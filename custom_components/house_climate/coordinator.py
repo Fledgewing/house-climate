@@ -19,6 +19,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .controller import ControlState, Device, Reading, control
+from .learning import EffortTracker, Learning
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -38,6 +39,17 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
         self.lock = asyncio.Lock()
         self.last_commands = {}
+        self.learning = self.new_learning()
+        self.effort = EffortTracker()
+        self.learning_baseline = None
+
+    def new_learning(self):
+        return Learning(
+            [s["entity_id"] for s in self.config["sensors"]],
+            [s["entity_id"] for s in self.config["systems"]],
+            self.config.get("learning_forgetting", 0.998),
+            self.config.get("learning_n0", 24),
+        )
 
     async def async_load(self):
         if saved := await self.store.async_load():
@@ -45,6 +57,14 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.enabled = saved.get("enabled", True)
             self.samples = saved.get("samples", [])
             self.restored = True
+            if saved.get("learning"):
+                self.learning = Learning.from_dict(saved["learning"])
+                self.learning.reconcile(
+                    [s["entity_id"] for s in self.config["sensors"]],
+                    [s["entity_id"] for s in self.config["systems"]],
+                )
+                self.learning.forgetting = self.config.get("learning_forgetting", 0.998)
+                self.learning.n0 = self.config.get("learning_n0", 24)
 
     def start(self):
         cancel_timer = async_track_time_interval(
@@ -68,6 +88,15 @@ class HouseCoordinator(DataUpdateCoordinator):
     @callback
     def _system_changed(self, event):
         old, new = event.data.get("old_state"), event.data.get("new_state")
+        # Runtime changes must be captured even during service calls under lock.
+        entity_id = event.data["entity_id"]
+        self.effort.change(
+            entity_id,
+            new.attributes.get("hvac_action")
+            if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+            else None,
+            dt_util.utcnow().timestamp(),
+        )
         if self.lock.locked() or self.data is None or old is None or new is None:
             return
         if old.state != new.state or old.attributes.get(
@@ -142,6 +171,36 @@ class HouseCoordinator(DataUpdateCoordinator):
             outdoor = self.number(self.config.get("outdoor_sensor"))
             if outdoor is None:
                 outdoor = self.number(self.config.get("weather_entity"), "temperature")
+            solar = self.solar_kw()
+            if record:
+                efforts, duration = self.effort.finish(
+                    {
+                        key: device.hvac_action if device.available else None
+                        for key, device in devices.items()
+                    },
+                    now.timestamp(),
+                )
+                valid = {
+                    key: r.value
+                    for key, r in readings.items()
+                    if r.value is not None
+                    and r.age <= self.config.get("stale_after", 720) * 60
+                }
+                if (
+                    self.learning_baseline is not None
+                    and outdoor is not None
+                    and solar is not None
+                ):
+                    before, previous_outdoor, previous_solar = self.learning_baseline
+                    self.learning.update(
+                        before,
+                        valid,
+                        previous_outdoor,
+                        efforts,
+                        previous_solar,
+                        duration / (self.config.get("interval", 5) * 60),
+                    )
+                self.learning_baseline = (valid, outdoor, solar)
             decision = control(
                 self.config,
                 self.state,
@@ -150,6 +209,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 now.timestamp(),
                 outdoor,
                 self.enabled,
+                self.learning,
             )
             if adoption:
                 decision.explanation = f"{adoption} {decision.explanation}"
@@ -188,7 +248,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                         "timestamp": now.timestamp(),
                         "sensors": raw,
                         "outdoor": outdoor,
-                        "solar": self.number(self.config.get("solar_sensor")),
+                        "solar": solar,
+                        "efforts": efforts,
                         "occupancy": occupancy.state if occupancy else None,
                         "systems": {
                             key: {
@@ -206,9 +267,28 @@ class HouseCoordinator(DataUpdateCoordinator):
                     "state": asdict(self.state),
                     "enabled": self.enabled,
                     "samples": self.samples,
+                    "learning": self.learning.to_dict(),
                 }
             )
             self.async_set_updated_data(decision)
+
+    def solar_kw(self):
+        entity_id = self.config.get("solar_sensor")
+        if not entity_id:
+            return 0.0
+        value = self.number(entity_id)
+        if value is None:
+            return None
+        unit = self.hass.states.get(entity_id).attributes.get("unit_of_measurement")
+        factors = {"W": 0.001, "kW": 1, "MW": 1000}
+        return value * factors[unit] if unit in factors else None
+
+    async def async_reset_learning(self):
+        async with self.lock:
+            self.learning = self.new_learning()
+            self.learning_baseline = None
+            self.effort = EffortTracker()
+        await self.async_tick(record=False)
 
     def adopt_systems(self, devices):
         """Start fresh entries from current systems before issuing any commands."""

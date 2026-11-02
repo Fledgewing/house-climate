@@ -51,7 +51,7 @@ class HouseSteps:
                 ]
                 old = {s["entity_id"]: s for s in self.settings["systems"]}
                 self.settings["systems"] = [
-                    old.get(s, {"entity_id": s, "influence": [], "preset": ""})
+                    old.get(s, {"entity_id": s, "preset": ""})
                     for s in dict.fromkeys(user_input["systems"])
                 ]
                 self.index = 0
@@ -99,37 +99,17 @@ class HouseSteps:
 
     async def async_step_system(self, user_input=None):
         system = self.settings["systems"][self.index]
-        members = [s["entity_id"] for s in self.settings["sensors"]]
-        errors = {}
         if user_input is not None:
-            if not user_input["influence"] or not set(user_input["influence"]).issubset(
-                members
-            ):
-                errors["base"] = "invalid_influence"
-            else:
-                system.update(user_input)
-                system["preset"] = user_input.get("preset", "").strip()
-                self.index += 1
-                if self.index == len(self.settings["systems"]):
-                    return await self.async_step_tunables()
-                return await self.async_step_system()
-        influence = [s for s in system["influence"] if s in members]
+            system["preset"] = user_input.get("preset", "").strip()
+            self.index += 1
+            if self.index == len(self.settings["systems"]):
+                return await self.async_step_tunables()
+            return await self.async_step_system()
         return self.async_show_form(
             step_id="system",
-            errors=errors,
             description_placeholders={"entity": system["entity_id"]},
             data_schema=vol.Schema(
                 {
-                    vol.Required(
-                        "influence", default=influence
-                    ): selector.EntitySelector(
-                        selector.EntitySelectorConfig(
-                            domain="sensor",
-                            device_class="temperature",
-                            include_entities=members,
-                            multiple=True,
-                        )
-                    ),
                     vol.Optional(
                         "preset",
                         description={"suggested_value": system.get("preset", "")},
@@ -177,6 +157,8 @@ class HouseSteps:
             ("heat_outdoor_max", -40, 50, 0.5),
             ("kp", 0, 10, 0.1),
             ("ki", 0, 10, 0.01),
+            ("learning_forgetting", 0.9, 1, 0.001),
+            ("learning_n0", 1, 1000, 1),
         ]:
             fields[vol.Required(key, default=self.settings[key])] = number(
                 low, high, step
@@ -185,7 +167,7 @@ class HouseSteps:
 
 
 class HouseConfigFlow(HouseSteps, config_entries.ConfigFlow, domain=DOMAIN):
-    VERSION = 1
+    VERSION = 2
 
     async def async_step_user(self, user_input=None):
         await self.async_set_unique_id(DOMAIN)

@@ -19,16 +19,15 @@
         }
       },
       "system": {
-        "title": "System influence",
-        "description": "Choose sensors affected by {entity}. Set a hold preset such as manual when required by the device.",
+        "title": "System preset",
+        "description": "Set a hold preset for {entity}, such as manual, when required by the device. Room effects are learned automatically.",
         "data": {
-          "influence": "Influence sensors",
           "preset": "Required preset (optional)"
         }
       },
       "tunables": {
         "title": "Control settings",
-        "description": "Temperatures are in \u00b0C. PI integral gain is per control interval. Optional context sources are recorded for future learning.",
+        "description": "Temperatures are in \u00b0C. Solar power is converted to kW for online learning. PI integral gain is per control interval.",
         "data": {
           "outdoor_sensor": "Outdoor temperature sensor",
           "weather_entity": "Fallback weather entity",
@@ -43,13 +42,14 @@
           "cool_outdoor_min": "Veto cooling below outdoor temperature (\u00b0C)",
           "heat_outdoor_max": "Veto heating above outdoor temperature (\u00b0C)",
           "kp": "Proportional gain",
-          "ki": "Integral gain"
+          "ki": "Integral gain",
+          "learning_forgetting": "Learning forgetting factor per sample",
+          "learning_n0": "Learning prior blend sample count"
         }
       }
     },
     "error": {
       "empty_selection": "Choose at least one sensor and system.",
-      "invalid_influence": "Choose at least one member sensor.",
       "self_reference": "The integration cannot control or read its own entities."
     },
     "abort": {
@@ -75,16 +75,15 @@
         }
       },
       "system": {
-        "title": "System influence",
-        "description": "Choose sensors affected by {entity}. Set a hold preset such as manual when required by the device.",
+        "title": "System preset",
+        "description": "Set a hold preset for {entity}, such as manual, when required by the device. Room effects are learned automatically.",
         "data": {
-          "influence": "Influence sensors",
           "preset": "Required preset (optional)"
         }
       },
       "tunables": {
         "title": "Control settings",
-        "description": "Temperatures are in \u00b0C. PI integral gain is per control interval. Optional context sources are recorded for future learning.",
+        "description": "Temperatures are in \u00b0C. Solar power is converted to kW for online learning. PI integral gain is per control interval.",
         "data": {
           "outdoor_sensor": "Outdoor temperature sensor",
           "weather_entity": "Fallback weather entity",
@@ -99,13 +98,14 @@
           "cool_outdoor_min": "Veto cooling below outdoor temperature (\u00b0C)",
           "heat_outdoor_max": "Veto heating above outdoor temperature (\u00b0C)",
           "kp": "Proportional gain",
-          "ki": "Integral gain"
+          "ki": "Integral gain",
+          "learning_forgetting": "Learning forgetting factor per sample",
+          "learning_n0": "Learning prior blend sample count"
         }
       }
     },
     "error": {
       "empty_selection": "Choose at least one sensor and system.",
-      "invalid_influence": "Choose at least one member sensor.",
       "self_reference": "The integration cannot control or read its own entities."
     }
   }

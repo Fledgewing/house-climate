@@ -40,10 +40,9 @@ def settings():
     data["systems"] = [
         {
             "entity_id": "climate.ducted",
-            "influence": ["sensor.room"],
             "preset": "manual",
         },
-        {"entity_id": "climate.split", "influence": ["sensor.room"], "preset": ""},
+        {"entity_id": "climate.split", "preset": ""},
     ]
     return data
 
@@ -207,6 +206,8 @@ async def test_setup_entities(hass, installed):
         "climate.house",
         "button.house_warmer",
         "button.house_colder",
+        "sensor.house_learning",
+        "button.house_reset_learning",
         "sensor.house_temperature",
         "sensor.house_temperature_spread",
         "sensor.house_ducted_offset",
@@ -286,9 +287,7 @@ async def complete_flow(manager, result, sensors, systems, stale_after=720):
         )
     for _ in systems:
         assert result["step_id"] == "system"
-        result = await manager.async_configure(
-            result["flow_id"], {"influence": sensors, "preset": ""}
-        )
+        result = await manager.async_configure(result["flow_id"], {"preset": ""})
     assert result["step_id"] == "tunables"
     # Unselected optional selectors are omitted by the HA frontend.
     tunables = {
@@ -349,7 +348,7 @@ async def test_options_add_remove_reweight(hass, settings):
         {"entity_id": "sensor.new", "weight": 1.0, "zone": "Room"},
         {"entity_id": "sensor.another", "weight": 2.0, "zone": "Room"},
     ]
-    assert entry.options["systems"][0]["influence"] == ["sensor.new", "sensor.another"]
+    assert entry.options["systems"] == [{"entity_id": "climate.third", "preset": ""}]
     assert entry.options["stale_after"] == 180
 
 
@@ -391,7 +390,7 @@ async def test_external_changes_are_explained_and_reasserted(hass, installed):
     assert any(
         entity_id == "climate.ducted"
         and service == "set_temperature"
-        and data["temperature"] == 19
+        and data["temperature"] == entry.runtime_data.last_commands["climate.ducted"][1]
         for entity_id, service, data in calls
     )
 
@@ -506,16 +505,8 @@ async def test_config_flow_empty_defaults_and_selector_filters(hass):
         result["flow_id"], {"weight": 1.0}
     )
     assert result["step_id"] == "system"
-    for field, entity_selector in result["data_schema"].schema.items():
-        if field.schema == "influence":
-            assert field.default() == []
-            assert isinstance(entity_selector, selector.EntitySelector)
-            assert entity_selector.config["domain"] == ["sensor"]
-            assert entity_selector.config["device_class"] == ["temperature"]
-            assert entity_selector.config["include_entities"] == ["sensor.room"]
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {"influence": ["sensor.room"]}
-    )
+    assert {field.schema for field in result["data_schema"].schema} == {"preset"}
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
     assert result["step_id"] == "tunables"
     expected = {
         "outdoor_sensor": ("sensor", "temperature"),
@@ -532,3 +523,133 @@ async def test_config_flow_empty_defaults_and_selector_filters(hass):
         assert entity_selector.config["domain"] == [domain]
         if device_class:
             assert entity_selector.config["device_class"] == [device_class]
+
+
+@pytest.mark.parametrize("options", [False, True])
+async def test_v1_entry_migration(hass, settings, options):
+    from custom_components.house_climate import async_migrate_entry
+
+    for system in settings["systems"]:
+        system["influence"] = ["sensor.room"]
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=1,
+        data=settings,
+        options=deepcopy(settings) if options else {},
+    )
+    entry.add_to_hass(hass)
+    assert await async_migrate_entry(hass, entry)
+    assert entry.version == 2
+    assert all("influence" not in s for s in entry.data["systems"])
+    assert all("influence" not in s for s in entry.options.get("systems", []))
+    assert entry.data["systems"][0]["preset"] == "manual"
+    assert entry.data["sensors"] == settings["sensors"]
+
+
+async def test_learning_action_events_store_restart_and_reset(hass, installed):
+    entry, _ = installed
+    coordinator = entry.runtime_data
+    coordinator.config["outdoor_sensor"] = "sensor.outdoor"
+    coordinator.config["solar_sensor"] = "sensor.solar"
+    hass.states.async_set("sensor.outdoor", "5")
+    hass.states.async_set("sensor.solar", "2000", {"unit_of_measurement": "W"})
+    assert coordinator.solar_kw() == 2
+    start = dt_util.utcnow()
+    # Establish a fresh interval with known weather and solar context.
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow", return_value=start
+    ):
+        await coordinator.async_tick()
+    for seconds, action in [(60, "heating"), (210, "idle")]:
+        with patch(
+            "custom_components.house_climate.coordinator.dt_util.utcnow",
+            return_value=start + timedelta(seconds=seconds),
+        ):
+            state = hass.states.get("climate.ducted")
+            hass.states.async_set(
+                "climate.ducted",
+                state.state,
+                {**state.attributes, "hvac_action": action},
+            )
+            await hass.async_block_till_done()
+    hass.states.async_set("sensor.room", "19.1")
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(seconds=300),
+    ):
+        await coordinator.async_tick()
+    assert coordinator.samples[-1]["efforts"]["climate.ducted"] == pytest.approx(0.5)
+    assert coordinator.learning.rows["sensor.room"].samples == 1
+    saved_model = coordinator.learning.to_dict()
+    assert (await coordinator.store.async_load())["learning"] == saved_model
+    assert (
+        hass.states.get("sensor.house_learning").attributes["sensors"]["sensor.room"][
+            "samples"
+        ]
+        == 1
+    )
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    assert entry.runtime_data.learning.to_dict() == saved_model
+    await hass.services.async_call(
+        "button", "press", {"entity_id": "button.house_reset_learning"}, blocking=True
+    )
+    assert entry.runtime_data.learning.rows["sensor.room"].samples == 0
+    assert entry.runtime_data.learning.rows["sensor.room"].theta[1:3] == [0.03, 0.03]
+    assert (await entry.runtime_data.store.async_load())[
+        "learning"
+    ] == entry.runtime_data.learning.to_dict()
+    assert hass.states.get("sensor.house_learning").state == "0.0"
+
+
+async def test_learning_reconciles_options_on_reload(hass, installed):
+    entry, _ = installed
+    model = entry.runtime_data.learning
+    model.update(
+        {"sensor.room": 19},
+        {"sensor.room": 19.1},
+        5,
+        {"climate.ducted": 1, "climate.split": 0},
+    )
+    await entry.runtime_data.async_tick(record=False)
+    retained = model.to_dict()["rows"]["sensor.room"]
+    options = deepcopy(dict(entry.data))
+    options["sensors"].append({"entity_id": "sensor.new", "weight": 1})
+    hass.config_entries.async_update_entry(entry, options=options)
+    await hass.async_block_till_done()
+    model = entry.runtime_data.learning
+    assert model.to_dict()["rows"]["sensor.room"] == retained
+    assert model.rows["sensor.new"].samples == 0
+    assert model.rows["sensor.new"].theta[1:3] == [0.03, 0.03]
+    options = deepcopy(options)
+    options["sensors"] = [options["sensors"][1]]
+    hass.config_entries.async_update_entry(entry, options=options)
+    await hass.async_block_till_done()
+    assert set(entry.runtime_data.learning.rows) == {"sensor.new"}
+    assert set((await entry.runtime_data.store.async_load())["learning"]["rows"]) == {
+        "sensor.new"
+    }
+
+
+async def test_action_events_during_command_lock_are_tracked(hass, installed):
+    entry, _ = installed
+    coordinator = entry.runtime_data
+    now = dt_util.utcnow()
+    coordinator.effort.finish(
+        {"climate.ducted": "idle", "climate.split": "idle"}, now.timestamp()
+    )
+    async with coordinator.lock:
+        with patch(
+            "custom_components.house_climate.coordinator.dt_util.utcnow",
+            return_value=now + timedelta(seconds=60),
+        ):
+            state = hass.states.get("climate.ducted")
+            hass.states.async_set(
+                state.entity_id,
+                state.state,
+                {**state.attributes, "hvac_action": "heating"},
+            )
+            await hass.async_block_till_done()
+    efforts, _ = coordinator.effort.finish(
+        {"climate.ducted": "idle", "climate.split": "idle"}, now.timestamp() + 300
+    )
+    assert efforts["climate.ducted"] == pytest.approx(0.8)

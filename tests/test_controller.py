@@ -23,7 +23,6 @@ def config():
         "systems": [
             {
                 "entity_id": "climate.a",
-                "influence": ["sensor.a", "sensor.b"],
                 "preset": "manual",
             }
         ],
@@ -191,8 +190,8 @@ def test_multiroom_with_four_quiet_sensors_raises_whole_house_offset():
     sensors = [f"sensor.room_{i}" for i in range(6)]
     config["sensors"] = [{"entity_id": entity_id, "weight": 1} for entity_id in sensors]
     config["systems"] = [
-        {"entity_id": "climate.ducted", "influence": sensors, "preset": "manual"},
-        {"entity_id": "climate.split", "influence": sensors[:2], "preset": ""},
+        {"entity_id": "climate.ducted", "preset": "manual"},
+        {"entity_id": "climate.split", "preset": ""},
     ]
     values = [22.5, 20.0, 20.3, 18.7, 21.7, 16.9]
     readings = {
@@ -227,7 +226,7 @@ def test_device_limit_antiwindup(config):
 
 
 def test_one_unavailable_system_does_not_block_others(config):
-    config["systems"].append({"entity_id": "climate.b", "influence": ["sensor.a"]})
+    config["systems"].append({"entity_id": "climate.b"})
     state = ControlState(mode="heat")
     result = control(
         config,
@@ -240,11 +239,10 @@ def test_one_unavailable_system_does_not_block_others(config):
     assert all(entity_id == "climate.b" for entity_id, _, _ in result.commands)
 
 
-def test_missing_influence_falls_back(config):
-    config["systems"][0]["influence"] = ["sensor.b"]
+def test_missing_room_uses_available_house_mean(config):
     result = run(config, readings={"sensor.a": Reading(19)})
     assert result.temperature == 19
-    assert result.commands[-1][2] == {"temperature": 21}
+    assert result.commands[-1][2] == {"temperature": 21.5}
 
 
 def test_outdoor_veto_thresholds_are_configurable(config):

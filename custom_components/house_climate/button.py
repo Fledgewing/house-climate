@@ -7,8 +7,11 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 async def async_setup_entry(hass, entry, async_add_entities):
     async_add_entities(
         [
-            HouseButton(entry.runtime_data, entry.entry_id, delta)
-            for delta in (0.5, -0.5)
+            *[
+                HouseButton(entry.runtime_data, entry.entry_id, delta)
+                for delta in (0.5, -0.5)
+            ],
+            ResetLearningButton(entry.runtime_data, entry.entry_id),
         ]
     )
 
@@ -26,3 +29,15 @@ class HouseButton(CoordinatorEntity, ButtonEntity):
 
     async def async_press(self):
         await self.coordinator.async_change(delta=self.delta)
+
+
+class ResetLearningButton(CoordinatorEntity, ButtonEntity):
+    _attr_name = "House reset learning"
+    _attr_icon = "mdi:brain"
+
+    def __init__(self, coordinator, entry_id):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry_id}_reset_learning"
+
+    async def async_press(self):
+        await self.coordinator.async_reset_learning()

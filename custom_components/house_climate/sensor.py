@@ -13,6 +13,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
     coordinator = entry.runtime_data
     async_add_entities(
         [
+            LearningSensor(coordinator, entry.entry_id),
             HouseSensor(coordinator, entry.entry_id, "temperature"),
             HouseSensor(coordinator, entry.entry_id, "temperature_spread"),
             *[
@@ -48,3 +49,22 @@ class HouseSensor(CoordinatorEntity, SensorEntity):
             if self.kind == "temperature"
             else self.coordinator.data.spread
         )
+
+
+class LearningSensor(CoordinatorEntity, SensorEntity):
+    _attr_name = "House learning"
+    _attr_native_unit_of_measurement = "%"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 1
+
+    def __init__(self, coordinator, entry_id):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry_id}_learning"
+
+    @property
+    def native_value(self):
+        return self.coordinator.learning.confidence_percent
+
+    @property
+    def extra_state_attributes(self):
+        return self.coordinator.learning.diagnostics()

@@ -28,6 +28,7 @@ by domain and, for temperature, power and occupancy sources, device class.
 - `button.house_warmer` and `button.house_colder`: change the house setpoint by ±0.5 °C.
 - `sensor.house_temperature` (weighted mean of member sensors) and `sensor.house_temperature_spread`
   (max − min of member sensors).
+- `sensor.house_learning` and `button.house_reset_learning`: model confidence, fitted room effects and reset.
 - `sensor.house_<system>_offset` per system: the current offset from the house setpoint.
 - `switch.house_climate_control`: when off, the integration observes and logs but sends no commands.
 - Attributes on `climate.house` explain the last decision in plain words (`last_decision`), plus
@@ -35,8 +36,7 @@ by domain and, for temperature, power and occupancy sources, device class.
 
 ## Configuration (config flow + options flow)
 
-- Systems (climate entities), each with the list of sensors it mainly affects ("influence") in v1.
-  Example: ducted system → all house sensors; mini-split → the two living-room sensors.
+- Systems (climate entities), each with an optional required hold preset. Room effects are learned automatically.
 - Member sensors, each with a weight (default 1.0) and an optional zone label. Adding a sensor
   later in the options flow is the "onboard a sensor" path; nothing else has to change.
 - Outdoor temperature sensor, optional weather entity, optional solar power sensor, optional
@@ -44,7 +44,7 @@ by domain and, for temperature, power and occupancy sources, device class.
 - Tunables with defaults: control interval 5 min, mode-switch deadband 1.0 °C, minimum time in a
   mode 60 min, sensor stale after 720 min (12 h), offset clamp ±3.0 °C, max offset change per interval 0.5 °C.
 
-## Control loop (v1)
+## Control loop (v0.2.0)
 
 Every control interval, and immediately when the house setpoint or mode changes:
 
@@ -58,14 +58,16 @@ Every control interval, and immediately when the house setpoint or mode changes:
    keep the current mode; never switch sooner than the minimum time in a mode. Outdoor temperature
    vetoes nonsense: no cooling when outdoors is below 10 °C, no heating when above 24 °C
    (both tunable). Every system gets the same mode. `off` turns every system off.
-3. Per-system offset, from a PI controller on the error of the sensors that system influences:
-   - Ducted system (whole house): error = setpoint − weighted mean of its influence sensors.
-   - Mini-split (living room): error = setpoint − weighted mean of the living-room sensors.
-   The ducted system pushes the whole house toward setpoint; the mini-split trims the living room so the
-   ducted system's living-room sensor does not stop it early. The effect is to warm the cold rooms
-   without overheating the living room.
-   Anti-windup, clamp to ±offset clamp, rate-limit per interval, round to 0.5 °C, and clamp the
-   final setpoint to the device's min/max.
+3. Per-system offset, from a PI controller on the learned influence-weighted room error:
+   `e_j = Σ_i w_i β_ij (S − T_i) / Σ_i w_i β_ij`. Here `w_i` is the configured sensor weight,
+   and `β_ij` is the nonnegative blended heating/cooling coefficient, normalized per system.
+   With neutral priors all systems start on the weighted house mean error. If all coefficients
+   are near zero, or their rooms are unavailable, use the available house mean error.
+   Each system pushes harder for the rooms it actually reaches, reducing spread while tracking
+   the house target. `last_decision` lists the rooms driving each error, largest absolute
+   weighted contribution first. During initial learning, add the exploration offset described below.
+   Keep conditional integration/anti-windup, ±offset clamp, interval slew limit, 0.5 °C rounding,
+   and device min/max target limits.
 4. Write only what changed: `climate.set_hvac_mode`, then `climate.set_temperature`. For a system with a
    configured required preset, re-assert that preset if it has left it.
 5. Track each system's last successfully commanded mode and target. Report an outside change
@@ -85,25 +87,73 @@ off, or no systems are available, start in off mode with control disabled: obser
 sending commands until the user chooses a House mode. Explain this choice in `last_decision`.
 Restored state takes precedence over adoption.
 
-## Learning (phase 2; v1 only records the data)
+## Learning (v0.2.0)
 
-v1 records a sample every interval to a `Store` file: every member sensor, outdoor temperature,
-solar power, occupancy, each system's mode, setpoint, offset and `hvac_action`. Capped to the last
-30 days.
+Every scheduled interval fits one thermal model per available room sensor using recursive least
+squares (RLS), in the pure `learning.py` module:
 
-Phase 2 fits, per sensor i, a simple model by recursive least squares:
-`dT_i/dt = a_i (T_out − T_i) + Σ_j b_ij · u_j + c_i · solar + d_i`, where u_j is system j's
-running effort (from `hvac_action` and its offset). The learned b_ij replaces the hand-set
-"influence" lists, and the offsets come from minimising the weighted spread of predicted room
-temperatures subject to the house mean meeting the setpoint, within the same clamps. A newly
-onboarded sensor counts in the house temperature at once and gets its b_ij after a few days of
-data; until its fit is confident (tunable sample count), it uses the v1 influence list.
+`ΔT_i = a_i (T_out − T_i) + Σ_j b_ij u_j + c_i solar_kW + d_i`.
+
+Coefficients describe one configured control interval (5 minutes by default); elapsed time scales
+regressors for delayed passes. `a_i` describes heat loss, `b_ij` the temperature response to each
+system, `c_i` sun gain, and `d_i` background drift. Every system/room pair starts with the same
+neutral `b = 0.03 °C/interval`. All other prior means are zero; diagonal prior covariance is 100
+for every coefficient, with zero cross-covariances. There are no room-specific assumptions.
+
+The signed effort `u_j` is actual heating seconds minus cooling seconds, divided by interval
+seconds. A state-change listener integrates every `hvac_action` transition, including transitions
+during command service calls. Idle/off/fan/drying contribute zero; unavailable or unknown actions
+invalidate that interval. Sampling only the action at a pass would miss short cycles.
+
+The forgetting factor defaults to 0.998 per valid row sample. Effective activity counts follow
+`n_ij ← 0.998 n_ij + 1[u_j ≠ 0]`. Confidence is `n/(n+N0)` with `N0 = 24` by default (about two
+hours of active 5-minute samples to give learned and prior coefficients equal weight).
+Control blends `confidence × learned_b + (1 − confidence) × 0.03`, clips negative results to
+zero, then normalizes per system. Learning starts affecting control from the first valid sample;
+several hours of informative runtime can outweigh the prior, and forgetting supports continued
+adaptation. Confidence measures effective runtime evidence, rather than a statistical certainty
+that two always-synchronized systems have been identified separately.
+
+To distinguish system effects, while a system's minimum room confidence is below 80%, add a
+±0.5 °C square-wave offset of period two hours, with system k shifted by k/N of a period. Its
+amplitude fades linearly to zero at 80% confidence. This stays inside the existing clamp and slew
+limits, and `last_decision` says `exploring` while it is active. Off mode and observe-only control
+send no exploration commands. Adding a room can restart exploration while its new row learns.
+
+A missing/nonfinite/stale room reading at either interval endpoint skips only that room's sample.
+Missing outdoor context or any system effort skips the whole interval. Configure an outdoor
+sensor or fallback weather temperature for learning. Solar is zero when no solar source is
+configured; a configured missing source or unsupported unit skips the interval. W, kW and MW are
+converted to kW. Occupancy remains recorded context, outside this model. Immediate user requests
+run control without adding training samples or resetting runtime accumulation.
+
+The Store persists coefficients, full covariance, effective counts, residual errors and sample
+counts alongside existing control state and the last 30 days of observations. Restarts retain
+the fit but start a new observation interval, avoiding invented runtime across downtime. Adding
+a sensor creates a neutral row immediately and retains existing rows; removing one deletes its
+row. Adding/removing/reordering systems reconciles coefficient and covariance columns by entity
+ID. Config-entry version 2 migrates existing data and options by removing obsolete room mappings,
+retaining the other settings and existing Store. Pre-learning Store files start at neutral priors.
+
+`sensor.house_learning` reports the mean confidence across all system/room pairs, as a percentage.
+Its `systems[system_entity][sensor_entity]` attributes expose raw `b`, `blended_b`, normalized
+`influence`, confidence percent and `effective_samples`. Its `sensors[sensor_entity]` attributes
+expose `a` (heat loss), `c` (sun gain), `d`, `fit_error` (forgetting-weighted RMS prediction error
+in °C), and `samples` (valid updates). Press `button.house_reset_learning` to reset the model and
+confidence to neutral priors; house target, mode and PI control state remain in place.
+
+The seeded two-day test uses two systems and six rooms, a nonuniform response matrix, outdoor
+5 °C with a day/night swing, solar gain, and cycling thermostats with the real controller in the
+loop. It checks every learned coefficient within 0.003 °C/interval of truth, house mean within
+0.5 °C throughout day two, spread improvement against learning disabled, useful learning within
+hours, and exploration active early but absent at the end.
 
 ## Code layout
 
 - `custom_components/house_climate/controller.py`: pure Python, no Home Assistant imports. Takes
   readings + config + state, returns the commands and the explanation. All the logic above lives
   here and is unit-tested directly.
+- `learning.py`: pure online RLS, confidence blending, runtime integration and model persistence.
 - `climate.py`, `button.py`, `sensor.py`, `switch.py`, `config_flow.py`, `__init__.py`,
   `coordinator.py`: thin HA wiring around the controller.
 - Tests: `tests/test_controller.py` (pure), plus HA tests with

@@ -19,4 +19,6 @@ DEFAULTS = {
     "heat_outdoor_max": 24.0,
     "kp": 1.0,
     "ki": 0.1,
+    "learning_forgetting": 0.998,
+    "learning_n0": 24,
 }

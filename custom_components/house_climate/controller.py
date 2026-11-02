@@ -57,7 +57,9 @@ def clamp(value, low, high):
     return max(low, min(high, value))
 
 
-def control(config, state, readings, devices, now, outdoor=None, enabled=True):
+def control(
+    config, state, readings, devices, now, outdoor=None, enabled=True, learning=None
+):
     """Update PI state and return changed commands. Time and ages are seconds.
 
     Positive offset means a higher physical target in both heat and cool modes.
@@ -134,20 +136,44 @@ def control(config, state, readings, devices, now, outdoor=None, enabled=True):
         if not device.available:
             notes.append(f"{entity_id} unavailable; skipped.")
             continue
-        affected = [m for m in members if m["entity_id"] in system["influence"]]
-        local = mean(values, affected)
+        influence = learning.influences(entity_id) if learning else {}
+        affected = [
+            {**m, "weight": m.get("weight", 1) * influence.get(m["entity_id"], 0)}
+            for m in members
+        ]
+        local = mean(values, affected) if influence else house
+        if local is None:
+            local = house
+            affected = members
         offset = state.offsets.get(entity_id, 0)
         if house is None or local is None:
             offset = 0
             state.integrals[entity_id] = 0
-            notes.append(
-                f"{entity_id}: no usable influence sensors; using house setpoint."
-            )
+            notes.append(f"{entity_id}: no usable room sensors; using house setpoint.")
         elif mode in ("heat", "cool"):
             error = state.setpoint - local
+            drivers = affected if influence else members
+            contributions = [
+                (
+                    m["entity_id"],
+                    m.get("weight", 1) * (state.setpoint - values[m["entity_id"]]),
+                )
+                for m in drivers
+                if m["entity_id"] in values and m.get("weight", 1) > 0
+            ]
+            contributions.sort(key=lambda item: abs(item[1]), reverse=True)
+            notes.append(
+                f"{entity_id}: error {error:+.2f} °C driven by "
+                + ", ".join(s for s, _ in contributions)
+                + "."
+            )
             integral = state.integrals.get(entity_id, 0)
             candidate = integral + config.get("ki", 0.1) * error * dt
             raw = config.get("kp", 1) * error + candidate
+            dither = learning.dither(entity_id, now) if learning else 0
+            if dither:
+                notes.append(f"{entity_id}: exploring ({dither:+.2f} °C dither).")
+            raw += dither
             limit = config.get("offset_clamp", 3)
             slew = config.get("max_offset_change", 0.5) * dt
             bounded = clamp(clamp(raw, -limit, limit), offset - slew, offset + slew)
