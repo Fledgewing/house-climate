@@ -1,0 +1,110 @@
+{
+  "title": "House Climate",
+  "config": {
+    "step": {
+      "user": {
+        "title": "House sensors and systems",
+        "description": "Choose all member temperature sensors and controlled HVAC systems. Removing an entity here removes it from control.",
+        "data": {
+          "sensors": "Member temperature sensors",
+          "systems": "HVAC systems"
+        }
+      },
+      "sensor": {
+        "title": "Sensor weight and zone",
+        "description": "Configure {entity}. Weights must be positive.",
+        "data": {
+          "weight": "Weight",
+          "zone": "Zone label (optional)"
+        }
+      },
+      "system": {
+        "title": "System influence",
+        "description": "Choose sensors affected by {entity}. Set a hold preset such as manual when required by the device.",
+        "data": {
+          "influence": "Influence sensors",
+          "preset": "Required preset (optional)"
+        }
+      },
+      "tunables": {
+        "title": "Control settings",
+        "description": "Temperatures are in \u00b0C. PI integral gain is per control interval. Optional context sources are recorded for future learning.",
+        "data": {
+          "outdoor_sensor": "Outdoor temperature sensor",
+          "weather_entity": "Fallback weather entity",
+          "solar_sensor": "Solar power sensor",
+          "occupancy_sensor": "Occupancy sensor",
+          "interval": "Control interval (minutes)",
+          "deadband": "Auto mode deadband (\u00b0C)",
+          "minimum_dwell": "Minimum time in mode (minutes)",
+          "offset_clamp": "Maximum absolute offset (\u00b0C)",
+          "max_offset_change": "Maximum offset change per interval (\u00b0C)",
+          "cool_outdoor_min": "Veto cooling below outdoor temperature (\u00b0C)",
+          "heat_outdoor_max": "Veto heating above outdoor temperature (\u00b0C)",
+          "kp": "Proportional gain",
+          "ki": "Integral gain"
+        }
+      }
+    },
+    "error": {
+      "empty_selection": "Choose at least one sensor and system.",
+      "invalid_influence": "Choose at least one member sensor.",
+      "self_reference": "The integration cannot control or read its own entities."
+    },
+    "abort": {
+      "already_configured": "House Climate is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "user": {
+        "title": "House sensors and systems",
+        "description": "Choose all member temperature sensors and controlled HVAC systems. Removing an entity here removes it from control.",
+        "data": {
+          "sensors": "Member temperature sensors",
+          "systems": "HVAC systems"
+        }
+      },
+      "sensor": {
+        "title": "Sensor weight and zone",
+        "description": "Configure {entity}. Weights must be positive.",
+        "data": {
+          "weight": "Weight",
+          "zone": "Zone label (optional)"
+        }
+      },
+      "system": {
+        "title": "System influence",
+        "description": "Choose sensors affected by {entity}. Set a hold preset such as manual when required by the device.",
+        "data": {
+          "influence": "Influence sensors",
+          "preset": "Required preset (optional)"
+        }
+      },
+      "tunables": {
+        "title": "Control settings",
+        "description": "Temperatures are in \u00b0C. PI integral gain is per control interval. Optional context sources are recorded for future learning.",
+        "data": {
+          "outdoor_sensor": "Outdoor temperature sensor",
+          "weather_entity": "Fallback weather entity",
+          "solar_sensor": "Solar power sensor",
+          "occupancy_sensor": "Occupancy sensor",
+          "interval": "Control interval (minutes)",
+          "deadband": "Auto mode deadband (\u00b0C)",
+          "minimum_dwell": "Minimum time in mode (minutes)",
+          "offset_clamp": "Maximum absolute offset (\u00b0C)",
+          "max_offset_change": "Maximum offset change per interval (\u00b0C)",
+          "cool_outdoor_min": "Veto cooling below outdoor temperature (\u00b0C)",
+          "heat_outdoor_max": "Veto heating above outdoor temperature (\u00b0C)",
+          "kp": "Proportional gain",
+          "ki": "Integral gain"
+        }
+      }
+    },
+    "error": {
+      "empty_selection": "Choose at least one sensor and system.",
+      "invalid_influence": "Choose at least one member sensor.",
+      "self_reference": "The integration cannot control or read its own entities."
+    }
+  }
+}

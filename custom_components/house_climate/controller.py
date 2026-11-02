@@ -1,0 +1,175 @@
+"""Deterministic house control, with no Home Assistant dependencies."""
+
+from dataclasses import dataclass, field
+from math import floor, isfinite
+
+
+@dataclass
+class Reading:
+    value: float | None
+    age: float = 0
+
+
+@dataclass
+class Device:
+    mode: str = "off"
+    temperature: float | None = None
+    minimum: float = 7
+    maximum: float = 35
+    preset: str | None = None
+    available: bool = True
+    hvac_action: str | None = None
+
+
+@dataclass
+class ControlState:
+    setpoint: float = 21
+    mode: str = "off"
+    active_mode: str = "off"
+    last_switch: float = 0
+    integrals: dict[str, float] = field(default_factory=dict)
+    offsets: dict[str, float] = field(default_factory=dict)
+    last_update: float | None = None
+
+
+@dataclass
+class Decision:
+    temperature: float | None
+    spread: float | None
+    readings: dict[str, float]
+    commands: list[tuple[str, str, dict]]
+    explanation: str
+
+
+def mean(values, members):
+    """Weighted mean using only positive finite weights and valid readings."""
+    pairs = [
+        (values[m["entity_id"]], m.get("weight", 1))
+        for m in members
+        if m["entity_id"] in values
+        and isfinite(m.get("weight", 1))
+        and m.get("weight", 1) > 0
+    ]
+    return sum(v * w for v, w in pairs) / sum(w for _, w in pairs) if pairs else None
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def control(config, state, readings, devices, now, outdoor=None, enabled=True):
+    """Update PI state and return changed commands. Time and ages are seconds.
+
+    Positive offset means a higher physical target in both heat and cool modes.
+    Conditional integration prevents windup at the clamp or slew limit. Immediate
+    user requests do not buy additional slew allowance between timed intervals.
+    """
+    members = config["sensors"]
+    values = {
+        k: r.value
+        for k, r in readings.items()
+        if r.value is not None and isfinite(r.value) and 0 <= r.age <= 1800
+    }
+    values = {
+        m["entity_id"]: values[m["entity_id"]]
+        for m in members
+        if m["entity_id"] in values
+        and isfinite(m.get("weight", 1))
+        and m.get("weight", 1) > 0
+    }
+    house = mean(values, members)
+    spread = max(values.values()) - min(values.values()) if values else None
+    interval = config.get("interval", 5) * 60
+    elapsed = interval if state.last_update is None else max(0, now - state.last_update)
+    dt = 1 if elapsed >= interval else 0
+    mode = state.mode
+    notes = []
+    if mode == "heat_cool":
+        mode = state.active_mode
+        deadband = config.get("deadband", 1)
+        if house is not None:
+            wanted = (
+                "heat"
+                if house < state.setpoint - deadband
+                else "cool"
+                if house > state.setpoint + deadband
+                else mode
+            )
+            if wanted != mode:
+                if (
+                    state.active_mode == "off"
+                    or now - state.last_switch >= config.get("minimum_dwell", 60) * 60
+                ):
+                    mode = wanted
+                else:
+                    notes.append("Minimum mode dwell retained the current mode.")
+    if outdoor is not None and (
+        (mode == "cool" and outdoor < config.get("cool_outdoor_min", 10))
+        or (mode == "heat" and outdoor > config.get("heat_outdoor_max", 24))
+    ):
+        mode = "off"
+        notes.append("Outdoor temperature vetoed operation.")
+    if not enabled:
+        return Decision(house, spread, values, [], "Control disabled; observing only.")
+    if mode != state.active_mode:
+        state.active_mode, state.last_switch = mode, now
+    commands = []
+    for system in config["systems"]:
+        entity_id = system["entity_id"]
+        device = devices.get(entity_id, Device(available=False))
+        if not device.available:
+            notes.append(f"{entity_id} unavailable; skipped.")
+            continue
+        affected = [m for m in members if m["entity_id"] in system["influence"]]
+        local = mean(values, affected)
+        offset = state.offsets.get(entity_id, 0)
+        if house is None or local is None:
+            offset = 0
+            state.integrals[entity_id] = 0
+            notes.append(
+                f"{entity_id}: no usable influence sensors; using house setpoint."
+            )
+        elif mode in ("heat", "cool"):
+            error = state.setpoint - local
+            integral = state.integrals.get(entity_id, 0)
+            candidate = integral + config.get("ki", 0.1) * error * dt
+            raw = config.get("kp", 1) * error + candidate
+            limit = config.get("offset_clamp", 3)
+            slew = config.get("max_offset_change", 0.5) * dt
+            bounded = clamp(clamp(raw, -limit, limit), offset - slew, offset + slew)
+            # Do not integrate farther into either saturation boundary.
+            device_limited = (
+                state.setpoint
+                + bounded
+                - clamp(state.setpoint + bounded, device.minimum, device.maximum)
+            )
+            if (raw - bounded) * error <= 0 and device_limited * error <= 0:
+                state.integrals[entity_id] = candidate
+            offset = clamp(floor(bounded * 2 + 0.5) / 2, -limit, limit)
+        state.offsets[entity_id] = offset
+        target = clamp(
+            floor((state.setpoint + offset) * 2 + 0.5) / 2,
+            device.minimum,
+            device.maximum,
+        )
+        if device.mode != mode:
+            notes.append(f"{entity_id}: mode differs; re-asserting {mode}.")
+            commands.append((entity_id, "set_hvac_mode", {"hvac_mode": mode}))
+        if mode != "off":
+            preset = system.get("preset")
+            if preset and device.preset != preset:
+                commands.append((entity_id, "set_preset_mode", {"preset_mode": preset}))
+            if device.temperature != target:
+                notes.append(
+                    f"{entity_id}: target differs; setting {target:.1f} °C (offset {offset:+.2f})."
+                )
+                commands.append((entity_id, "set_temperature", {"temperature": target}))
+    if state.last_update is None or elapsed >= interval:
+        state.last_update = now
+    notes.insert(
+        0,
+        f"House {house:.2f} °C; selected {mode}."
+        if house is not None
+        else f"No house sensors; selected {mode}, zero offsets.",
+    )
+    return Decision(house, spread, values, commands, " ".join(notes))
