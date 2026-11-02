@@ -12,6 +12,8 @@ DEFAULTS = {
     "interval": 5,
     "stale_after": 720,
     "frozen_after": 4,
+    "filter_minutes": 15,
+    "max_rate": 0.5,
     "deadband": 1.0,
     "minimum_dwell": 60,
     "offset_clamp": 3.0,

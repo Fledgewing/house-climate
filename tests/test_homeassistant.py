@@ -572,11 +572,12 @@ async def test_learning_action_events_store_restart_and_reset(hass, installed):
                 {**state.attributes, "hvac_action": action},
             )
             await hass.async_block_till_done()
-    hass.states.async_set("sensor.room", "19.1")
     with patch(
         "custom_components.house_climate.coordinator.dt_util.utcnow",
         return_value=start + timedelta(seconds=300),
     ):
+        hass.states.async_set("sensor.room", "19.1")
+        await hass.async_block_till_done()
         await coordinator.async_tick()
     assert coordinator.samples[-1]["efforts"]["climate.ducted"] == pytest.approx(0.5)
     assert coordinator.learning.rows["sensor.room"].samples == 1
@@ -699,9 +700,9 @@ async def test_frozen_sensor_exclusion_repair_recovery_and_learning(
     assert ("sensor.room" not in coordinator.data.readings) is active
     if not active:
         assert issue is None
-        assert coordinator.data.temperature == 20.25
+        assert coordinator.data.temperature == 20
         return
-    assert coordinator.data.temperature == 21.5
+    assert coordinator.data.temperature == 21
     assert coordinator.data.spread == 0
     assert issue.severity == ir.IssueSeverity.WARNING
     assert issue.translation_placeholders["sensor"] == "sensor.room"
@@ -723,7 +724,8 @@ async def test_frozen_sensor_exclusion_repair_recovery_and_learning(
         hass.states.async_set("sensor.room", "19.1")
         await hass.async_block_till_done()
     assert "sensor.room" not in coordinator.not_reporting
-    assert coordinator.data.readings["sensor.room"] == 19.1
+    # The value-change immediately clears the repair, while control stays filtered.
+    assert coordinator.data.readings["sensor.room"] == 19
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
 
 
@@ -832,3 +834,115 @@ async def test_recorder_seeds_numeric_changes_and_activity_on_startup(hass, sett
         assert coordinator.data.readings == {}
     finally:
         hass.data.pop(DATA_INSTANCE)
+
+
+async def test_real_house_transient_replay(hass, installed):
+    """All minute events reach the filter; control/learning run every five minutes."""
+    from custom_components.house_climate.filtering import SensorFilter
+
+    entry, calls = installed
+    c = entry.runtime_data
+    c.config["sensors"].append({"entity_id": "sensor.other", "weight": 1})
+    c.learning.reconcile(["sensor.room", "sensor.other"], c.learning.systems)
+    c.config["outdoor_sensor"] = "sensor.outdoor"
+    hass.states.async_set("sensor.outdoor", "3")
+    c.state = ControlState(setpoint=22.5, mode="heat")
+    c.enabled = True
+    c.filters = {"sensor.room": SensorFilter(), "sensor.other": SensorFilter()}
+    c.learning_baseline = None
+    # Keep the exploration square wave in one phase throughout this replay.
+    start = dt_util.parse_datetime("2026-11-02T17:30:00+00:00")
+    sequence = [
+        22,
+        22.5,
+        22,
+        21.5,
+        20.5,
+        18.5,
+        18,
+        19,
+        20,
+        21,
+        21.5,
+        22,
+        23,
+        23.5,
+        24,
+        23.5,
+        23,
+        22.5,
+        22,
+    ]
+    temperatures = []
+    targets = []
+    for minute in range(-15, 26):
+        value = sequence[minute] if 0 <= minute < len(sequence) else 22
+        # The other room remains in the observed 23–24 °C band.
+        other = 23.5 + 0.5 * min(1, max(0, minute) / 25)
+        with patch(
+            "custom_components.house_climate.coordinator.dt_util.utcnow",
+            return_value=start + timedelta(minutes=minute),
+        ):
+            hass.states.async_set(
+                "sensor.room", str(value), {"friendly_name": "living-room"}
+            )
+            hass.states.async_set("sensor.other", str(other))
+            await hass.async_block_till_done()
+            if minute % 5 == 0:
+                await c.async_tick()
+                if minute >= 0:
+                    temperatures.append(c.data.temperature)
+                    targets.append(c.last_commands["climate.split"][1])
+                    if minute in (5, 10, 15, 20):
+                        assert (
+                            "living-room sensor transient ignored" in c.data.explanation
+                        )
+    assert max(temperatures) - min(temperatures) <= 0.5
+    assert max(targets) <= targets[0]
+    # Warmup rows learn; the cold and hot excursions add no contaminated rows.
+    assert c.learning.rows["sensor.room"].samples == 3
+    assert c.learning.rows["sensor.other"].samples == 8
+    attrs = hass.states.get("climate.house").attributes
+    assert attrs["raw_sensor_readings"]["sensor.room"]["value"] == 22
+    assert attrs["filtered_sensor_readings"] == c.data.readings
+    assert (await c.store.async_load())["filters"]["sensor.room"] == c.filters[
+        "sensor.room"
+    ].to_dict()
+
+
+async def test_completed_transient_between_ticks_skips_learning(hass, installed):
+    entry, _ = installed
+    c = entry.runtime_data
+    c.config["outdoor_sensor"] = "sensor.outdoor"
+    hass.states.async_set("sensor.outdoor", "5")
+    start = dt_util.utcnow()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow", return_value=start
+    ):
+        await c.async_tick()
+    before = deepcopy(c.learning.to_dict())
+    for minute, value in [(1, 15), (3, 19)]:
+        with patch(
+            "custom_components.house_climate.coordinator.dt_util.utcnow",
+            return_value=start + timedelta(minutes=minute),
+        ):
+            hass.states.async_set("sensor.room", str(value))
+            await hass.async_block_till_done()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(minutes=5),
+    ):
+        await c.async_tick()
+    assert c.learning.to_dict() == before
+    assert c.data.readings == {"sensor.room": 19}
+    assert "sensor transient ignored" in c.data.explanation
+    # The median window and rejected interval survive an actual integration reload.
+    saved = c.filters["sensor.room"].to_dict()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(minutes=6),
+    ):
+        assert await hass.config_entries.async_reload(entry.entry_id)
+    restored = entry.runtime_data.filters["sensor.room"]
+    assert restored.rejected == saved["rejected"]
+    assert restored.value((start + timedelta(minutes=6)).timestamp()) == 19

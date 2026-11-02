@@ -42,9 +42,10 @@ by domain and, for temperature, power and occupancy sources, device class.
 - Outdoor temperature sensor, optional weather entity, optional solar power sensor, optional
   occupancy sensor.
 - Tunables with defaults: control interval 5 min, mode-switch deadband 1.0 °C, minimum time in a
-  mode 60 min, sensor stale after 720 min (12 h), frozen after 4 h, offset clamp ±3.0 °C, max offset change per interval 0.5 °C.
+  mode 60 min, sensor stale after 720 min (12 h), frozen after 4 h, median window `filter_minutes` 15 min, maximum sensor rate
+  `max_rate` 0.5 °C/min, offset clamp ±3.0 °C, max offset change per interval 0.5 °C.
 
-## Control loop (v0.2.1)
+## Control loop (v0.2.2)
 
 Every control interval, and immediately when the house setpoint or mode changes:
 
@@ -70,7 +71,28 @@ Every control interval, and immediately when the house setpoint or mode changes:
    Raise a warning repair per not-reporting member, naming the sensor and last real change
    and asking the user to check its battery; clear the repair on recovery. Expose the same
    details in `climate.house.not_reporting` and `last_decision`.
-   House temperature = weighted mean of the remaining reporting sensors.
+   Each member has a generic rolling, time-weighted median over `filter_minutes`
+   (default 15 minutes); readings hold their value until the next state change.
+   Capture every sensor state-change event, including events between control passes.
+   Unknown/unavailable periods carry no median weight and remain unavailable at the
+   current endpoint. Control, house mean/spread and learning all use these medians;
+   the existing reporting/staleness checks still apply to the raw member.
+   A movement faster than `max_rate` (default 0.5 °C/min) opens a pending excursion,
+   immediately withholding its readings from control and learning. Returning to within
+   one minute's allowed movement of the pre-excursion value, or crossing that value,
+   within the filter window confirms a transient. Exclude its held intervals from the
+   median; name the member in `last_decision` as “sensor transient ignored”. If it
+   does not return, admit the sustained change after the window expires. While all
+   elapsed readings are withheld, hold the pre-excursion value. This is symmetric
+   for upward/downward excursions and assumes no device type or operating cycle.
+   Skip learning rows whose interval overlaps a pending or confirmed excursion,
+   including an excursion that starts and ends between passes. Require clean endpoints
+   before resuming. Keep only the rolling event window plus its preceding value,
+   rejected intervals and pending anchor in Store for restart continuity; do not
+   archive event history. Restarts still start a fresh learning/runtime interval.
+   House temperature = weighted mean of the remaining filtered reporting sensors.
+   `climate.house.raw_sensor_readings` exposes raw value, age, state and reporting
+   status alongside `filtered_sensor_readings` (also the existing `sensor_readings`).
 2. Mode. If the house mode is `heat` or `cool`, use it. If it is `heat_cool`, pick heat when the
    house temperature is below setpoint − deadband, cool when above setpoint + deadband, otherwise
    keep the current mode; never switch sooner than the minimum time in a mode. Outdoor temperature
@@ -173,6 +195,7 @@ hours, and exploration active early but absent at the end.
   here and is unit-tested directly.
 - `learning.py`: pure online RLS, confidence blending, runtime integration and model persistence.
 - `reporting.py`: pure persisted value-change and HVAC activity tracking for frozen sensors.
+- `filtering.py`: pure bounded time-weighted median and generic transient rejection.
 - `climate.py`, `button.py`, `sensor.py`, `switch.py`, `config_flow.py`, `__init__.py`,
   `coordinator.py`: thin HA wiring around the controller.
 - Tests: `tests/test_controller.py` (pure), plus HA tests with
@@ -199,3 +222,12 @@ catch stale devices even when HA refreshes state metadata. Repairs and thermosta
 identify affected sensors; control and learning use only reporting rooms. Regression coverage
 includes five-hour freezes, idle systems, recovery, persistence, recorder seeding, stale device
 timestamps and unchanged excluded learning rows.
+
+## 0.2.2 fixes
+
+Generic per-sensor time-weighted medians and rate-based transient rejection protect both
+control and learning from brief sensor excursions. Added the `filter_minutes` and
+`max_rate` options, raw/filtered thermostat diagnostics and bounded restart recovery.
+Regression coverage replays the November 2 real-house cold excursion and warm recovery,
+checks stable house temperature and no split target increase, skips contaminated learning
+rows, and tracks a genuine 0.1 °C/min hour-long drop with less than 15 minutes of lag.

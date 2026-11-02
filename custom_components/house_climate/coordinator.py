@@ -23,6 +23,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .controller import ControlState, Device, Reading, control
+from .filtering import SensorFilter
 from .learning import EffortTracker, Learning
 from .reporting import Reporting
 
@@ -50,6 +51,13 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.reporting = Reporting()
         self.not_reporting = {}
         self.history_seeded = False
+        self.filters = {
+            m["entity_id"]: SensorFilter(
+                self.config.get("filter_minutes", 15), self.config.get("max_rate", 0.5)
+            )
+            for m in self.config["sensors"]
+        }
+        self.raw_readings = {}
 
     def new_learning(self):
         return Learning(
@@ -66,6 +74,12 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.samples = saved.get("samples", [])
             self.restored = True
             self.reporting = Reporting(saved.get("reporting"))
+            for key in self.filters:
+                self.filters[key] = SensorFilter(
+                    self.config.get("filter_minutes", 15),
+                    self.config.get("max_rate", 0.5),
+                    saved.get("filters", {}).get(key),
+                )
             if saved.get("learning"):
                 self.learning = Learning.from_dict(saved["learning"])
                 self.learning.reconcile(
@@ -113,6 +127,10 @@ class HouseCoordinator(DataUpdateCoordinator):
             value = float(new.state) if new else None
         except TypeError, ValueError:
             value = None
+        self.filters[entity_id].observe(
+            value if value is not None and isfinite(value) else None,
+            dt_util.utcnow().timestamp(),
+        )
         self.reporting.observe(
             entity_id,
             value if value is not None and isfinite(value) else None,
@@ -248,8 +266,19 @@ class HouseCoordinator(DataUpdateCoordinator):
                     )
                 else:
                     ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+                sensor_filter = self.filters.setdefault(
+                    entity_id,
+                    SensorFilter(
+                        self.config.get("filter_minutes", 15),
+                        self.config.get("max_rate", 0.5),
+                    ),
+                )
+                sensor_filter.observe(value, now.timestamp())
+                filtered = sensor_filter.value(now.timestamp())
                 readings[entity_id] = Reading(
-                    value, age, entity_id not in self.not_reporting
+                    filtered if value is not None else None,
+                    age,
+                    entity_id not in self.not_reporting,
                 )
                 raw[entity_id] = {
                     "value": value,
@@ -257,6 +286,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                     "state": entity.state if entity else None,
                     "not_reporting": entity_id in self.not_reporting,
                 }
+            self.raw_readings = raw
             if self.learning_baseline is not None:
                 baseline, outdoor_before, solar_before = self.learning_baseline
                 self.learning_baseline = (
@@ -264,6 +294,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                         key: value
                         for key, value in baseline.items()
                         if key not in self.not_reporting
+                        and not self.filters[key].blocked
                     },
                     outdoor_before,
                     solar_before,
@@ -303,7 +334,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                 valid = {
                     key: r.value
                     for key, r in readings.items()
-                    if r.reporting
+                    if not self.filters[key].blocked
+                    and r.reporting
                     and r.value is not None
                     and r.age <= self.config.get("stale_after", 720) * 60
                 }
@@ -322,6 +354,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                         duration / (self.config.get("interval", 5) * 60),
                     )
                 self.learning_baseline = (valid, outdoor, solar)
+                for sensor_filter in self.filters.values():
+                    sensor_filter.finish_interval()
             decision = control(
                 self.config,
                 self.state,
@@ -332,6 +366,11 @@ class HouseCoordinator(DataUpdateCoordinator):
                 self.enabled,
                 self.learning,
             )
+            for entity_id, sensor_filter in self.filters.items():
+                if sensor_filter.pending or sensor_filter.rejected:
+                    entity = self.hass.states.get(entity_id)
+                    name = entity.name if entity else entity_id
+                    decision.explanation += f" {name} sensor transient ignored."
             for entity_id, details in self.not_reporting.items():
                 decision.explanation += (
                     f" {entity_id}: not reporting ({details['reason']}); "
@@ -395,6 +434,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                     "samples": self.samples,
                     "learning": self.learning.to_dict(),
                     "reporting": self.reporting.to_dict(),
+                    "filters": {key: f.to_dict() for key, f in self.filters.items()},
                 }
             )
             self.async_set_updated_data(decision)

@@ -45,7 +45,9 @@
           "ki": "Integral gain",
           "learning_forgetting": "Learning forgetting factor per sample",
           "learning_n0": "Learning prior blend sample count",
-          "frozen_after": "Unchanged sensor limit during HVAC activity (hours)"
+          "frozen_after": "Unchanged sensor limit during HVAC activity (hours)",
+          "filter_minutes": "Sensor median window (minutes)",
+          "max_rate": "Maximum sensor rate (\u00b0C/min)"
         }
       }
     },
@@ -102,7 +104,9 @@
           "ki": "Integral gain",
           "learning_forgetting": "Learning forgetting factor per sample",
           "learning_n0": "Learning prior blend sample count",
-          "frozen_after": "Unchanged sensor limit during HVAC activity (hours)"
+          "frozen_after": "Unchanged sensor limit during HVAC activity (hours)",
+          "filter_minutes": "Sensor median window (minutes)",
+          "max_rate": "Maximum sensor rate (\u00b0C/min)"
         }
       }
     },

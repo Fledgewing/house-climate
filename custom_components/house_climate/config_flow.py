@@ -148,6 +148,8 @@ class HouseSteps:
             ] = entities(domain, device_class=device_class)
         for key, low, high, step in [
             ("interval", 1, 60, 1),
+            ("filter_minutes", 1, 120, 1),
+            ("max_rate", 0.01, 10, 0.01),
             ("stale_after", 1, 10080, 1),
             ("frozen_after", 1, 168, 0.5),
             ("deadband", 0.1, 10, 0.1),
