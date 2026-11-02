@@ -2,6 +2,8 @@
 
 from copy import deepcopy
 from dataclasses import asdict
+from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -273,7 +275,7 @@ async def test_sample_retention_and_restore(hass, installed):
     assert not entry.runtime_data.enabled
 
 
-async def complete_flow(manager, result, sensors, systems):
+async def complete_flow(manager, result, sensors, systems, stale_after=720):
     result = await manager.async_configure(
         result["flow_id"], {"sensors": sensors, "systems": systems}
     )
@@ -292,6 +294,9 @@ async def complete_flow(manager, result, sensors, systems):
     tunables = {
         k: v for k, v in DEFAULTS.items() if k not in ("sensors", "systems") and v != ""
     }
+    fields = {field.schema: field for field in result["data_schema"].schema}
+    assert fields["stale_after"].default() == 720
+    tunables["stale_after"] = stale_after
     return await manager.async_configure(result["flow_id"], tunables)
 
 
@@ -327,6 +332,8 @@ async def test_config_flow_creates_entry(hass):
 
 
 async def test_options_add_remove_reweight(hass, settings):
+    # Existing 0.1.1 entries have no stale_after option.
+    settings.pop("stale_after")
     entry = MockConfigEntry(domain=DOMAIN, unique_id=DOMAIN, data=settings)
     entry.add_to_hass(hass)
     result = await hass.config_entries.options.async_init(entry.entry_id)
@@ -335,6 +342,7 @@ async def test_options_add_remove_reweight(hass, settings):
         result,
         ["sensor.new", "sensor.another"],
         ["climate.third"],
+        stale_after=180,
     )
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert entry.options["sensors"] == [
@@ -342,6 +350,7 @@ async def test_options_add_remove_reweight(hass, settings):
         {"entity_id": "sensor.another", "weight": 2.0, "zone": "Room"},
     ]
     assert entry.options["systems"][0]["influence"] == ["sensor.new", "sensor.another"]
+    assert entry.options["stale_after"] == 180
 
 
 async def test_empty_selection(hass):
@@ -362,13 +371,20 @@ async def test_external_changes_are_explained_and_reasserted(hass, installed):
         {"entity_id": "climate.house", "hvac_mode": "heat"},
         blocking=True,
     )
-    await hass.services.async_call(
-        "climate",
-        "set_temperature",
-        {"entity_id": "climate.ducted", "temperature": 18},
-        blocking=True,
+    event_time = entry.runtime_data.last_commands["climate.ducted"][2] + timedelta(
+        seconds=121
     )
-    await hass.async_block_till_done()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=event_time,
+    ):
+        await hass.services.async_call(
+            "climate",
+            "set_temperature",
+            {"entity_id": "climate.ducted", "temperature": 18},
+            blocking=True,
+        )
+        await hass.async_block_till_done()
     assert "changed outside house control" in entry.runtime_data.data.explanation
     calls.clear()
     await entry.runtime_data.async_tick()
@@ -378,6 +394,95 @@ async def test_external_changes_are_explained_and_reasserted(hass, installed):
         and data["temperature"] == 19
         for entity_id, service, data in calls
     )
+
+
+@pytest.mark.parametrize("delay", [10, 121])
+async def test_delayed_command_echo_is_not_an_outside_change(hass, installed, delay):
+    entry, calls = installed
+    # Simulate a device accepting the command but reporting its target later.
+    with patch.object(MockSystem, "async_set_temperature", return_value=None):
+        await entry.runtime_data.async_change(mode="heat", setpoint=21)
+    target = entry.runtime_data.last_commands["climate.ducted"][1]
+    assert hass.states.get("climate.ducted").attributes["temperature"] != target
+    event_time = entry.runtime_data.last_commands["climate.ducted"][2] + timedelta(
+        seconds=delay
+    )
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=event_time,
+    ):
+        await hass.services.async_call(
+            "climate",
+            "set_temperature",
+            {"entity_id": "climate.ducted", "temperature": target},
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+    assert "changed outside house control" not in entry.runtime_data.data.explanation
+    assert (
+        "changed outside house control"
+        not in hass.states.get("climate.house").attributes["last_decision"]
+    )
+
+
+@pytest.mark.parametrize("delay", [10, 120, 121])
+@pytest.mark.parametrize(
+    "service,data",
+    [
+        ("set_temperature", {"temperature": 18}),
+        ("set_hvac_mode", {"hvac_mode": "cool"}),
+    ],
+)
+async def test_outside_change_grace_period(hass, installed, delay, service, data):
+    entry, _ = installed
+    await entry.runtime_data.async_change(mode="heat", setpoint=21)
+    event_time = entry.runtime_data.last_commands["climate.ducted"][2] + timedelta(
+        seconds=delay
+    )
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=event_time,
+    ):
+        await hass.services.async_call(
+            "climate",
+            service,
+            {"entity_id": "climate.ducted", **data},
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+    assert ("changed outside house control" in entry.runtime_data.data.explanation) is (
+        delay > 120
+    )
+
+
+@pytest.mark.parametrize("has_last_reported", [True, False])
+async def test_sensor_age_uses_report_time_with_update_fallback(
+    hass, installed, has_last_reported
+):
+    entry, _ = installed
+    now = dt_util.utcnow()
+    sensor = SimpleNamespace(
+        state="19",
+        attributes={},
+        last_updated=now - timedelta(hours=13),
+    )
+    if has_last_reported:
+        sensor.last_reported = now - timedelta(minutes=93)
+    get_state = hass.states.get
+    with patch.object(
+        type(hass.states),
+        "get",
+        side_effect=lambda entity_id: (
+            sensor if entity_id == "sensor.room" else get_state(entity_id)
+        ),
+    ):
+        await entry.runtime_data.async_tick()
+    result = entry.runtime_data.data
+    if has_last_reported:
+        assert result.readings == {"sensor.room": 19}
+    else:
+        assert result.readings == {}
+        assert "sensor.room: stale reading" in result.explanation
 
 
 async def test_config_flow_empty_defaults_and_selector_filters(hass):

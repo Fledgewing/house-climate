@@ -65,10 +65,19 @@ def control(config, state, readings, devices, now, outdoor=None, enabled=True):
     user requests do not buy additional slew allowance between timed intervals.
     """
     members = config["sensors"]
+    stale_after = config.get("stale_after", 720) * 60
+    notes = [
+        f"{m['entity_id']}: stale reading older than {stale_after / 60:g} minutes; dropped."
+        for m in members
+        if (r := readings.get(m["entity_id"])) is not None
+        and r.value is not None
+        and isfinite(r.value)
+        and r.age > stale_after
+    ]
     values = {
         k: r.value
         for k, r in readings.items()
-        if r.value is not None and isfinite(r.value) and 0 <= r.age <= 1800
+        if r.value is not None and isfinite(r.value) and r.age <= stale_after
     }
     values = {
         m["entity_id"]: values[m["entity_id"]]
@@ -83,7 +92,6 @@ def control(config, state, readings, devices, now, outdoor=None, enabled=True):
     elapsed = interval if state.last_update is None else max(0, now - state.last_update)
     dt = 1 if elapsed >= interval else 0
     mode = state.mode
-    notes = []
     if mode == "heat_cool":
         mode = state.active_mode
         deadband = config.get("deadband", 1)
@@ -110,7 +118,13 @@ def control(config, state, readings, devices, now, outdoor=None, enabled=True):
         mode = "off"
         notes.append("Outdoor temperature vetoed operation.")
     if not enabled:
-        return Decision(house, spread, values, [], "Control disabled; observing only.")
+        return Decision(
+            house,
+            spread,
+            values,
+            [],
+            " ".join(["Control disabled; observing only.", *notes]),
+        )
     if mode != state.active_mode:
         state.active_mode, state.last_switch = mode, now
     commands = []

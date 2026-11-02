@@ -51,7 +51,12 @@ def test_weighted_house_and_spread(config):
 
 @pytest.mark.parametrize(
     "bad",
-    [Reading(None), Reading(23, 1801), Reading(float("nan")), Reading(float("inf"))],
+    [
+        Reading(None),
+        Reading(23, 720 * 60 + 1),
+        Reading(float("nan")),
+        Reading(float("inf")),
+    ],
 )
 def test_invalid_and_stale(config, bad):
     result = run(config, readings={"sensor.a": Reading(20), "sensor.b": bad})
@@ -61,7 +66,22 @@ def test_invalid_and_stale(config, bad):
 
 
 def test_staleness_boundary(config):
-    assert run(config, readings={"sensor.a": Reading(19, 1800)}).temperature == 19
+    assert run(config, readings={"sensor.a": Reading(19, 720 * 60)}).temperature == 19
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_configured_staleness_drops_and_names_sensor(config, enabled):
+    config["stale_after"] = 120
+    result = run(
+        config,
+        readings={"sensor.a": Reading(19, 7200), "sensor.b": Reading(25, 7201)},
+        enabled=enabled,
+    )
+    assert result.readings == {"sensor.a": 19}
+    assert result.temperature == 19
+    assert (
+        "sensor.b: stale reading older than 120 minutes; dropped." in result.explanation
+    )
 
 
 @pytest.mark.parametrize(
@@ -166,7 +186,7 @@ def test_off(config):
     assert result.commands == [("climate.a", "set_hvac_mode", {"hvac_mode": "off"})]
 
 
-def test_multiroom_scenario():
+def test_multiroom_with_four_quiet_sensors_raises_whole_house_offset():
     config = deepcopy(DEFAULTS)
     sensors = [f"sensor.room_{i}" for i in range(6)]
     config["sensors"] = [{"entity_id": entity_id, "weight": 1} for entity_id in sensors]
@@ -174,17 +194,22 @@ def test_multiroom_scenario():
         {"entity_id": "climate.ducted", "influence": sensors, "preset": "manual"},
         {"entity_id": "climate.split", "influence": sensors[:2], "preset": ""},
     ]
-    values = [21.5, 23.0, 20.3, 18.7, 21.7, 16.9]
+    values = [22.5, 20.0, 20.3, 18.7, 21.7, 16.9]
     readings = {
-        s["entity_id"]: Reading(t)
-        for s, t in zip(config["sensors"], values, strict=True)
+        entity_id: Reading(t, 0 if i < 2 else 93 * 60)
+        for i, (entity_id, t) in enumerate(zip(sensors, values, strict=True))
     }
     state = ControlState(setpoint=21, mode="heat")
     devices = {s["entity_id"]: Device() for s in config["systems"]}
     result = control(config, state, readings, devices, 10000)
-    assert result.temperature == pytest.approx(20.35)
+    assert result.readings == dict(zip(sensors, values, strict=True))
+    assert result.temperature == pytest.approx(20.0166666667)
     assert state.offsets[config["systems"][0]["entity_id"]] == 0.5
-    assert state.offsets[config["systems"][1]["entity_id"]] == -0.5
+    assert (
+        "climate.ducted",
+        "set_temperature",
+        {"temperature": 21.5},
+    ) in result.commands
 
 
 def test_device_limit_antiwindup(config):

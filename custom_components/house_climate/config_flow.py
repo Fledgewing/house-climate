@@ -168,6 +168,7 @@ class HouseSteps:
             ] = entities(domain, device_class=device_class)
         for key, low, high, step in [
             ("interval", 1, 60, 1),
+            ("stale_after", 1, 10080, 1),
             ("deadband", 0.1, 10, 0.1),
             ("minimum_dwell", 0, 1440, 1),
             ("offset_clamp", 0, 10, 0.5),
@@ -199,7 +200,8 @@ class HouseConfigFlow(HouseSteps, config_entries.ConfigFlow, domain=DOMAIN):
 
 class HouseOptionsFlow(HouseSteps, config_entries.OptionsFlow):
     async def async_step_init(self, user_input=None):
-        self.settings = deepcopy(
-            dict(self.config_entry.options or self.config_entry.data)
+        self.settings = deepcopy(DEFAULTS)
+        self.settings.update(
+            deepcopy(dict(self.config_entry.options or self.config_entry.data))
         )
         return await self.async_step_user(user_input)

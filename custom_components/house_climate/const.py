@@ -10,6 +10,7 @@ DEFAULTS = {
     "solar_sensor": "",
     "occupancy_sensor": "",
     "interval": 5,
+    "stale_after": 720,
     "deadband": 1.0,
     "minimum_dwell": 60,
     "offset_clamp": 3.0,

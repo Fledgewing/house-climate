@@ -37,6 +37,7 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.samples = []
         self.store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
         self.lock = asyncio.Lock()
+        self.last_commands = {}
 
     async def async_load(self):
         if saved := await self.store.async_load():
@@ -72,6 +73,14 @@ class HouseCoordinator(DataUpdateCoordinator):
         if old.state != new.state or old.attributes.get(
             "temperature"
         ) != new.attributes.get("temperature"):
+            commanded = self.last_commands.get(new.entity_id)
+            if commanded is None:
+                return
+            mode, target, sent_at = commanded
+            if (dt_util.utcnow() - sent_at).total_seconds() <= 120 or (
+                new.state == mode and new.attributes.get("temperature") == target
+            ):
+                return
             note = f" {new.entity_id} changed outside house control; next interval will re-assert."
             _LOGGER.info("%s", note.strip())
             self.async_set_updated_data(
@@ -98,7 +107,12 @@ class HouseCoordinator(DataUpdateCoordinator):
                 entity = self.hass.states.get(entity_id)
                 value = self.number(entity_id)
                 # last_reported includes unchanged readings from reporting devices.
-                age = (now - entity.last_reported).total_seconds() if entity else 1e9
+                reported = (
+                    getattr(entity, "last_reported", None) or entity.last_updated
+                    if entity
+                    else None
+                )
+                age = (now - reported).total_seconds() if reported else 1e9
                 readings[entity_id] = Reading(value, age)
                 raw[entity_id] = {
                     "value": value,
@@ -150,6 +164,16 @@ class HouseCoordinator(DataUpdateCoordinator):
                         {"entity_id": entity_id, **data},
                         blocking=True,
                     )
+                    if service in ("set_hvac_mode", "set_temperature"):
+                        device = devices[entity_id]
+                        mode, target, _ = self.last_commands.get(
+                            entity_id, (device.mode, device.temperature, None)
+                        )
+                        self.last_commands[entity_id] = (
+                            data.get("hvac_mode", mode),
+                            data.get("temperature", target),
+                            dt_util.utcnow(),
+                        )
                 except HomeAssistantError as err:
                     failures.add(entity_id)
                     decision.explanation += f" {entity_id}: command failed ({err})."

@@ -42,14 +42,17 @@ by domain and, for temperature, power and occupancy sources, device class.
 - Outdoor temperature sensor, optional weather entity, optional solar power sensor, optional
   occupancy sensor.
 - Tunables with defaults: control interval 5 min, mode-switch deadband 1.0 °C, minimum time in a
-  mode 60 min, offset clamp ±3.0 °C, max offset change per interval 0.5 °C.
+  mode 60 min, sensor stale after 720 min (12 h), offset clamp ±3.0 °C, max offset change per interval 0.5 °C.
 
 ## Control loop (v1)
 
 Every control interval, and immediately when the house setpoint or mode changes:
 
-1. Read member sensors; drop unavailable or stale (>30 min) ones. House temperature = weighted
-   mean of the rest.
+1. Read member sensors; include finite numeric states unless unavailable/unknown. Battery and
+   Z-Wave sensors may report only on changes, so age is only a backstop: drop readings older
+   than `stale_after` minutes (default 720, editable in options), naming them in `last_decision`.
+   Age uses `last_reported` (falling back to `last_updated`) so unchanged reports refresh it.
+   House temperature = weighted mean of the rest.
 2. Mode. If the house mode is `heat` or `cool`, use it. If it is `heat_cool`, pick heat when the
    house temperature is below setpoint − deadband, cool when above setpoint + deadband, otherwise
    keep the current mode; never switch sooner than the minimum time in a mode. Outdoor temperature
@@ -65,8 +68,10 @@ Every control interval, and immediately when the house setpoint or mode changes:
    final setpoint to the device's min/max.
 4. Write only what changed: `climate.set_hvac_mode`, then `climate.set_temperature`. For a system with a
    configured required preset, re-assert that preset if it has left it.
-5. If someone changes a system's setpoint or mode outside the integration, log it in
-   `last_decision`; the next interval re-asserts (the House thermostat is the one control).
+5. Track each system's last successfully commanded mode and target. Report an outside change
+   in `last_decision` only when the reported mode/target differs from that command and more
+   than 2 minutes have passed since it, suppressing delayed device echoes. The next interval
+   re-asserts (the House thermostat is the one control).
 6. Fallbacks: if no member sensor is available, every system gets the house setpoint with zero
    offset. If a system is unavailable, skip it and keep controlling the others.
 
@@ -110,3 +115,9 @@ Public GitHub repository `Fledgewing/house-climate`. In HACS → Custom reposito
 `https://github.com/Fledgewing/house-climate` as an Integration, download, restart Home Assistant,
 then add the House Climate integration. Alternatively, copy `custom_components/house_climate`
 into `/config/custom_components/` and restart before adding the integration.
+
+## 0.1.2 fixes
+
+Replaced the 30-minute sensor cutoff with the configurable 12-hour backstop to keep healthy,
+quiet room sensors in whole-house control. Delayed HVAC command echoes no longer produce
+false outside-change notes; mismatches have a two-minute grace period.
