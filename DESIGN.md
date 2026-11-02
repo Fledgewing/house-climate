@@ -4,18 +4,21 @@ A Home Assistant custom integration (`custom_components/house_climate`, domain `
 that runs several HVAC systems as one house thermostat. It keeps them on the same heat/cool mode
 and gives each system its own setpoint so the temperatures across the house stay close together.
 
-## The house today (2026-11-01)
+## Example house
 
-| Role | Entity | Notes |
+These generic entity IDs illustrate a possible installation; users select their own entities.
+
+| Role | Example entity | Notes |
 |---|---|---|
-| Whole-house ducted system | `climate.home_zone_1` | Bryant Evolution Connex via `ha_carrier`. Modes off/fan_only/heat_cool/heat/cool. Step 0.5 °C, range 7–35. Presets include `manual` (hold); must stay on `manual`. Its built-in sensor sits in the living room, across the room from the Mitsubishi. |
-| Living-room mini-split | `climate.livingroom` | Mitsubishi via `kumo`. Modes off/cool/dry/heat/fan_only/heat_cool. Step 0.5 °C, range 7–35. |
-| Room sensors | `sensor.home_zone_1_temperature` (Bryant thermostat, living room), `sensor.livingroom_current_temperature` (Mitsubishi, living room), `sensor.upstairs_temperature_sensor_air_temperature`, `sensor.downstairs_temperature_sensor_air_temperature`, `sensor.office_sensor_air_temperature_2`, `sensor.guest_bedroom_sensor_air_temperature` | Spread on 2026-11-01 was about 6 °C (16.9 to 23.0). |
-| Outdoor | `sensor.home_outdoor_temperature` (Bryant outdoor unit), `weather.forecast_home` (Met.no) | |
-| Sun gain proxy | `sensor.envoy_202252012437_current_power_production` (kW) | Solar output stands in for sun on the house. |
-| Occupancy | `binary_sensor.home_zone_1_occupancy` | |
+| Whole-house ducted system | `climate.ducted` | A system with a built-in living-room sensor and an optional required `manual` hold preset. |
+| Living-room mini-split | `climate.living_room` | A second system that trims the living room. |
+| Room sensors | `sensor.ducted_temperature`, `sensor.living_room_temperature`, `sensor.upstairs_temperature`, `sensor.downstairs_temperature`, `sensor.office_temperature`, `sensor.guest_room_temperature` | Member sensors across the house. |
+| Outdoor | `sensor.outdoor_temperature`, `weather.home` | Optional temperature sensor and fallback weather source. |
+| Sun gain proxy | `sensor.solar_power` (kW) | Solar output stands in for sun on the house. |
+| Occupancy | `binary_sensor.occupancy` | Optional occupancy source. |
 
-HA units are °C. All entity ids above are defaults in the config flow, never hard-coded in logic.
+HA units are °C. The config flow starts with no entity IDs selected. Entity selectors filter
+by domain and, for temperature, power and occupancy sources, device class.
 
 ## What the user sees
 
@@ -33,7 +36,7 @@ HA units are °C. All entity ids above are defaults in the config flow, never ha
 ## Configuration (config flow + options flow)
 
 - Systems (climate entities), each with the list of sensors it mainly affects ("influence") in v1.
-  Default: Bryant → all house sensors; Mitsubishi → the two living-room sensors.
+  Example: ducted system → all house sensors; mini-split → the two living-room sensors.
 - Member sensors, each with a weight (default 1.0) and an optional zone label. Adding a sensor
   later in the options flow is the "onboard a sensor" path; nothing else has to change.
 - Outdoor temperature sensor, optional weather entity, optional solar power sensor, optional
@@ -53,15 +56,15 @@ Every control interval, and immediately when the house setpoint or mode changes:
    vetoes nonsense: no cooling when outdoors is below 10 °C, no heating when above 24 °C
    (both tunable). Every system gets the same mode. `off` turns every system off.
 3. Per-system offset, from a PI controller on the error of the sensors that system influences:
-   - Bryant (whole house): error = setpoint − weighted mean of its influence sensors.
-   - Mitsubishi (living room): error = setpoint − weighted mean of the living-room sensors.
-   The Bryant pushes the whole house toward setpoint; the Mitsubishi trims the living room so the
-   Bryant's living-room sensor does not stop it early. The effect is to warm the cold rooms
+   - Ducted system (whole house): error = setpoint − weighted mean of its influence sensors.
+   - Mini-split (living room): error = setpoint − weighted mean of the living-room sensors.
+   The ducted system pushes the whole house toward setpoint; the mini-split trims the living room so the
+   ducted system's living-room sensor does not stop it early. The effect is to warm the cold rooms
    without overheating the living room.
    Anti-windup, clamp to ±offset clamp, rate-limit per interval, round to 0.5 °C, and clamp the
    final setpoint to the device's min/max.
-4. Write only what changed: `climate.set_hvac_mode`, then `climate.set_temperature`. For the
-   Bryant, re-assert preset `manual` if it has left it.
+4. Write only what changed: `climate.set_hvac_mode`, then `climate.set_temperature`. For a system with a
+   configured required preset, re-assert that preset if it has left it.
 5. If someone changes a system's setpoint or mode outside the integration, log it in
    `last_decision`; the next interval re-asserts (the House thermostat is the one control).
 6. Fallbacks: if no member sensor is available, every system gets the house setpoint with zero
@@ -96,5 +99,7 @@ data; until its fit is confident (tunable sample count), it uses the v1 influenc
 
 ## Install
 
-Private GitHub repo `Fledgewing/house-climate`. HACS does not support private repos, so the
-integration is copied into the HA `/config/custom_components/` directory, then HA restarts.
+Public GitHub repository `Fledgewing/house-climate`. In HACS → Custom repositories, add
+`https://github.com/Fledgewing/house-climate` as an Integration, download, restart Home Assistant,
+then add the House Climate integration. Alternatively, copy `custom_components/house_climate`
+into `/config/custom_components/` and restart before adding the integration.
