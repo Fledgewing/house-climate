@@ -1,6 +1,7 @@
 """Home Assistant 2026.10 wiring, flows, commands, and persisted samples."""
 
 from copy import deepcopy
+from dataclasses import asdict
 from unittest.mock import patch
 
 import pytest
@@ -13,14 +14,19 @@ from homeassistant.components.climate import (
 from homeassistant.components.climate.const import DATA_COMPONENT
 from homeassistant.config_entries import SOURCE_USER
 from homeassistant.const import UnitOfTemperature
+from homeassistant.core import State
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import selector
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_system import METRIC_SYSTEM
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    mock_restore_cache,
+)
 
 from custom_components.house_climate.const import DEFAULTS, DOMAIN
+from custom_components.house_climate.controller import ControlState
 
 pytestmark = pytest.mark.usefixtures("enable_custom_integrations")
 
@@ -45,7 +51,7 @@ class MockSystem(ClimateEntity):
 
     _attr_should_poll = False
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
-    _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL]
+    _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL, HVACMode.HEAT_COOL]
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
     )
@@ -79,20 +85,118 @@ class MockSystem(ClimateEntity):
 
 
 @pytest.fixture
-async def installed(hass, settings):
+async def installed(hass, settings, request):
     hass.config.units = METRIC_SYSTEM
     hass.states.async_set("sensor.room", "19", {"unit_of_measurement": "°C"})
     calls = []
     assert await async_setup_component(hass, "climate", {})
-    await hass.data[DATA_COMPONENT].async_add_entities(
-        [MockSystem(system["entity_id"], calls) for system in settings["systems"]]
-    )
+    systems = [MockSystem(system["entity_id"], calls) for system in settings["systems"]]
+    for system, (mode, target) in zip(
+        systems, getattr(request, "param", [("off", 19), ("off", 19)]), strict=True
+    ):
+        system._attr_available = mode != "unavailable"
+        system._attr_hvac_mode = HVACMode(mode) if system.available else HVACMode.OFF
+        system._attr_target_temperature = target
+    await hass.data[DATA_COMPONENT].async_add_entities(systems)
     entry = MockConfigEntry(domain=DOMAIN, unique_id=DOMAIN, data=settings)
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-    calls.clear()
     return entry, calls
+
+
+@pytest.mark.parametrize("installed", [[("heat", 23), ("heat", 21)]], indirect=True)
+async def test_fresh_setup_adopts_heat_without_turning_systems_off(hass, installed):
+    entry, calls = installed
+    house = hass.states.get("climate.house")
+    assert house.state == "heat"
+    assert house.attributes["temperature"] == 22.0
+    assert "Adopted" in house.attributes["last_decision"]
+    assert hass.states.get("switch.house_climate_control").state == "on"
+    await entry.runtime_data.async_tick()
+    assert not any(
+        service == "set_hvac_mode" and data["hvac_mode"] == "off"
+        for _, service, data in calls
+    )
+
+
+@pytest.mark.parametrize("installed", [[("heat", 23), ("cool", 21)]], indirect=True)
+async def test_fresh_setup_mixed_modes_observes_without_commands(hass, installed):
+    entry, calls = installed
+    house = hass.states.get("climate.house")
+    assert house.state == "off"
+    assert house.attributes["temperature"] == 22.0
+    assert "Systems disagree" in house.attributes["last_decision"]
+    assert hass.states.get("switch.house_climate_control").state == "off"
+    await entry.runtime_data.async_tick()
+    assert not calls
+    await hass.services.async_call(
+        "climate",
+        "set_hvac_mode",
+        {"entity_id": "climate.house", "hvac_mode": "heat"},
+        blocking=True,
+    )
+    assert entry.runtime_data.enabled
+    assert calls
+
+
+@pytest.mark.parametrize(
+    ("installed", "mode", "target", "enabled"),
+    [
+        ([("heat", 23), ("off", 21)], "off", 22.0, False),
+        ([("off", None), ("off", None)], "off", 21.0, False),
+        ([("unavailable", 23), ("unavailable", 21)], "off", 21.0, False),
+        ([("heat", 23), ("unavailable", 21)], "heat", 23.0, True),
+        ([("cool", 23.3), ("cool", 21.3)], "cool", 22.5, True),
+        ([("heat", 1), ("heat", 2)], "heat", 7.0, True),
+        ([("cool", 40), ("cool", 41)], "cool", 35.0, True),
+        ([("heat_cool", 19), ("heat_cool", 19)], "heat_cool", 19.0, True),
+    ],
+    indirect=["installed"],
+)
+async def test_fresh_adoption_fallbacks(hass, installed, mode, target, enabled):
+    entry, calls = installed
+    house = hass.states.get("climate.house")
+    assert house.state == mode
+    assert house.attributes["temperature"] == target
+    assert entry.runtime_data.enabled is enabled
+    assert not any(
+        service == "set_hvac_mode" and data["hvac_mode"] == "off"
+        for _, service, data in calls
+    )
+    if not enabled:
+        assert not calls
+
+
+@pytest.mark.parametrize("stored", [False, True])
+async def test_restored_state_wins_over_adoption(hass, settings, stored):
+    mock_restore_cache(hass, [State("climate.house", "cool", {"temperature": 24})])
+    for system in settings["systems"]:
+        hass.states.async_set(system["entity_id"], "heat", {"temperature": 23})
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=DOMAIN, data=settings)
+    entry.add_to_hass(hass)
+    saved = None
+    if stored:
+        saved = {
+            "state": asdict(ControlState(mode="heat", setpoint=20)),
+            "enabled": False,
+        }
+    with (
+        patch(
+            "custom_components.house_climate.coordinator.Store.async_load",
+            return_value=saved,
+        ),
+        patch("homeassistant.core.ServiceRegistry.async_call") as service_call,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    house = hass.states.get("climate.house")
+    assert house.state == ("heat" if stored else "cool")
+    assert house.attributes["temperature"] == (20 if stored else 24)
+    assert "Adopted" not in house.attributes["last_decision"]
+    if stored:
+        assert not entry.runtime_data.enabled
+        service_call.assert_not_called()
 
 
 async def test_setup_entities(hass, installed):
@@ -125,7 +229,7 @@ async def test_warmer_commands_and_disabled(hass, installed):
     await hass.services.async_call(
         "button", "press", {"entity_id": "button.house_warmer"}, blocking=True
     )
-    assert hass.states.get("climate.house").attributes["temperature"] == 21.5
+    assert hass.states.get("climate.house").attributes["temperature"] == 19.5
     targets = {
         entity_id for entity_id, service, _ in calls if service == "set_temperature"
     }
@@ -142,7 +246,7 @@ async def test_warmer_commands_and_disabled(hass, installed):
     )
     await entry.runtime_data.async_tick()
     assert not calls
-    assert entry.runtime_data.state.setpoint == 22
+    assert entry.runtime_data.state.setpoint == 20
     assert "observing" in entry.runtime_data.data.explanation
 
 
@@ -271,7 +375,7 @@ async def test_external_changes_are_explained_and_reasserted(hass, installed):
     assert any(
         entity_id == "climate.ducted"
         and service == "set_temperature"
-        and data["temperature"] == 21
+        and data["temperature"] == 19
         for entity_id, service, data in calls
     )
 

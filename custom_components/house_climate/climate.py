@@ -37,6 +37,7 @@ class HouseClimate(CoordinatorEntity, ClimateEntity, RestoreEntity):
                 self.coordinator.state.mode = last.state
             if (target := last.attributes.get(ATTR_TEMPERATURE)) is not None:
                 self.coordinator.state.setpoint = float(target)
+            self.coordinator.restored = True
 
     @property
     def available(self):

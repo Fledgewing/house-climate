@@ -73,6 +73,13 @@ Every control interval, and immediately when the house setpoint or mode changes:
 State (setpoint, mode, integrator values, last mode switch) survives restarts via `RestoreEntity`
 / `Store`.
 
+On a fresh setup with no restored state, adopt the available systems' shared heat, cool or
+heat_cool mode and their mean target, rounded to 0.5 °C and clamped to the House's 7–35 °C
+range (default 21 °C if no targets are available). If modes disagree, any available system is
+off, or no systems are available, start in off mode with control disabled: observe without
+sending commands until the user chooses a House mode. Explain this choice in `last_decision`.
+Restored state takes precedence over adoption.
+
 ## Learning (phase 2; v1 only records the data)
 
 v1 records a sample every interval to a `Store` file: every member sensor, outdoor temperature,

@@ -4,7 +4,7 @@ import asyncio
 import logging
 from dataclasses import asdict, replace
 from datetime import timedelta
-from math import isfinite
+from math import floor, isfinite
 
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import callback
@@ -32,6 +32,8 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.state = ControlState()
         self.enabled = True
         self.restored = False
+        self.initialized = False
+        self.awaiting_mode = False
         self.samples = []
         self.store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
         self.lock = asyncio.Lock()
@@ -118,6 +120,11 @@ class HouseCoordinator(DataUpdateCoordinator):
                     preset=entity.attributes.get("preset_mode"),
                     hvac_action=entity.attributes.get("hvac_action"),
                 )
+            adoption = ""
+            if not self.initialized:
+                if not self.restored:
+                    adoption = self.adopt_systems(devices)
+                self.initialized = True
             outdoor = self.number(self.config.get("outdoor_sensor"))
             if outdoor is None:
                 outdoor = self.number(self.config.get("weather_entity"), "temperature")
@@ -130,6 +137,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                 outdoor,
                 self.enabled,
             )
+            if adoption:
+                decision.explanation = f"{adoption} {decision.explanation}"
             failures = set()
             for entity_id, service, data in decision.commands:
                 if entity_id in failures:
@@ -177,6 +186,28 @@ class HouseCoordinator(DataUpdateCoordinator):
             )
             self.async_set_updated_data(decision)
 
+    def adopt_systems(self, devices):
+        """Start fresh entries from current systems before issuing any commands."""
+        available = [device for device in devices.values() if device.available]
+        targets = [d.temperature for d in available if d.temperature is not None]
+        target = sum(targets) / len(targets) if targets else 21
+        self.state.setpoint = max(7, min(35, floor(target * 2 + 0.5) / 2))
+        modes = {device.mode for device in available}
+        if len(modes) == 1 and modes <= {"heat", "cool", "heat_cool"}:
+            self.state.mode = modes.pop()
+            # Auto mode retains the systems' current mode inside the deadband.
+            self.state.active_mode = self.state.mode
+            note = f"Adopted the systems' current {self.state.mode} mode."
+        else:
+            self.state.mode = "off"
+            self.enabled = False
+            self.awaiting_mode = True
+            note = (
+                "Systems disagree, are off, or have no available mode; "
+                "control is off and observing only until you choose a House mode."
+            )
+        return f"{note} Starting House target is {self.state.setpoint:.1f} °C."
+
     async def async_change(self, *, setpoint=None, delta=None, mode=None, enabled=None):
         # Mutations share the lock with in-flight commands.
         async with self.lock:
@@ -186,6 +217,9 @@ class HouseCoordinator(DataUpdateCoordinator):
                 self.state.setpoint = max(7, min(35, round(setpoint * 2) / 2))
             if mode is not None:
                 self.state.mode = mode
+                if self.awaiting_mode:
+                    self.enabled = True
+                    self.awaiting_mode = False
             if enabled is not None:
                 self.enabled = enabled
         await self.async_tick(record=False)
