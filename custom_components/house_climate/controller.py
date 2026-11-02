@@ -8,6 +8,7 @@ from math import floor, isfinite
 class Reading:
     value: float | None
     age: float = 0
+    reporting: bool = True
 
 
 @dataclass
@@ -79,7 +80,10 @@ def control(
     values = {
         k: r.value
         for k, r in readings.items()
-        if r.value is not None and isfinite(r.value) and r.age <= stale_after
+        if r.reporting
+        and r.value is not None
+        and isfinite(r.value)
+        and r.age <= stale_after
     }
     values = {
         m["entity_id"]: values[m["entity_id"]]
@@ -136,7 +140,11 @@ def control(
         if not device.available:
             notes.append(f"{entity_id} unavailable; skipped.")
             continue
-        influence = learning.influences(entity_id) if learning else {}
+        influence = (
+            learning.influences(entity_id, values.keys() & learning.rows.keys())
+            if learning
+            else {}
+        )
         affected = [
             {**m, "weight": m.get("weight", 1) * influence.get(m["entity_id"], 0)}
             for m in members
@@ -170,7 +178,11 @@ def control(
             integral = state.integrals.get(entity_id, 0)
             candidate = integral + config.get("ki", 0.1) * error * dt
             raw = config.get("kp", 1) * error + candidate
-            dither = learning.dither(entity_id, now) if learning else 0
+            dither = (
+                learning.dither(entity_id, now, values.keys() & learning.rows.keys())
+                if learning
+                else 0
+            )
             if dither:
                 notes.append(f"{entity_id}: exploring ({dither:+.2f} °C dither).")
             raw += dither

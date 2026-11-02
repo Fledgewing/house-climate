@@ -149,6 +149,7 @@ class HouseSteps:
         for key, low, high, step in [
             ("interval", 1, 60, 1),
             ("stale_after", 1, 10080, 1),
+            ("frozen_after", 1, 168, 0.5),
             ("deadband", 0.1, 10, 0.1),
             ("minimum_dwell", 0, 1440, 1),
             ("offset_clamp", 0, 10, 0.5),

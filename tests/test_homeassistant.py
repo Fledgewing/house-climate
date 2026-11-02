@@ -653,3 +653,182 @@ async def test_action_events_during_command_lock_are_tracked(hass, installed):
         {"climate.ducted": "idle", "climate.split": "idle"}, now.timestamp() + 300
     )
     assert efforts["climate.ducted"] == pytest.approx(0.8)
+
+
+@pytest.mark.parametrize("active", [True, False])
+async def test_frozen_sensor_exclusion_repair_recovery_and_learning(
+    hass, installed, active
+):
+    """Five hours of repeated values only freezes a sensor with actual HVAC use."""
+    from homeassistant.helpers import issue_registry as ir
+
+    entry, _ = installed
+    coordinator = entry.runtime_data
+    coordinator.config["sensors"].append({"entity_id": "sensor.healthy", "weight": 1})
+    coordinator.learning.reconcile(
+        ["sensor.room", "sensor.healthy"], coordinator.learning.systems
+    )
+    coordinator.config["outdoor_sensor"] = "sensor.outdoor"
+    hass.states.async_set("sensor.outdoor", "5")
+    hass.states.async_set("sensor.healthy", "21")
+    start = dt_util.utcnow()
+    state = hass.states.get("climate.ducted")
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow", return_value=start
+    ):
+        hass.states.async_set(
+            state.entity_id,
+            state.state,
+            {**state.attributes, "hvac_action": "heating" if active else "idle"},
+        )
+        await hass.async_block_till_done()
+        await coordinator.async_tick()
+    before = deepcopy(coordinator.learning.to_dict()["rows"]["sensor.room"])
+    end = start + timedelta(hours=5)
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow", return_value=end
+    ):
+        # Attribute changes/report metadata must not count as a temperature change.
+        hass.states.async_set("sensor.room", "19.0", {"battery": 90})
+        hass.states.async_set("sensor.healthy", "21.5")
+        await hass.async_block_till_done()
+        await coordinator.async_tick()
+    issue_id = f"{entry.entry_id}_sensor.room_not_reporting"
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, issue_id)
+    assert ("sensor.room" in coordinator.not_reporting) is active
+    assert ("sensor.room" not in coordinator.data.readings) is active
+    if not active:
+        assert issue is None
+        assert coordinator.data.temperature == 20.25
+        return
+    assert coordinator.data.temperature == 21.5
+    assert coordinator.data.spread == 0
+    assert issue.severity == ir.IssueSeverity.WARNING
+    assert issue.translation_placeholders["sensor"] == "sensor.room"
+    assert "sensor.room: not reporting" in coordinator.data.explanation
+    assert "check its battery" in coordinator.data.explanation
+    assert coordinator.learning.to_dict()["rows"]["sensor.room"] == before
+    assert coordinator.learning.rows["sensor.healthy"].samples == 1
+    assert "sensor.room" in hass.states.get("climate.house").attributes["not_reporting"]
+    saved = await coordinator.store.async_load()
+    assert saved["reporting"]["sensors"]["sensor.room"]["frozen"]
+    # A restart refreshing HA state metadata cannot revive the sensor.
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    coordinator = entry.runtime_data
+    assert "sensor.room" in coordinator.not_reporting
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=end + timedelta(minutes=1),
+    ):
+        hass.states.async_set("sensor.room", "19.1")
+        await hass.async_block_till_done()
+    assert "sensor.room" not in coordinator.not_reporting
+    assert coordinator.data.readings["sensor.room"] == 19.1
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
+
+
+async def test_device_last_seen_excludes_at_startup(hass, settings):
+    from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
+    from homeassistant.helpers import issue_registry as ir
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=DOMAIN, data=settings)
+    entry.add_to_hass(hass)
+    device = dr.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id, identifiers={("generic", "room")}
+    )
+    registry = er.async_get(hass)
+    for name in ("room", "room_last_seen", "unrelated_last_seen"):
+        registry.async_get_or_create(
+            "sensor",
+            "generic",
+            name,
+            suggested_object_id=name,
+            device_id=device.id if name != "unrelated_last_seen" else None,
+        )
+    now = dt_util.utcnow()
+    hass.states.async_set("sensor.room", "15")
+    hass.states.async_set(
+        "sensor.room_last_seen",
+        (now - timedelta(days=120)).isoformat(),
+        {"device_class": "timestamp"},
+    )
+    hass.states.async_set(
+        "sensor.unrelated_last_seen", now.isoformat(), {"device_class": "timestamp"}
+    )
+    with patch("homeassistant.core.ServiceRegistry.async_call"):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    coordinator = entry.runtime_data
+    assert hass.states.get("sensor.room").last_updated >= now
+    assert coordinator.data.readings == {}
+    assert coordinator.data.temperature is None
+    assert (
+        coordinator.not_reporting["sensor.room"]["reason"]
+        == "device last seen is too old"
+    )
+    issue_id = f"{entry.entry_id}_sensor.room_not_reporting"
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is not None
+    # Timestamp signal independently recovers without needing temperature motion.
+    hass.states.async_set(
+        "sensor.room_last_seen", now.isoformat(), {"device_class": "timestamp"}
+    )
+    await coordinator.async_tick()
+    assert coordinator.data.readings == {"sensor.room": 15}
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
+
+
+async def test_recorder_seeds_numeric_changes_and_activity_on_startup(hass, settings):
+    """Restart/attribute updates of the same value are not real changes."""
+    from homeassistant.helpers.recorder import DATA_INSTANCE
+
+    from custom_components.house_climate.coordinator import HouseCoordinator
+
+    entry = MockConfigEntry(domain=DOMAIN, data=settings)
+    entry.add_to_hass(hass)
+    coordinator = HouseCoordinator(hass, entry)
+    now = dt_util.utcnow()
+    old = now - timedelta(hours=5)
+    hass.states.async_set("sensor.room", "19")
+    hass.states.async_set(
+        "climate.ducted", "heat", {"hvac_action": "heating", "temperature": 21}
+    )
+    history = {
+        "sensor.room": [
+            State("sensor.room", "18", last_updated=old - timedelta(minutes=5)),
+            State("sensor.room", "19", last_updated=old),
+            State(
+                "sensor.room", "unavailable", last_updated=now - timedelta(minutes=2)
+            ),
+            State("sensor.room", "19.0", last_updated=now - timedelta(minutes=1)),
+        ]
+    }
+    activity = {
+        "climate.ducted": [
+            State(
+                "climate.ducted", "heat", {"hvac_action": "heating"}, last_updated=old
+            )
+        ]
+    }
+
+    class Recorder:
+        async def async_add_executor_job(self, job):
+            return job()
+
+    hass.data[DATA_INSTANCE] = Recorder()
+    try:
+        with (
+            patch(
+                "homeassistant.components.recorder.history.get_significant_states",
+                side_effect=[history, activity],
+            ),
+            patch("homeassistant.core.ServiceRegistry.async_call"),
+        ):
+            await coordinator.async_tick()
+        assert (
+            coordinator.reporting.sensors["sensor.room"]["changed"] == old.timestamp()
+        )
+        assert "sensor.room" in coordinator.not_reporting
+        assert coordinator.data.readings == {}
+    finally:
+        hass.data.pop(DATA_INSTANCE)

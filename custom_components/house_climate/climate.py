@@ -60,6 +60,7 @@ class HouseClimate(CoordinatorEntity, ClimateEntity, RestoreEntity):
         data = self.coordinator.data
         return {
             "last_decision": data.explanation if data else "Starting",
+            "not_reporting": self.coordinator.not_reporting,
             "sensor_readings": data.readings if data else {},
             "active_mode": self.coordinator.state.active_mode,
         }

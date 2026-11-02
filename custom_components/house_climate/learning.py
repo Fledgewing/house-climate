@@ -112,8 +112,14 @@ class Learning:
         n = self.rows[sensor].counts[self.systems.index(system)]
         return n / (n + self.n0)
 
-    def system_confidence(self, system):
-        return min((self.confidence(s, system) for s in self.rows), default=0)
+    def system_confidence(self, system, sensors=None):
+        return min(
+            (
+                self.confidence(s, system)
+                for s in (self.rows if sensors is None else sensors)
+            ),
+            default=0,
+        )
 
     @property
     def confidence_percent(self):
@@ -125,13 +131,16 @@ class Learning:
         b = self.rows[sensor].theta[self.systems.index(system) + 1]
         return confidence * b + (1 - confidence) * PRIOR_B
 
-    def influences(self, system):
-        positive = {s: max(0, self.blended(s, system)) for s in self.rows}
+    def influences(self, system, sensors=None):
+        positive = {
+            s: max(0, self.blended(s, system))
+            for s in (self.rows if sensors is None else sensors)
+        }
         total = sum(positive.values())
         return {s: b / total for s, b in positive.items()} if total > 1e-9 else {}
 
-    def dither(self, system, now):
-        confidence = self.system_confidence(system)
+    def dither(self, system, now, sensors=None):
+        confidence = self.system_confidence(system, sensors)
         if confidence >= 0.8:
             return 0
         phase = (now / 7200 + self.systems.index(system) / len(self.systems)) % 1

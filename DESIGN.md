@@ -42,9 +42,9 @@ by domain and, for temperature, power and occupancy sources, device class.
 - Outdoor temperature sensor, optional weather entity, optional solar power sensor, optional
   occupancy sensor.
 - Tunables with defaults: control interval 5 min, mode-switch deadband 1.0 °C, minimum time in a
-  mode 60 min, sensor stale after 720 min (12 h), offset clamp ±3.0 °C, max offset change per interval 0.5 °C.
+  mode 60 min, sensor stale after 720 min (12 h), frozen after 4 h, offset clamp ±3.0 °C, max offset change per interval 0.5 °C.
 
-## Control loop (v0.2.0)
+## Control loop (v0.2.1)
 
 Every control interval, and immediately when the house setpoint or mode changes:
 
@@ -52,7 +52,25 @@ Every control interval, and immediately when the house setpoint or mode changes:
    Z-Wave sensors may report only on changes, so age is only a backstop: drop readings older
    than `stale_after` minutes (default 720, editable in options), naming them in `last_decision`.
    Age uses `last_reported` (falling back to `last_updated`) so unchanged reports refresh it.
-   House temperature = weighted mean of the rest.
+   Independently, persist each sensor's numeric value and last real value-change time;
+   unchanged reports, attribute changes, unavailable markers and HA restarts do not reset it.
+   A value unchanged for `frozen_after` hours (default 4, editable in options) with at least
+   one hour of observed heating/cooling in that window is "not reporting". Count the union
+   of actual `hvac_action` activity across systems, including action changes between ticks;
+   idle/off time and unobserved downtime do not count. Once frozen, exclude the sensor until
+   its first numeric value change, which triggers recovery immediately.
+   At startup, seed from retained recorder history when available: compare numeric values
+   across restart markers to find the last actual change, plus action history for the activity
+   window. If retention has no earlier different value, the earliest retained observation is
+   a conservative lower bound on unchanged age. Without history, use Store evidence or start
+   observing now.
+   Optionally resolve timestamp entities ending in `_last_seen` on the member's registered
+   device. A timestamp older than `stale_after` independently excludes that member; no device
+   protocol or entity IDs are assumed. This signal clears when the timestamp becomes fresh.
+   Raise a warning repair per not-reporting member, naming the sensor and last real change
+   and asking the user to check its battery; clear the repair on recovery. Expose the same
+   details in `climate.house.not_reporting` and `last_decision`.
+   House temperature = weighted mean of the remaining reporting sensors.
 2. Mode. If the house mode is `heat` or `cool`, use it. If it is `heat_cool`, pick heat when the
    house temperature is below setpoint − deadband, cool when above setpoint + deadband, otherwise
    keep the current mode; never switch sooner than the minimum time in a mode. Outdoor temperature
@@ -120,7 +138,7 @@ amplitude fades linearly to zero at 80% confidence. This stays inside the existi
 limits, and `last_decision` says `exploring` while it is active. Off mode and observe-only control
 send no exploration commands. Adding a room can restart exploration while its new row learns.
 
-A missing/nonfinite/stale room reading at either interval endpoint skips only that room's sample.
+A missing/nonfinite/stale/not-reporting room reading at either interval endpoint skips only that room's sample. Excluded rows retain all coefficients, covariance, counts and fit errors unchanged; their confidence also does not drive control exploration.
 Missing outdoor context or any system effort skips the whole interval. Configure an outdoor
 sensor or fallback weather temperature for learning. Solar is zero when no solar source is
 configured; a configured missing source or unsupported unit skips the interval. W, kW and MW are
@@ -128,7 +146,7 @@ converted to kW. Occupancy remains recorded context, outside this model. Immedia
 run control without adding training samples or resetting runtime accumulation.
 
 The Store persists coefficients, full covariance, effective counts, residual errors and sample
-counts alongside existing control state and the last 30 days of observations. Restarts retain
+counts alongside persisted value-change clocks, frozen status, observed activity intervals, existing control state and the last 30 days of observations. Restarts retain
 the fit but start a new observation interval, avoiding invented runtime across downtime. Adding
 a sensor creates a neutral row immediately and retains existing rows; removing one deletes its
 row. Adding/removing/reordering systems reconciles coefficient and covariance columns by entity
@@ -154,6 +172,7 @@ hours, and exploration active early but absent at the end.
   readings + config + state, returns the commands and the explanation. All the logic above lives
   here and is unit-tested directly.
 - `learning.py`: pure online RLS, confidence blending, runtime integration and model persistence.
+- `reporting.py`: pure persisted value-change and HVAC activity tracking for frozen sensors.
 - `climate.py`, `button.py`, `sensor.py`, `switch.py`, `config_flow.py`, `__init__.py`,
   `coordinator.py`: thin HA wiring around the controller.
 - Tests: `tests/test_controller.py` (pure), plus HA tests with
@@ -171,3 +190,12 @@ into `/config/custom_components/` and restart before adding the integration.
 Replaced the 30-minute sensor cutoff with the configurable 12-hour backstop to keep healthy,
 quiet room sensors in whole-house control. Delayed HVAC command echoes no longer produce
 false outside-change notes; mismatches have a two-minute grace period.
+
+## 0.2.1 fixes
+
+Exclude frozen sensors after four unchanged hours with an hour of actual HVAC activity,
+with persisted clocks and recorder startup seeding. Optional device last-seen timestamps
+catch stale devices even when HA refreshes state metadata. Repairs and thermostat diagnostics
+identify affected sensors; control and learning use only reporting rooms. Regression coverage
+includes five-hour freezes, idle systems, recovery, persistence, recorder seeding, stale device
+timestamps and unchanged excluded learning rows.

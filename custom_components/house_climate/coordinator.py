@@ -9,10 +9,14 @@ from math import floor, isfinite
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_interval,
 )
+from homeassistant.helpers.recorder import DATA_INSTANCE, get_instance
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -20,6 +24,7 @@ from homeassistant.util import dt as dt_util
 from .const import DOMAIN
 from .controller import ControlState, Device, Reading, control
 from .learning import EffortTracker, Learning
+from .reporting import Reporting
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,6 +47,9 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.learning = self.new_learning()
         self.effort = EffortTracker()
         self.learning_baseline = None
+        self.reporting = Reporting()
+        self.not_reporting = {}
+        self.history_seeded = False
 
     def new_learning(self):
         return Learning(
@@ -57,6 +65,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.enabled = saved.get("enabled", True)
             self.samples = saved.get("samples", [])
             self.restored = True
+            self.reporting = Reporting(saved.get("reporting"))
             if saved.get("learning"):
                 self.learning = Learning.from_dict(saved["learning"])
                 self.learning.reconcile(
@@ -78,18 +87,57 @@ class HouseCoordinator(DataUpdateCoordinator):
             self._system_changed,
         )
 
+        cancel_sensors = async_track_state_change_event(
+            self.hass,
+            [s["entity_id"] for s in self.config["sensors"]],
+            self._sensor_changed,
+        )
+
         @callback
         def cancel():
             cancel_timer()
             cancel_states()
+            cancel_sensors()
 
         return cancel
+
+    @property
+    def frozen_window(self):
+        return self.config.get("frozen_after", 4) * 3600
+
+    @callback
+    def _sensor_changed(self, event):
+        entity_id = event.data["entity_id"]
+        new = event.data.get("new_state")
+        try:
+            value = float(new.state) if new else None
+        except TypeError, ValueError:
+            value = None
+        self.reporting.observe(
+            entity_id,
+            value if value is not None and isfinite(value) else None,
+            dt_util.utcnow().timestamp(),
+        )
+        # Recover control and repairs on the first numeric change, even between ticks.
+        if entity_id in self.not_reporting:
+            self.hass.async_create_task(self.async_tick(record=False))
 
     @callback
     def _system_changed(self, event):
         old, new = event.data.get("old_state"), event.data.get("new_state")
         # Runtime changes must be captured even during service calls under lock.
         entity_id = event.data["entity_id"]
+        self.reporting.activity(
+            dt_util.utcnow().timestamp(),
+            {
+                entity_id: bool(
+                    new
+                    and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+                    and new.attributes.get("hvac_action") in ("heating", "cooling")
+                )
+            },
+            self.frozen_window,
+        )
         self.effort.change(
             entity_id,
             new.attributes.get("hvac_action")
@@ -129,6 +177,23 @@ class HouseCoordinator(DataUpdateCoordinator):
     async def async_tick(self, _now=None, *, record=True):
         async with self.lock:
             now = dt_util.utcnow()
+            if not self.history_seeded:
+                await self.async_seed_history(now)
+                self.history_seeded = True
+            self.reporting.activity(
+                now.timestamp(),
+                {
+                    s["entity_id"]: bool(
+                        (entity := self.hass.states.get(s["entity_id"]))
+                        and entity.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+                        and entity.attributes.get("hvac_action")
+                        in ("heating", "cooling")
+                    )
+                    for s in self.config["systems"]
+                },
+                self.frozen_window,
+            )
+            self.not_reporting = {}
             readings = {}
             raw = {}
             for member in self.config["sensors"]:
@@ -142,12 +207,67 @@ class HouseCoordinator(DataUpdateCoordinator):
                     else None
                 )
                 age = (now - reported).total_seconds() if reported else 1e9
-                readings[entity_id] = Reading(value, age)
+                self.reporting.observe(entity_id, value, now.timestamp())
+                frozen = self.reporting.frozen(
+                    entity_id, now.timestamp(), self.frozen_window
+                )
+                last_seen = self.device_last_seen(entity_id)
+                stale_device = (
+                    last_seen is not None
+                    and (now - last_seen).total_seconds()
+                    > self.config.get("stale_after", 720) * 60
+                )
+                issue_id = f"{self.config_entry.entry_id}_{entity_id}_not_reporting"
+                if frozen or stale_device:
+                    tracked = self.reporting.sensors.get(entity_id)
+                    changed = (
+                        dt_util.utc_from_timestamp(tracked["changed"]).isoformat()
+                        if tracked
+                        else "unknown"
+                    )
+                    reason = (
+                        "value frozen during heating/cooling"
+                        if frozen
+                        else "device last seen is too old"
+                    )
+                    self.not_reporting[entity_id] = {
+                        "last_change": changed,
+                        "reason": reason,
+                    }
+                    ir.async_create_issue(
+                        self.hass,
+                        DOMAIN,
+                        issue_id,
+                        is_fixable=False,
+                        severity=ir.IssueSeverity.WARNING,
+                        translation_key="not_reporting",
+                        translation_placeholders={
+                            "sensor": entity_id,
+                            "last_change": changed,
+                        },
+                    )
+                else:
+                    ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+                readings[entity_id] = Reading(
+                    value, age, entity_id not in self.not_reporting
+                )
                 raw[entity_id] = {
                     "value": value,
                     "age": age,
                     "state": entity.state if entity else None,
+                    "not_reporting": entity_id in self.not_reporting,
                 }
+            if self.learning_baseline is not None:
+                baseline, outdoor_before, solar_before = self.learning_baseline
+                self.learning_baseline = (
+                    {
+                        key: value
+                        for key, value in baseline.items()
+                        if key not in self.not_reporting
+                    },
+                    outdoor_before,
+                    solar_before,
+                )
             devices = {}
             for system in self.config["systems"]:
                 entity_id = system["entity_id"]
@@ -183,7 +303,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                 valid = {
                     key: r.value
                     for key, r in readings.items()
-                    if r.value is not None
+                    if r.reporting
+                    and r.value is not None
                     and r.age <= self.config.get("stale_after", 720) * 60
                 }
                 if (
@@ -211,6 +332,11 @@ class HouseCoordinator(DataUpdateCoordinator):
                 self.enabled,
                 self.learning,
             )
+            for entity_id, details in self.not_reporting.items():
+                decision.explanation += (
+                    f" {entity_id}: not reporting ({details['reason']}); "
+                    f"last real change {details['last_change']}; check its battery."
+                )
             if adoption:
                 decision.explanation = f"{adoption} {decision.explanation}"
             failures = set()
@@ -268,9 +394,116 @@ class HouseCoordinator(DataUpdateCoordinator):
                     "enabled": self.enabled,
                     "samples": self.samples,
                     "learning": self.learning.to_dict(),
+                    "reporting": self.reporting.to_dict(),
                 }
             )
             self.async_set_updated_data(decision)
+
+    def device_last_seen(self, entity_id):
+        """Resolve optional timestamp siblings through the device/entity registries."""
+        registry = er.async_get(self.hass)
+        member = registry.async_get(entity_id)
+        if (
+            not member
+            or not member.device_id
+            or not dr.async_get(self.hass).async_get(member.device_id)
+        ):
+            return None
+        timestamps = []
+        for sibling in er.async_entries_for_device(registry, member.device_id):
+            entity = self.hass.states.get(sibling.entity_id)
+            if (
+                sibling.entity_id.endswith("_last_seen")
+                and entity
+                and entity.attributes.get("device_class") == "timestamp"
+                and (parsed := dt_util.parse_datetime(entity.state)) is not None
+            ):
+                timestamps.append(dt_util.as_utc(parsed))
+        return min(timestamps) if timestamps else None
+
+    async def async_seed_history(self, now):
+        """Seed real numeric changes and observed action runtime from recorder.
+
+        Compare consecutive numeric values, ignoring restart/unavailable markers.
+        A retained first observation is a conservative lower bound on value age.
+        Store evidence wins unless recorder contains a later actual value change.
+        """
+        if DATA_INSTANCE not in self.hass.data:
+            return
+        from homeassistant.components.recorder.history import get_significant_states
+
+        sensors = [s["entity_id"] for s in self.config["sensors"]]
+        systems = [s["entity_id"] for s in self.config["systems"]]
+
+        def read():
+            return (
+                get_significant_states(
+                    self.hass,
+                    dt_util.utc_from_timestamp(0),
+                    now,
+                    sensors,
+                    no_attributes=True,
+                ),
+                get_significant_states(
+                    self.hass,
+                    now - timedelta(seconds=self.frozen_window),
+                    now,
+                    systems,
+                    significant_changes_only=False,
+                ),
+            )
+
+        try:
+            history, activity = await get_instance(self.hass).async_add_executor_job(
+                read
+            )
+        except Exception:  # Recorder is optional; a failed query must not stop control.
+            _LOGGER.warning(
+                "Could not seed sensor reporting from recorder", exc_info=True
+            )
+            return
+        for entity_id, states in history.items():
+            value = None
+            changed = None
+            transitioned = False
+            for state in states:
+                try:
+                    number = float(state.state)
+                except TypeError, ValueError:
+                    continue
+                if isfinite(number) and number != value:
+                    transitioned = value is not None
+                    value, changed = number, state.last_updated.timestamp()
+            if changed is None:
+                continue
+            previous = self.reporting.sensors.get(entity_id)
+            if previous is None or (
+                (previous["value"] != value or transitioned)
+                and changed > previous["changed"]
+            ):
+                self.reporting.sensors[entity_id] = {
+                    "value": value,
+                    "changed": changed,
+                    "frozen": False,
+                }
+        for states in activity.values():
+            for index, state in enumerate(states):
+                if state.state not in (
+                    STATE_UNAVAILABLE,
+                    STATE_UNKNOWN,
+                ) and state.attributes.get("hvac_action") in ("heating", "cooling"):
+                    end = (
+                        states[index + 1].last_updated
+                        if index + 1 < len(states)
+                        else now
+                    )
+                    self.reporting.add_interval(
+                        max(
+                            state.last_updated.timestamp(),
+                            now.timestamp() - self.frozen_window,
+                        ),
+                        end.timestamp(),
+                    )
 
     def solar_kw(self):
         entity_id = self.config.get("solar_sensor")

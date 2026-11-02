@@ -11,6 +11,7 @@ DEFAULTS = {
     "occupancy_sensor": "",
     "interval": 5,
     "stale_after": 720,
+    "frozen_after": 4,
     "deadband": 1.0,
     "minimum_dwell": 60,
     "offset_clamp": 3.0,

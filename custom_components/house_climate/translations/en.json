@@ -44,7 +44,8 @@
           "kp": "Proportional gain",
           "ki": "Integral gain",
           "learning_forgetting": "Learning forgetting factor per sample",
-          "learning_n0": "Learning prior blend sample count"
+          "learning_n0": "Learning prior blend sample count",
+          "frozen_after": "Unchanged sensor limit during HVAC activity (hours)"
         }
       }
     },
@@ -100,13 +101,20 @@
           "kp": "Proportional gain",
           "ki": "Integral gain",
           "learning_forgetting": "Learning forgetting factor per sample",
-          "learning_n0": "Learning prior blend sample count"
+          "learning_n0": "Learning prior blend sample count",
+          "frozen_after": "Unchanged sensor limit during HVAC activity (hours)"
         }
       }
     },
     "error": {
       "empty_selection": "Choose at least one sensor and system.",
       "self_reference": "The integration cannot control or read its own entities."
+    }
+  },
+  "issues": {
+    "not_reporting": {
+      "title": "Temperature sensor is not reporting",
+      "description": "{sensor} is not reporting and has been excluded from House Climate control and learning. Last real value change: {last_change}. Please check its battery and connection. The sensor rejoins automatically when it recovers."
     }
   }
 }
