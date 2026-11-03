@@ -17,6 +17,7 @@ class SensorFilter:
         self.rejected = [list(p) for p in saved.get("rejected", [])]
         self.pending = saved.get("pending")
         self.dirty = False
+        self.contaminated = False
 
     def observe(self, value, now):
         self._expire(now)
@@ -34,17 +35,18 @@ class SensorFilter:
                 self.rejected.append([start, now])
                 self.pending = None
                 self.dirty = True
+                self.contaminated = True
         elif previous and value is not None and previous[1] is not None:
             elapsed = now - previous[0]
             delta = value - previous[1]
             if elapsed > 0 and abs(delta) * 60 > self.max_rate * elapsed:
                 self.pending = [now, previous[1], 1 if delta > 0 else -1]
-                self.dirty = True
+                self.contaminated = True
         self.points.append([now, value])
         self._prune(now)
 
     def _expire(self, now):
-        if self.pending and now - self.pending[0] > self.window:
+        if self.pending and now - self.pending[0] >= self.window:
             self.pending = None
 
     def _prune(self, now):
@@ -87,6 +89,7 @@ class SensorFilter:
 
     def finish_interval(self):
         self.dirty = False
+        self.contaminated = False
 
     def to_dict(self):
         return {

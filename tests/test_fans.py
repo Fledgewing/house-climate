@@ -217,15 +217,15 @@ def test_reassertions_on_other_actions_wait_for_global_hold():
     assert tick(model, systems, 3601) is None
 
 
-def test_quiet_restriction_changes_one_action_after_hold():
+def test_quiet_restriction_interrupts_hold_immediately():
     model = FanLearning(rng=Random(5))
     systems = devices()
     systems["other"] = dict(systems["unit"])
     tick(model, systems, 0)
     assert systems["unit"]["fan_mode"] == "c"
     systems["unit"]["fan_modes"] = quiet_modes(["a", "b", "c"], "a", True, "22:00")
-    assert tick(model, systems, 1799) is None
-    assert tick(model, systems, 1800) == ("unit", "set_fan_mode", {"fan_mode": "a"})
+    assert tick(model, systems, 1799) == ("unit", "set_fan_mode", {"fan_mode": "a"})
+    assert tick(model, systems, 1800) is None
     assert samples(model) == 0  # The allowed options changed during this window.
 
 
@@ -236,3 +236,16 @@ def test_diagnostics_best_only_uses_sampled_options_and_reconcile():
     assert model.diagnostics()["systems"]["unit"]["fan"]["heat|0|1"]["best"] == "a"
     model.reconcile([])
     assert model.arms == {}
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_quiet_cap_without_experiment_or_outdoor_context(valid):
+    model = FanLearning()
+    systems = devices()
+    systems["unit"].update(fan_modes=["a"], fan_mode="c", quiet_restricted=True)
+    assert model.tick(0, "heat", None, systems, {}, {}, 21, valid=valid) == (
+        "unit",
+        "set_fan_mode",
+        {"fan_mode": "a"},
+    )
+    assert model.window is None

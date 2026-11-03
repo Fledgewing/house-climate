@@ -41,9 +41,11 @@ def test_fast_permanent_step_is_admitted_after_window():
     f.observe(18, 60)
     assert f.value(900) == 22
     assert f.blocked
-    assert f.value(961) == 18
-    f.finish_interval()
+    assert f.value(960) == 18
     assert not f.blocked
+    assert f.contaminated
+    f.finish_interval()
+    assert not f.contaminated
 
 
 def test_slow_drop_tracks_with_less_than_fifteen_minutes_lag():
@@ -68,3 +70,16 @@ def test_small_fast_step_does_not_confirm_itself_on_unchanged_reports():
     f.observe(22, 120)
     assert not f.pending
     assert f.rejected == [[1, 120]]
+
+
+def test_report_on_change_step_expires_on_passes_without_reports():
+    f = SensorFilter()
+    f.observe(16.9, 0)
+    f.observe(20.6, 60)
+    for now in (300, 600, 900):
+        assert f.value(now) == 16.9
+        assert f.blocked
+        f.finish_interval()
+    assert f.value(960) == 20.6
+    assert not f.blocked
+    assert len(f.points) == 1

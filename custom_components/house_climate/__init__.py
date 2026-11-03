@@ -21,8 +21,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: HouseClimateEntry) -> bo
     coordinator = entry.runtime_data = HouseCoordinator(hass, entry)
     await coordinator.async_load()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(coordinator.start())
-    await coordinator.async_tick()
+
+    async def begin(_event=None):
+        entry.async_on_unload(coordinator.start())
+        await coordinator.async_tick()
+
+    from homeassistant.core import CoreState
+
+    if hass.state is CoreState.running:
+        await begin()
+    else:
+        from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+
+        entry.async_on_unload(
+            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, begin)
+        )
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
     return True
 

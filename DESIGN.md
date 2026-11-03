@@ -47,7 +47,7 @@ by domain and, for temperature, power and occupancy sources, device class.
   mode 60 min, sensor stale after 720 min (12 h), frozen after 4 h, median window `filter_minutes` 15 min, maximum sensor rate
   `max_rate` 0.5 °C/min, offset clamp ±3.0 °C, max offset change per interval 0.5 °C.
 
-## Control loop (v0.3.0)
+## Control loop (v0.3.1)
 
 Every control interval, and immediately when the house setpoint or mode changes:
 
@@ -84,7 +84,8 @@ Every control interval, and immediately when the house setpoint or mode changes:
    one minute's allowed movement of the pre-excursion value, or crossing that value,
    within the filter window confirms a transient. Exclude its held intervals from the
    median; name the member in `last_decision` as “sensor transient ignored”. If it
-   does not return, admit the sustained change after the window expires. While all
+   does not return, admit the sustained change when the window expires, evaluated
+   on every control pass even if the sensor sends no further reports. While all
    elapsed readings are withheld, hold the pre-excursion value. This is symmetric
    for upward/downward excursions and assumes no device type or operating cycle.
    Skip learning rows whose interval overlaps a pending or confirmed excursion,
@@ -191,7 +192,7 @@ loop. It checks every learned coefficient within 0.003 °C/interval of truth, ho
 0.5 °C throughout day two, spread improvement against learning disabled, useful learning within
 hours, and exploration active early but absent at the end.
 
-## Fan/vane learning (v0.3.0)
+## Fan/vane learning (v0.3.1)
 
 Pure `fans.py` implements a contextual UCB bandit per system and per action (`fan`, `swing`).
 Action options are read from each climate entity's `fan_modes` and `swing_modes` on every pass;
@@ -210,11 +211,14 @@ next pass. Selecting an already-current option sends nothing but still starts a 
 Only one action of one system can be commanded in a hold window; other chosen settings remain
 fixed. The PI temperature controller continues tracking the house setpoint throughout.
 
-A sensor transient, missing/stale/not-reporting member, HVAC mode switch, user house/physical
+A sensor transient or missing/stale/not-reporting member with at least
+`minor_weight_share` of the total configured positive sensor weight (default 0.05),
+an HVAC mode switch, user house/physical
 setpoint change or selected-context change dirties the complete experiment. Events between ticks
 latch dirtiness; recovery before a tick cannot make it train. Dirty windows retain their deadline
 but contribute no sample. Disabled house/fan control invalidates experiments and sends no fan/vane
-commands. Commands use `climate.set_fan_mode` / `climate.set_swing_mode` only when different.
+commands. Blocked minor members are still excluded from fan rewards and their
+thermal learning rows, while healthy rooms continue training. Commands use `climate.set_fan_mode` / `climate.set_swing_mode` only when different.
 Failures discard the window. Re-assert outside changes to chosen settings, restarting a full
 hold; another action's re-assertion waits for the global deadline. Outside-change notices use the
 same two-minute echo grace as targets. The required preset path remains unchanged.
@@ -237,8 +241,10 @@ exclusive, supporting midnight crossings; equal start/end means no quiet window.
 window only options up to the maximum's list index are eligible, plus `auto` (case insensitive)
 always. Outside it, when disabled, or without a matching maximum, all advertised options remain
 eligible. Quiet restrictions change candidate lists, never their reward priors; vanes are
-unrestricted. If a chosen fan becomes excluded, prioritize replacing it at the next global hold
-boundary, invalidating the interrupted experiment and retaining the one-action rule.
+unrestricted. If the current fan becomes excluded, cap it on the first pass inside the quiet
+window, interrupting the global hold and discarding its sample. Start a fresh full hold
+when context is available, retaining the one-action-per-pass rule. The cap also applies
+when sensor or outdoor context prevents learning.
 
 Regression tests cover neutral/exploring arms, context buckets, weighted reward/λ, global holds,
 outside changes, quiet hours on/off and midnight crossings, skipped windows and persistence.
@@ -291,3 +297,24 @@ control and learning from brief sensor excursions. Added the `filter_minutes` an
 Regression coverage replays the November 2 real-house cold excursion and warm recovery,
 checks stable house temperature and no split target increase, skips contaminated learning
 rows, and tracks a genuine 0.1 °C/min hour-long drop with less than 15 minutes of lag.
+
+
+## 0.3.1 fixes
+
+The first control pass and runtime listeners wait for `EVENT_HOMEASSISTANT_STARTED`;
+config-entry reloads while HA is fully running start immediately. The first numeric
+reading in each new runtime establishes a fresh filter level if it differs from Store,
+so startup unavailable-to-value transitions cannot invent rate excursions. Existing
+same-level filtering evidence remains bounded and retained.
+
+Report-on-change steps expire at `filter_minutes` by wall-clock time without more
+reports; control passes evaluate held readings without creating synthetic samples.
+Minor members below the configurable 5% weight share cannot dirty fan experiments,
+but blocked/missing/not-reporting members contribute no reward or thermal learning row.
+Quiet-hour caps interrupt holds immediately on the first pass in the window.
+
+Per-system offsets and PI integrals were already serialized in the control state.
+Deferring startup avoids the no-sensor fallback resetting them before integrations load.
+Regression tests round-trip distinct offsets/integrals for both systems through Store,
+startup and reload, and cover silent permanent steps, repeated minor transients,
+missing/not-reporting minor members and immediate quiet caps.

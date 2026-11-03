@@ -65,6 +65,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             for m in self.config["sensors"]
         }
         self.raw_readings = {}
+        self.startup_sensors = set(self.filters)
 
     def new_learning(self):
         return Learning(
@@ -133,6 +134,28 @@ class HouseCoordinator(DataUpdateCoordinator):
     def frozen_window(self):
         return self.config.get("frozen_after", 4) * 3600
 
+    def sensor_blocks_fans(self, entity_id):
+        weights = {
+            m["entity_id"]: max(0, m.get("weight", 1)) for m in self.config["sensors"]
+        }
+        total = sum(weights.values())
+        return total > 0 and weights.get(entity_id, 0) / total >= self.config.get(
+            "minor_weight_share", 0.05
+        )
+
+    def observe_sensor(self, entity_id, value, now):
+        sensor_filter = self.filters[entity_id]
+        if value is not None and entity_id in self.startup_sensors:
+            self.startup_sensors.remove(entity_id)
+            # Downtime/startup values give no evidence of a fast jump.
+            if sensor_filter.points and sensor_filter.points[-1][1] != value:
+                sensor_filter = self.filters[entity_id] = SensorFilter(
+                    self.config.get("filter_minutes", 15),
+                    self.config.get("max_rate", 0.5),
+                )
+        sensor_filter.observe(value, now)
+        return sensor_filter
+
     @callback
     def _sensor_changed(self, event):
         entity_id = event.data["entity_id"]
@@ -141,7 +164,8 @@ class HouseCoordinator(DataUpdateCoordinator):
             value = float(new.state) if new else None
         except TypeError, ValueError:
             value = None
-        self.filters[entity_id].observe(
+        self.observe_sensor(
+            entity_id,
             value if value is not None and isfinite(value) else None,
             dt_util.utcnow().timestamp(),
         )
@@ -150,7 +174,9 @@ class HouseCoordinator(DataUpdateCoordinator):
             value if value is not None and isfinite(value) else None,
             dt_util.utcnow().timestamp(),
         )
-        if value is None or not isfinite(value) or self.filters[entity_id].blocked:
+        if self.sensor_blocks_fans(entity_id) and (
+            value is None or not isfinite(value) or self.filters[entity_id].blocked
+        ):
             self.fans.invalidate()
         # Recover control and repairs on the first numeric change, even between ticks.
         if entity_id in self.not_reporting:
@@ -320,7 +346,15 @@ class HouseCoordinator(DataUpdateCoordinator):
                         self.config.get("max_rate", 0.5),
                     ),
                 )
-                sensor_filter.observe(value, now.timestamp())
+                if (
+                    entity_id in self.startup_sensors
+                    or not sensor_filter.points
+                    or sensor_filter.points[-1][1] != value
+                ):
+                    sensor_filter = self.observe_sensor(
+                        entity_id, value, now.timestamp()
+                    )
+                # Resolve held excursions on every pass, even without a new report.
                 filtered = sensor_filter.value(now.timestamp())
                 readings[entity_id] = Reading(
                     filtered if value is not None else None,
@@ -342,6 +376,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                         for key, value in baseline.items()
                         if key not in self.not_reporting
                         and not self.filters[key].blocked
+                        and not self.filters[key].contaminated
                     },
                     outdoor_before,
                     solar_before,
@@ -376,9 +411,18 @@ class HouseCoordinator(DataUpdateCoordinator):
                 and reading.value is not None
                 and reading.age <= self.config.get("stale_after", 720) * 60
                 for key, reading in readings.items()
+                if self.sensor_blocks_fans(key)
             )
             if not fan_clean:
                 self.fans.invalidate()
+            clean_values = {
+                key: r.value
+                for key, r in readings.items()
+                if not self.filters[key].blocked
+                and r.reporting
+                and r.value is not None
+                and r.age <= self.config.get("stale_after", 720) * 60
+            }
             if record:
                 efforts, duration = self.effort.finish(
                     {
@@ -387,13 +431,10 @@ class HouseCoordinator(DataUpdateCoordinator):
                     },
                     now.timestamp(),
                 )
-                valid = {
-                    key: r.value
-                    for key, r in readings.items()
-                    if not self.filters[key].blocked
-                    and r.reporting
-                    and r.value is not None
-                    and r.age <= self.config.get("stale_after", 720) * 60
+                learning_values = {
+                    key: value
+                    for key, value in clean_values.items()
+                    if not self.filters[key].contaminated
                 }
                 if (
                     self.learning_baseline is not None
@@ -403,13 +444,13 @@ class HouseCoordinator(DataUpdateCoordinator):
                     before, previous_outdoor, previous_solar = self.learning_baseline
                     self.learning.update(
                         before,
-                        valid,
+                        learning_values,
                         previous_outdoor,
                         efforts,
                         previous_solar,
                         duration / (self.config.get("interval", 5) * 60),
                     )
-                self.learning_baseline = (valid, outdoor, solar)
+                self.learning_baseline = (learning_values, outdoor, solar)
                 for sensor_filter in self.filters.values():
                     sensor_filter.finish_interval()
             decision = control(
@@ -458,12 +499,15 @@ class HouseCoordinator(DataUpdateCoordinator):
                     ),
                     "swing_modes": attrs.get("swing_modes") or [],
                 }
+                fan_systems[entity_id]["quiet_restricted"] = fan_systems[entity_id][
+                    "fan_modes"
+                ] != list(attrs.get("fan_modes") or [])
             fan_command = self.fans.tick(
                 now.timestamp(),
                 self.state.active_mode,
                 outdoor,
                 fan_systems,
-                decision.readings,
+                clean_values,
                 {m["entity_id"]: m.get("weight", 1) for m in self.config["sensors"]},
                 self.state.setpoint,
                 valid=fan_clean,

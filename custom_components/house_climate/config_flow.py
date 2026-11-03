@@ -167,6 +167,7 @@ class HouseSteps:
             ("fan_reward_lambda", 0, 100, 0.1),
             ("filter_minutes", 1, 120, 1),
             ("max_rate", 0.01, 10, 0.01),
+            ("minor_weight_share", 0, 1, 0.01),
             ("stale_after", 1, 10080, 1),
             ("frozen_after", 1, 168, 0.5),
             ("deadband", 0.1, 10, 0.1),

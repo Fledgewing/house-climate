@@ -19,6 +19,7 @@ DEFAULTS = {
     "frozen_after": 4,
     "filter_minutes": 15,
     "max_rate": 0.5,
+    "minor_weight_share": 0.05,
     "deadband": 1.0,
     "minimum_dwell": 60,
     "offset_clamp": 3.0,

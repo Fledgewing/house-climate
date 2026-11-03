@@ -125,6 +125,35 @@ class FanLearning:
                     self.options(system, action, bucket, modes)
                     candidates.append((system, action, bucket, modes))
         sample = reward(values, weights, setpoint, self.penalty) if valid else None
+        # Quiet limits take effect on this pass, interrupting any global hold.
+        if enabled:
+            for system, device in systems.items():
+                modes = device.get("fan_modes", [])
+                chosen = self.chosen.get(system, {}).get("fan")
+                restricted = device.get("quiet_restricted", False) or (
+                    chosen is not None and chosen not in modes
+                )
+                if (
+                    device.get("available", True)
+                    and modes
+                    and restricted
+                    and device.get("fan_mode") not in modes
+                ):
+                    self.invalidate()
+                    self.window = None
+                    self.resume = None
+                    choice = modes[0]
+                    self.chosen.setdefault(system, {})["fan"] = choice
+                    bucket = context(mode, outdoor, device.get("running", False))
+                    if bucket is not None and sample is not None:
+                        self.options(system, "fan", bucket, modes)
+                        self._start(
+                            now, system, "fan", bucket, choice, setpoint, sample
+                        )
+                    self.last_decision = (
+                        f"{system} fan capped at {choice} for quiet hours."
+                    )
+                    return self._command(system, "fan", choice)
         if not enabled or not candidates or sample is None:
             self.invalidate()
             return None
