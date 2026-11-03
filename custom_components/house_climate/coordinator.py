@@ -78,9 +78,35 @@ class HouseCoordinator(DataUpdateCoordinator):
     def priority_weights(self):
         return modes(self.config)[self.priority_mode]
 
+    @property
+    def learning_sensors(self):
+        return list(
+            dict.fromkeys(
+                [s["entity_id"] for s in self.config["sensors"]]
+                + [s["entity_id"] for s in self.config["systems"]]
+            )
+        )
+
+    def own_sensor(self, system):
+        """Prefer an explicit sensor, then a unique member on the same device."""
+        if system.get("own_sensor"):
+            return system["own_sensor"]
+        registry = er.async_get(self.hass)
+        unit = registry.async_get(system["entity_id"])
+        if unit and unit.device_id:
+            matches = [
+                s["entity_id"]
+                for s in self.config["sensors"]
+                if (member := registry.async_get(s["entity_id"]))
+                and member.device_id == unit.device_id
+            ]
+            if len(matches) == 1:
+                return matches[0]
+        return system["entity_id"]
+
     def new_learning(self):
         return Learning(
-            [s["entity_id"] for s in self.config["sensors"]],
+            self.learning_sensors,
             [s["entity_id"] for s in self.config["systems"]],
             self.config.get("learning_forgetting", 0.998),
             self.config.get("learning_n0", 24),
@@ -123,6 +149,34 @@ class HouseCoordinator(DataUpdateCoordinator):
             )
             self.fans.reconcile([s["entity_id"] for s in self.config["systems"]])
             self.samples = saved.get("samples", [])
+            # Upgrade old Store data even when recorder is absent during an outage.
+            for system in self.config["systems"]:
+                key = system["entity_id"]
+                if key in self.state.thermostats:
+                    continue
+                history = ControlState()
+                for sample in self.samples:
+                    report = sample.get("systems", {}).get(key, {})
+                    if not report or not report.get("available", True):
+                        continue
+                    history.observe_report(
+                        system,
+                        Device(
+                            **{
+                                field: value
+                                for field, value in report.items()
+                                if field in Device.__dataclass_fields__
+                            }
+                        ),
+                        self.config,
+                    )
+                    if key in history.thermostats:
+                        history.thermostats[key]["time"] = sample["timestamp"]
+                if key in history.thermostats:
+                    self.state.thermostats[key] = history.thermostats[key]
+                    self.state.thermostat_points[key] = history.thermostat_points.get(
+                        key, []
+                    )
             self.restored = True
             self.reporting = Reporting(saved.get("reporting"))
             for key in self.filters:
@@ -134,7 +188,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             if saved.get("learning"):
                 self.learning = Learning.from_dict(saved["learning"])
                 self.learning.reconcile(
-                    [s["entity_id"] for s in self.config["sensors"]],
+                    self.learning_sensors,
                     [s["entity_id"] for s in self.config["systems"]],
                     [s["entity_id"] for s in self.config.get("extra_heat_sources", [])],
                 )
@@ -287,6 +341,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.state.observe_report(
                 next(s for s in self.config["systems"] if s["entity_id"] == entity_id),
                 Device(
+                    mode=new.state,
                     hvac_action=new.attributes.get("hvac_action"),
                     temperature=self.number(entity_id, "temperature"),
                     current_temperature=self.number(entity_id, "current_temperature"),
@@ -295,6 +350,12 @@ class HouseCoordinator(DataUpdateCoordinator):
                 ),
                 self.config,
             )
+        if (
+            new
+            and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+            and entity_id in self.state.thermostats
+        ):
+            self.state.thermostats[entity_id]["time"] = dt_util.utcnow().timestamp()
         self.reporting.activity(
             dt_util.utcnow().timestamp(),
             {
@@ -496,8 +557,13 @@ class HouseCoordinator(DataUpdateCoordinator):
                         key: value
                         for key, value in baseline.items()
                         if key not in self.not_reporting
-                        and not self.filters[key].blocked
-                        and not self.filters[key].contaminated
+                        and (
+                            key not in self.filters
+                            or (
+                                not self.filters[key].blocked
+                                and not self.filters[key].contaminated
+                            )
+                        )
                     },
                     outdoor_before,
                     solar_before,
@@ -571,6 +637,13 @@ class HouseCoordinator(DataUpdateCoordinator):
                     if not self.filters[key].blocked
                     and not self.filters[key].contaminated
                 }
+                learning_values.update(
+                    {
+                        key: device.current_temperature
+                        for key, device in devices.items()
+                        if device.available and device.current_temperature is not None
+                    }
+                )
                 if (
                     self.learning_enabled
                     and self.learning_baseline is not None
@@ -620,9 +693,27 @@ class HouseCoordinator(DataUpdateCoordinator):
             fan_clean = not fan_problems
             if not fan_clean:
                 self.fans.invalidate("; ".join(fan_problems))
+            control_systems = [
+                {**system, "own_sensor": self.own_sensor(system)}
+                for system in self.config["systems"]
+            ]
+            for system in control_systems:
+                sensor = system["own_sensor"]
+                if sensor not in readings and sensor != system["entity_id"]:
+                    entity = self.hass.states.get(sensor)
+                    reported = (
+                        (getattr(entity, "last_reported", None) or entity.last_updated)
+                        if entity
+                        else None
+                    )
+                    readings[sensor] = Reading(
+                        self.number(sensor),
+                        (now - reported).total_seconds() if reported else 1e9,
+                    )
             decision = control(
                 {
                     **self.config,
+                    "systems": control_systems,
                     "sensors": [
                         {
                             **member,
@@ -906,6 +997,34 @@ class HouseCoordinator(DataUpdateCoordinator):
                         ),
                         end.timestamp(),
                     )
+
+            if entity_id not in self.state.thermostats:
+                system = next(
+                    s for s in self.config["systems"] if s["entity_id"] == entity_id
+                )
+                for recorded in sorted(states, key=lambda s: s.last_updated):
+                    self.state.observe_report(
+                        system,
+                        Device(
+                            available=recorded.state
+                            not in (STATE_UNAVAILABLE, STATE_UNKNOWN),
+                            mode=recorded.state,
+                            temperature=recorded.attributes.get("temperature"),
+                            current_temperature=recorded.attributes.get(
+                                "current_temperature"
+                            ),
+                            hvac_action=recorded.attributes.get("hvac_action"),
+                            name=recorded.name,
+                        ),
+                        self.config,
+                    )
+                    if (
+                        recorded.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+                        and entity_id in self.state.thermostats
+                    ):
+                        self.state.thermostats[entity_id]["time"] = (
+                            recorded.last_updated.timestamp()
+                        )
 
             # Replay action transitions, including attribute-only changes. Merge
             # retained evidence without replacing newer Store/event observations.

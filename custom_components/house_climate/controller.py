@@ -46,6 +46,9 @@ class ControlState:
     requested_efforts: dict[str, float] = field(default_factory=dict)
     effort_switches: dict[str, float] = field(default_factory=dict)
 
+    thermostats: dict[str, dict] = field(default_factory=dict)
+    thermostat_points: dict[str, list[float]] = field(default_factory=dict)
+
     reported_actions: dict[str, str] = field(default_factory=dict)
     reported_efforts: dict[str, float] = field(default_factory=dict)
     reported_names: dict[str, str] = field(default_factory=dict)
@@ -56,7 +59,54 @@ class ControlState:
 
     def observe_report(self, system, device, config):
         """Retain reported actuator input separately from unknown runtime."""
+        key = system["entity_id"]
+        if not device.available:
+            return
+        previous = self.thermostats.get(key, {})
+        own = (
+            device.current_temperature
+            if device.current_temperature is not None
+            else previous.get("own")
+        )
+        target = (
+            device.temperature
+            if device.temperature is not None
+            else previous.get("target")
+        )
         action = device.hvac_action
+        mode = (
+            device.mode
+            if device.mode in ("heat", "cool", "off")
+            else previous.get("mode", "off")
+        )
+        if action in ("heating", "cooling"):
+            mode = "heat" if action == "heating" else "cool"
+        if all(v is not None and isfinite(v) for v in (own, target)):
+            direction = 1 if mode == "heat" else -1
+            if (
+                action in ("heating", "cooling")
+                and previous.get("action") == "idle"
+                and previous.get("target") == target
+                and previous.get("mode") == mode
+            ):
+                gap = direction * (target - own)
+                if 0 < gap <= 3:
+                    points = self.thermostat_points.setdefault(key, [])
+                    points.append(gap)
+                    del points[:-32]
+            self.thermostats[key] = {
+                **previous,
+                "own": own,
+                "target": target,
+                "mode": mode,
+                "running": (
+                    action in ("heating", "cooling")
+                    if action is not None
+                    else previous.get("running", False)
+                ),
+                "action": action,
+                "time": None,
+            }
         if not device.available or action not in (
             "heating",
             "cooling",
@@ -259,6 +309,115 @@ def clamp(value, low, high):
     return max(low, min(high, value))
 
 
+def thermostat_effort(config, state, key, thermostat):
+    """Apply the local thermostat's latched on/off thresholds."""
+    mode = thermostat["mode"]
+    if mode not in ("heat", "cool"):
+        thermostat["running"] = False
+        return 0.0
+    settings = {**config, **next(s for s in config["systems"] if s["entity_id"] == key)}
+    points = state.thermostat_points.get(key, [])
+    hysteresis = (
+        sum(points) / len(points)
+        if points
+        else settings.get("thermostat_hysteresis", 0.5)
+    )
+    direction = 1 if mode == "heat" else -1
+    gap = direction * (thermostat["target"] - thermostat["own"])
+    if gap <= 0:
+        thermostat["running"] = False
+    elif gap > hysteresis:
+        thermostat["running"] = True
+    return float(thermostat["running"]) * direction
+
+
+def model_step(learning, sensor, temperature, efforts, outdoor, solar, sources):
+    from .learning import PRIOR_B
+
+    if learning and sensor in learning.rows:
+        passive, coefficients = learning.forecast(
+            sensor, temperature, list(efforts), 1, outdoor, solar, sources
+        )
+        return passive + sum(b * u for b, u in zip(coefficients, efforts.values()))
+    return temperature + PRIOR_B * sum(efforts.values())
+
+
+def outage_step(
+    config, state, thermostats, efforts, learning, outdoor, solar, sources, fraction=1
+):
+    """Advance all own sensors simultaneously using the same joint inputs."""
+    efforts = dict(efforts)
+    for key, thermostat in thermostats.items():
+        efforts[key] = thermostat_effort(config, state, key, thermostat)
+    for key, thermostat in thermostats.items():
+        sensor = thermostat.get("sensor", key)
+        if learning and sensor not in learning.rows:
+            sensor = key
+        predicted = model_step(
+            learning, sensor, thermostat["own"], efforts, outdoor, solar, sources
+        )
+        thermostat["own"] += fraction * (predicted - thermostat["own"])
+    return efforts
+
+
+def observe_thermostats(
+    config, state, readings, devices, now, learning, outdoor, solar, sources
+):
+    """Advance saved outage state by elapsed time only, preferring real readings."""
+    unavailable = {}
+    for system in config["systems"]:
+        key = system["entity_id"]
+        device = devices.get(key, Device(available=False))
+        thermostat = state.thermostats.get(key)
+        if not thermostat:
+            continue
+        sensor = system.get("own_sensor", key)
+        thermostat["sensor"] = sensor
+        if device.available:
+            thermostat["time"] = now
+        else:
+            unavailable[key] = thermostat
+    if not unavailable:
+        return
+    interval = config.get("interval", 5) * 60
+    # Different last observations are possible after restore or event reports.
+    remaining = {
+        key: max(0, now - (t["time"] if t.get("time") is not None else now)) / interval
+        for key, t in unavailable.items()
+    }
+    while any(v > 1e-9 for v in remaining.values()):
+        fraction = min(1, max(remaining.values()))
+        before = {key: t["own"] for key, t in unavailable.items()}
+        outage_step(
+            config,
+            state,
+            unavailable,
+            state.reported_efforts,
+            learning,
+            outdoor,
+            solar,
+            sources,
+            fraction,
+        )
+        for key, thermostat in unavailable.items():
+            share = min(fraction, remaining[key]) / fraction
+            thermostat["own"] = before[key] + share * (thermostat["own"] - before[key])
+            remaining[key] = max(0, remaining[key] - fraction)
+    for key, thermostat in unavailable.items():
+        reading = readings.get(thermostat["sensor"])
+        real = devices.get(key, Device(available=False)).current_temperature
+        if (
+            reading
+            and reading.reporting
+            and reading.age <= config.get("stale_after", 720) * 60
+        ):
+            real = reading.value
+        if real is not None and isfinite(real):
+            thermostat["own"] = real
+        thermostat["time"] = now
+        thermostat_effort(config, state, key, thermostat)
+
+
 def allocate(
     config,
     values,
@@ -287,7 +446,11 @@ def allocate(
         if devices.get(s["entity_id"], Device(available=False)).available
     ]
     fixed = {
-        s["entity_id"]: state.reported_efforts.get(s["entity_id"], 0)
+        s["entity_id"]: (
+            0
+            if s["entity_id"] in state.thermostats
+            else state.reported_efforts.get(s["entity_id"], 0)
+        )
         for s in config["systems"]
         if state and s["entity_id"] not in systems
     }
@@ -392,6 +555,77 @@ def allocate(
             change = max(change, abs(delta))
         if change < 1e-9:
             break
+    outages = (
+        {key: dict(state.thermostats[key]) for key in fixed if key in state.thermostats}
+        if state
+        else {}
+    )
+    if outages:
+
+        def simulate(candidate):
+            thermostats = {key: dict(t) for key, t in outages.items()}
+            temperatures = dict(values)
+            inputs = {**fixed, **dict(zip(systems, (direction * u for u in candidate)))}
+            for _ in range(steps):
+                joint = outage_step(
+                    config,
+                    state,
+                    thermostats,
+                    inputs,
+                    learning,
+                    outdoor,
+                    solar,
+                    sources,
+                )
+                temperatures = {
+                    room: model_step(learning, room, t, joint, outdoor, solar, sources)
+                    for room, t in temperatures.items()
+                }
+            average = sum(w * temperatures[r] for w, r in zip(weights, rooms))
+            objective = sum(
+                w * (temperatures[r] - average) ** 2 for w, r in zip(weights, rooms)
+            )
+            objective += penalty * (average - setpoint) ** 2
+            objective += sum(
+                switch_cost * ((u > 0) != running) + change_cost * abs(u - old)
+                for u, running, old in zip(candidate, on, previous)
+            )
+            return objective, average
+
+        # The thermostat makes the horizon piecewise rather than affine. Evaluate
+        # each candidate's fixed outage trajectory with all candidate system inputs.
+        for _ in range(20):
+            before = efforts[:]
+            for j, key in enumerate(systems):
+                low, high = bounds[j]
+                system = next(s for s in config["systems"] if s["entity_id"] == key)
+                candidates = [u for u in (0, 1) if low <= u <= high]
+                if system.get("modulating", devices[key].step < 0.5):
+                    candidates = [low + (high - low) * k / 40 for k in range(41)]
+                    candidates += [efforts[j], clamp(previous[j], low, high)]
+
+                def cost(u):
+                    candidate = efforts[:]
+                    candidate[j] = u
+                    return simulate(candidate)[0]
+
+                best = min(candidates, key=cost)
+                if system.get("modulating", devices[key].step < 0.5):
+                    width = (high - low) / 40
+                    for _ in range(18):
+                        options = [
+                            best,
+                            max(low, best - width),
+                            min(high, best + width),
+                        ]
+                        best = min(options, key=cost)
+                        width /= 2
+                efforts[j] = best
+            if max((abs(a - b) for a, b in zip(before, efforts)), default=0) < 1e-8:
+                break
+        return dict(zip(systems, (direction * u for u in efforts))), simulate(efforts)[
+            1
+        ]
     predicted_mean = mean_base + sum(e * b for e, b in zip(efforts, mean_effect))
     return dict(zip(systems, (direction * u for u in efforts))), predicted_mean
 
@@ -471,6 +705,9 @@ def control(
         state.observe_report(
             system, devices.get(system["entity_id"], Device(available=False)), config
         )
+    observe_thermostats(
+        config, state, readings, devices, now, learning, outdoor, solar, sources
+    )
     if not enabled:
         if state.excitation:
             state.last_excite[state.excitation["system"]] = now
@@ -521,6 +758,20 @@ def control(
         if not device.available:
             action = state.reported_actions.get(entity_id)
             name = state.reported_names.get(entity_id, device.name or entity_id)
+            thermostat = state.thermostats.get(entity_id)
+            if thermostat:
+                effort = thermostat_effort(config, state, entity_id, thermostat)
+                action = "heating" if effort > 0 else "cooling" if effort < 0 else "off"
+                notes.append(
+                    f"{name} unavailable; predicted own temperature {thermostat['own']:.1f} °C "
+                    f"vs its target {thermostat['target']:g} °C, assuming {action}"
+                    + (
+                        " until it reaches it."
+                        if effort
+                        else " until its thermostat calls again."
+                    )
+                )
+                continue
             notes.append(
                 f"{name} unavailable; assuming it continues {action} as last reported."
                 if action is not None

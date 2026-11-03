@@ -182,7 +182,7 @@ Every control interval, and immediately when the house setpoint or mode changes:
    re-asserts (the House thermostat is the one control).
 6. Fallbacks: if no member sensor is available, every system gets the house setpoint, subject
    to reported cycling holds. Without any local/house reference, retain an on-held target or
-   use HVAC off for an off hold. If target limits prevent an off hold, also use HVAC off. If a system is unavailable, issue it no commands and keep controlling the others. Include its last reported signed effort as a fixed input in every horizon step, with the normal objective weights unchanged.
+   use HVAC off for an off hold. If target limits prevent an off hold, also use HVAC off. If a system is unavailable, issue it no commands and keep controlling the others. Simulate its local thermostat as a fixed input at each horizon step (v0.5.5), with the normal objective weights unchanged.
 
 State (setpoint, mode, integrator values, last mode switch) survives restarts via `RestoreEntity`
 / `Store`.
@@ -794,3 +794,39 @@ replace retained evidence. During an outage, fold each retained input through it
 system's forecast coefficient into the passive forecast, outside the decision variables.
 The retained assumption survives Store restore, and `last_decision` names the system
 and its assumed action. Current unknown runtime still skips learning intervals.
+
+
+## Unavailable local thermostats (v0.5.5)
+
+Unavailable units retain their own last reported temperature, target, mode and on/off latch.
+Advance that temperature once per elapsed interval with its learned row and the joint signed
+system efforts, outdoor loss, solar, extra sources and drift. Fractional intervals advance
+proportionally; the saved timestamp prevents immediate ticks or restarts from advancing twice.
+Use a real, fresh reporting own-sensor reading whenever available. The coordinator prefers
+an explicit per-system `own_sensor`, then a unique configured sensor on the same HA device;
+otherwise it learns a separate row keyed by the climate entity's `current_temperature`.
+These additional rows never join the house comfort weights. Unknown runtime still excludes
+learning; predicted temperatures and actions are never training observations.
+
+For heat, stop at or above the retained target and restart strictly below target minus
+`thermostat_hysteresis` (default 0.5 °C); reverse both inequalities for cool. Inside the gap,
+retain the latch. When observed idle-to-running transitions at an unchanged target exist,
+use the mean target-relative starting gap from the last 32 transitions instead of the default.
+Retained samples or recorder seed this evidence when no retained thermostat exists. Save thermostat state,
+timestamps and hysteresis evidence in `ControlState` through the existing Store path.
+
+For each allocator candidate, forecast copies of all unavailable thermostats simultaneously,
+using that candidate's available efforts and the unavailable units' predicted signed on/off
+inputs. An unavailable unit can stop and restart within the horizon, but is never an allocator
+decision variable and receives no commands. Since the resulting objective is piecewise,
+evaluate binary coordinate candidates directly; for modulating units sample 41 bounded
+candidates and refine the best with 18 halving steps, retaining the existing movement and
+switch penalties and cycling bounds. This is a bounded coordinate search, not a global
+optimality guarantee. Units without a retained target/own reading keep the v0.5.4 reported-input
+fallback until sufficient real evidence arrives. `last_decision` names each unavailable unit,
+its predicted own reading and retained target, and explains whether it is heating, cooling or
+off. Forecast copies never advance persisted time or the reported runtime evidence.
+
+Tests cover heat/cool target crossings in both the horizon and elapsed outage state,
+fresh real own readings, JSON/Store restart continuity, hysteresis latching and learning,
+and own-row contributions from joint efforts, outdoor temperature, solar and heat sources.

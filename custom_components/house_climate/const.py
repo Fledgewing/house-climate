@@ -43,6 +43,7 @@ DEFAULTS = {
     "effort_change_penalty": 0.005,
     "comfort_band": 1.0,
     "run_margin": 1.0,
+    "thermostat_hysteresis": 0.5,
     "control_horizon_minutes": 45,
     "effort_hysteresis": 0.05,
     "effort_dwell_minutes": 5,

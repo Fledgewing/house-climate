@@ -259,16 +259,13 @@ def test_unavailable_reported_input_reduces_remaining_effort(
     )
     assert set(running) == {"live"}
     assert abs(running["live"]) < abs(off["live"])
-    assert abs(off["live"] - running["live"]) == pytest.approx(fraction / 2)
+    assert abs(off["live"] - running["live"]) == pytest.approx(0.5)
     assert predicted == pytest.approx(21)
     decision = control(
         config, state, {"room": Reading(values["room"])}, devices, 0, learning=model
     )
     assert all(key == "live" for key, _, _ in decision.commands)
-    assert (
-        f"Home ZONE 1 unavailable; assuming it continues {action} as last reported"
-        in decision.explanation
-    )
+    assert f"assuming {action} until it reaches it" in decision.explanation
     assert state.actions["lost"] is None
     assert state.reported_actions["lost"] == action
     # A known idle report replaces running evidence and contributes exactly zero.

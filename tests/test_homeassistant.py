@@ -663,9 +663,15 @@ async def test_learning_reconciles_options_on_reload(hass, installed):
     options["sensors"] = [options["sensors"][1]]
     hass.config_entries.async_update_entry(entry, options=options)
     await hass.async_block_till_done()
-    assert set(entry.runtime_data.learning.rows) == {"sensor.new"}
+    assert set(entry.runtime_data.learning.rows) == {
+        "sensor.new",
+        "climate.ducted",
+        "climate.split",
+    }
     assert set((await entry.runtime_data.store.async_load())["learning"]["rows"]) == {
-        "sensor.new"
+        "sensor.new",
+        "climate.ducted",
+        "climate.split",
     }
 
 
@@ -2268,7 +2274,11 @@ async def test_room_controls_follow_sensor_membership(hass, installed):
         "switch.guest_bedroom_temporary_change",
     ):
         assert hass.states.get(entity_id) is not None
-    assert set(entry.runtime_data.learning.regimes) == {"sensor.guest"}
+    assert set(entry.runtime_data.learning.regimes) == {
+        "sensor.guest",
+        "climate.ducted",
+        "climate.split",
+    }
     assert (
         ir.async_get(hass).async_get_issue(
             DOMAIN, f"{entry.entry_id}_sensor.room_regime"
@@ -2471,8 +2481,98 @@ async def test_outage_report_survives_restart_without_commands_or_learning(
     assert restored.state.reported_actions[key] == "heating"
     assert restored.state.reported_efforts[key] == pytest.approx(0.4)
     assert (
-        "Home ZONE 1 unavailable; assuming it continues heating as last reported"
+        "Home ZONE 1 unavailable; predicted own temperature 20.0 °C vs its target 20.4 °C, assuming heating until it reaches it"
         in restored.data.explanation
     )
     assert restored.samples[-1]["efforts"][key] is None
     assert not any(entity == key for entity, _, _ in calls)
+
+
+async def test_unavailable_thermostat_uses_independent_sensor_and_persists_latch(
+    hass, installed
+):
+    from custom_components.house_climate.coordinator import HouseCoordinator
+
+    entry, calls = installed
+    c = entry.runtime_data
+    key = "climate.ducted"
+    c.config["systems"][0]["own_sensor"] = "sensor.independent"
+    c.state.mode = c.state.active_mode = "heat"
+    hass.states.async_set(
+        key,
+        "heat",
+        {
+            "hvac_action": "heating",
+            "temperature": 21,
+            "current_temperature": 20,
+        },
+    )
+    await hass.async_block_till_done()
+    hass.states.async_set("sensor.independent", "22")
+    hass.states.async_set(key, "unavailable")
+    await hass.async_block_till_done()
+    calls.clear()
+    c.enabled = True
+    await c.async_tick()
+    assert c.state.thermostats[key]["own"] == 22
+    assert c.state.thermostats[key]["running"] is False
+    assert (
+        "predicted own temperature 22.0 °C vs its target 21 °C, assuming off"
+        in c.data.explanation
+    )
+    assert c.samples[-1]["efforts"][key] is None
+    assert not any(entity == key for entity, _, _ in calls)
+    restored = HouseCoordinator(hass, entry)
+    await restored.async_load()
+    assert restored.state.thermostats[key] == c.state.thermostats[key]
+    assert key in restored.learning.rows
+    assert key not in c.data.readings  # Own models never change comfort membership.
+
+
+async def test_upgrade_seeds_outage_thermostat_from_samples_without_recorder(
+    hass, installed
+):
+    from custom_components.house_climate.coordinator import HouseCoordinator
+
+    entry, _ = installed
+    c = entry.runtime_data
+    saved = await c.store.async_load()
+    saved["state"].pop("thermostats", None)
+    saved["state"].pop("thermostat_points", None)
+    now = dt_util.utcnow().timestamp()
+    saved["samples"] = [
+        {
+            "timestamp": now - 600,
+            "systems": {
+                "climate.ducted": {
+                    "available": True,
+                    "mode": "heat",
+                    "temperature": 25,
+                    "current_temperature": 25,
+                    "hvac_action": "idle",
+                }
+            },
+        },
+        {
+            "timestamp": now - 300,
+            "systems": {
+                "climate.ducted": {
+                    "available": True,
+                    "mode": "heat",
+                    "temperature": 25,
+                    "current_temperature": 24.3,
+                    "hvac_action": "heating",
+                }
+            },
+        },
+        {"timestamp": now, "systems": {"climate.ducted": {"available": False}}},
+    ]
+    await c.store.async_save(saved)
+    restored = HouseCoordinator(hass, entry)
+    await restored.async_load()
+    thermostat = restored.state.thermostats["climate.ducted"]
+    assert thermostat["own"] == 24.3
+    assert thermostat["target"] == 25
+    assert thermostat["time"] == now - 300
+    assert thermostat["running"] is True
+    assert restored.state.thermostat_points["climate.ducted"] == pytest.approx([0.7])
