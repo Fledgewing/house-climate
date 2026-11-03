@@ -271,6 +271,9 @@ class HouseSteps:
             ("ki", 0, 10, 0.01),
             ("learning_forgetting", 0.9, 1, 0.001),
             ("learning_n0", 1, 1000, 1),
+            ("explore_threshold", 0, 1, 0.01),
+            ("excite_after_minutes", 1, 10080, 1),
+            ("excite_minutes", 1, 60, 1),
         ]:
             fields[vol.Required(key, default=self.settings[key])] = number(
                 low, high, step

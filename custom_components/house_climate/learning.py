@@ -126,10 +126,21 @@ class Learning:
         pairs = [self.confidence(s, j) for s in self.rows for j in self.systems]
         return 100 * sum(pairs) / len(pairs) if pairs else 0
 
+    def system_prior(self, system):
+        """Unobserved rooms inherit this system's measured reach, not weak reach."""
+        index = self.systems.index(system) + 1
+        pairs = [
+            (self.confidence(s, system), row.theta[index])
+            for s, row in self.rows.items()
+            if self.confidence(s, system) > 0
+        ]
+        total = sum(c for c, _ in pairs)
+        return sum(c * b for c, b in pairs) / total if total else PRIOR_B
+
     def blended(self, sensor, system):
         confidence = self.confidence(sensor, system)
         b = self.rows[sensor].theta[self.systems.index(system) + 1]
-        return confidence * b + (1 - confidence) * PRIOR_B
+        return confidence * b + (1 - confidence) * self.system_prior(system)
 
     def influences(self, system, sensors=None):
         positive = {
@@ -139,12 +150,12 @@ class Learning:
         total = sum(positive.values())
         return {s: b / total for s, b in positive.items()} if total > 1e-9 else {}
 
-    def dither(self, system, now, sensors=None):
+    def dither(self, system, now, sensors=None, threshold=0.8):
         confidence = self.system_confidence(system, sensors)
-        if confidence >= 0.8:
+        if confidence >= threshold:
             return 0
         phase = (now / 7200 + self.systems.index(system) / len(self.systems)) % 1
-        return (0.5 if phase < 0.5 else -0.5) * (1 - confidence / 0.8)
+        return (0.5 if phase < 0.5 else -0.5) * (1 - confidence / threshold)
 
     def diagnostics(self):
         return {

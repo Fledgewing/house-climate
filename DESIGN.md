@@ -153,15 +153,18 @@ invalidate that interval. Sampling only the action at a pass would miss short cy
 The forgetting factor defaults to 0.998 per valid row sample. Effective activity counts follow
 `n_ij ← 0.998 n_ij + 1[u_j ≠ 0]`. Confidence is `n/(n+N0)` with `N0 = 24` by default (about two
 hours of active 5-minute samples to give learned and prior coefficients equal weight).
-Control blends `confidence × learned_b + (1 − confidence) × 0.03`, clips negative results to
-zero, then normalizes per system. Learning starts affecting control from the first valid sample;
+Control blends `confidence × learned_b + (1 − confidence) × system_prior`, clips negative results to
+zero, then normalizes per system. `system_prior` is the confidence-weighted mean raw learned b
+over that system's sensors with nonzero runtime confidence, falling back to 0.03 only when
+none has evidence. Unexplored pairs therefore inherit measured system reach rather than
+being mistaken for weak influence. Learning starts affecting control from the first valid sample;
 several hours of informative runtime can outweigh the prior, and forgetting supports continued
 adaptation. Confidence measures effective runtime evidence, rather than a statistical certainty
 that two always-synchronized systems have been identified separately.
 
-To distinguish system effects, while a system's minimum room confidence is below 80%, add a
+To distinguish system effects, while a system's minimum room confidence is below `explore_threshold` (default 0.8), add a
 ±0.5 °C square-wave offset of period two hours, with system k shifted by k/N of a period. Its
-amplitude fades linearly to zero at 80% confidence. This stays inside the existing clamp and slew
+amplitude fades linearly to zero at the confidence threshold. This stays inside the existing clamp and slew
 limits, and `last_decision` says `exploring` while it is active. Off mode and observe-only control
 send no exploration commands. Adding a room can restart exploration while its new row learns.
 
@@ -389,3 +392,45 @@ a 0.5-weight member above `minor_weight_share`, completing eight fan windows des
 repeated defrost-shaped dips. It also checks startup auto correction with invalid room
 readings or missing outdoor context, re-assertions, quiet caps, concrete pause reasons,
 and continued rejection of real missing/not-reporting/mode/setpoint contamination.
+
+
+## 0.4.2 learning fix
+
+Low-confidence room/system pairs blend toward that system's confidence-weighted mean learned
+b across explored rooms (any nonzero confidence), with the neutral 0.03 fallback only when
+nothing is explored. This uses measured effects without configured room mappings.
+
+Dither alone cannot start a system whose local sensor is far above its target. If any available,
+positive-weight member has confidence below `explore_threshold` (default 0.8), and a system has
+not actually heated/cooled for `excite_after_minutes` (default 120), start one global excitation.
+The weighted house mean must be below setpoint in heat or above in cool. Set the target to the
+system's own `current_temperature` plus 1 °C in heat or minus 1 °C in cool, rounded to 0.5 °C
+and bounded by device limits and the existing house offset clamp. The excitation deliberately
+bypasses the normal PI slew limit to reach a target that can start the device; hold that target
+and freeze its integrator. Other systems continue normal control.
+
+Hold until `excite_minutes` (default 30) of reported matching heating/cooling action have
+accumulated, or 60 wall-clock minutes pass. Action transitions between ticks count; idle,
+unknown and unavailable time do not. Abort on control off, mode change, unavailable system,
+missing house readings, or the house reaching/passing setpoint. A completed/aborted experiment
+waits another inactivity interval before retrying that system, allowing other systems a turn.
+Normal PI control then resumes with its usual slew limit. Names in `last_decision` read
+“exploring: running <name> to learn which rooms it reaches”. All three tunables are in options;
+setting the threshold to zero disables thermal exploration, including dither.
+
+Store retains inactivity and retry clocks. On restart discard an active experiment and begin
+its cooldown, clearing action endpoints so downtime never becomes observed runtime. Systems
+without a finite local temperature cannot start a forced run. Clamps can limit the achievable
+excitation target; the one-hour deadline bounds unsuccessful attempts.
+
+The deterministic two-day regression starts at 24 °C in two explored living-room sensors and
+18.8 °C in two newly joined cold sensors (weights 1, 1, 2, 2; weighted mean 20.53 °C), setpoint
+22.5 °C and outdoor 7 °C. B's local sensor reads the living room; A's local sensor is 4.5 °C
+cooler, so A can keep running at its backed-off target while B stays idle. Both systems' warm
+sensor counts start at 80; the cold rows start with zero runtime evidence. B last ran 14 hours
+ago. Cold-room losses balance A's small effects near the initial temperatures; B has strong
+but initially unobserved effects. Minute thermostat cycles feed actual runtime to the real
+controller and RLS learner at five-minute intervals. The comparison retains v0.4.1 learning
+and dither but disables excitation and restores the fixed prior blend. Assert B runs within
+three hours, learns larger cold-room b than A, and lowers final and day-two average weighted
+standard deviation (the simulation's weighted spread metric). Production spread remains max−min.

@@ -31,4 +31,7 @@ DEFAULTS = {
     "ki": 0.1,
     "learning_forgetting": 0.998,
     "learning_n0": 24,
+    "explore_threshold": 0.8,
+    "excite_after_minutes": 120,
+    "excite_minutes": 30,
 }

@@ -20,6 +20,8 @@ class Device:
     preset: str | None = None
     available: bool = True
     hvac_action: str | None = None
+    current_temperature: float | None = None
+    name: str | None = None
 
 
 @dataclass
@@ -31,6 +33,90 @@ class ControlState:
     integrals: dict[str, float] = field(default_factory=dict)
     offsets: dict[str, float] = field(default_factory=dict)
     last_update: float | None = None
+    last_run: dict[str, float] = field(default_factory=dict)
+    last_excite: dict[str, float] = field(default_factory=dict)
+    action_times: dict[str, float] = field(default_factory=dict)
+    actions: dict[str, str | None] = field(default_factory=dict)
+    excitation: dict = field(default_factory=dict)
+
+    def observe_action(self, system, action, now):
+        """Account only observed runtime, including transitions between ticks."""
+        previous = self.actions.get(system)
+        elapsed = max(0, now - self.action_times.get(system, now))
+        running = action in ("heating", "cooling")
+        if running or previous in ("heating", "cooling"):
+            self.last_run[system] = now
+        else:
+            self.last_run.setdefault(system, now)
+        if self.excitation.get("system") == system and previous == {
+            "heat": "heating",
+            "cool": "cooling",
+        }.get(self.excitation["mode"]):
+            self.excitation["runtime"] += elapsed
+        self.actions[system], self.action_times[system] = action, now
+
+
+def excitation_target(config, state, devices, values, house, mode, now, learning):
+    """Select one bounded, held experiment; never infer runtime from a target."""
+    helps = house is not None and (
+        (mode == "heat" and house < state.setpoint)
+        or (mode == "cool" and house > state.setpoint)
+    )
+    active = state.excitation
+    if active:
+        device = devices.get(active["system"])
+        finished = (
+            not helps
+            or mode != active["mode"]
+            or not device
+            or not device.available
+            or active["runtime"] >= config.get("excite_minutes", 30) * 60
+            or now - active["started"] >= 3600
+        )
+        if finished:
+            state.last_excite[active["system"]] = now
+            state.excitation = {}
+        return
+    if not helps or learning is None:
+        return
+    sensors = values.keys() & learning.rows.keys()
+    for system in config["systems"]:
+        key = system["entity_id"]
+        device = devices.get(key)
+        if (
+            not device
+            or not device.available
+            or device.current_temperature is None
+            or not isfinite(device.current_temperature)
+            or device.hvac_action in ("heating", "cooling")
+            or not sensors
+            or learning.system_confidence(key, sensors)
+            >= config.get("explore_threshold", 0.8)
+            or now - max(state.last_run[key], state.last_excite.get(key, float("-inf")))
+            < config.get("excite_after_minutes", 120) * 60
+        ):
+            continue
+        limit = config.get("offset_clamp", 3)
+        low = max(device.minimum, state.setpoint - limit)
+        high = min(device.maximum, state.setpoint + limit)
+        if low > high:
+            continue
+        target = clamp(
+            floor(
+                (device.current_temperature + (1 if mode == "heat" else -1)) * 2 + 0.5
+            )
+            / 2,
+            low,
+            high,
+        )
+        state.excitation = {
+            "system": key,
+            "mode": mode,
+            "started": now,
+            "runtime": 0,
+            "target": target,
+        }
+        break
 
 
 @dataclass
@@ -124,6 +210,9 @@ def control(
         mode = "off"
         notes.append("Outdoor temperature vetoed operation.")
     if not enabled:
+        if state.excitation:
+            state.last_excite[state.excitation["system"]] = now
+            state.excitation = {}
         return Decision(
             house,
             spread,
@@ -133,6 +222,9 @@ def control(
         )
     if mode != state.active_mode:
         state.active_mode, state.last_switch = mode, now
+    for key, device in devices.items():
+        state.observe_action(key, device.hvac_action if device.available else None, now)
+    excitation_target(config, state, devices, values, house, mode, now, learning)
     commands = []
     for system in config["systems"]:
         entity_id = system["entity_id"]
@@ -158,6 +250,11 @@ def control(
             offset = 0
             state.integrals[entity_id] = 0
             notes.append(f"{entity_id}: no usable room sensors; using house setpoint.")
+        elif state.excitation.get("system") == entity_id:
+            offset = state.excitation["target"] - state.setpoint
+            notes.append(
+                f"exploring: running {device.name or entity_id} to learn which rooms it reaches"
+            )
         elif mode in ("heat", "cool"):
             error = state.setpoint - local
             drivers = affected if influence else members
@@ -179,7 +276,12 @@ def control(
             candidate = integral + config.get("ki", 0.1) * error * dt
             raw = config.get("kp", 1) * error + candidate
             dither = (
-                learning.dither(entity_id, now, values.keys() & learning.rows.keys())
+                learning.dither(
+                    entity_id,
+                    now,
+                    values.keys() & learning.rows.keys(),
+                    config.get("explore_threshold", 0.8),
+                )
                 if learning
                 else 0
             )

@@ -35,7 +35,7 @@ def test_forgetting_and_blend():
     model.rows["room"].counts = [24]
     model.rows["room"].theta[1] = 0.2
     assert model.confidence("room", "heat") == 0.5
-    assert model.blended("room", "heat") == pytest.approx(0.115)
+    assert model.blended("room", "heat") == pytest.approx(0.2)
 
 
 def test_roundtrip_and_membership():

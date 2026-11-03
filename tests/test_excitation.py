@@ -1,0 +1,298 @@
+"""Late sensor onboarding must not trap an unobserved system at zero runtime."""
+
+from copy import deepcopy
+from dataclasses import asdict
+from math import sqrt
+
+import pytest
+
+from custom_components.house_climate.controller import (
+    ControlState,
+    Device,
+    Reading,
+    control,
+)
+from custom_components.house_climate.learning import PRIOR_B, Learning
+
+
+def setup(mode="heat"):
+    config = {
+        "sensors": [{"entity_id": "warm"}, {"entity_id": "cold", "weight": 2}],
+        "systems": [{"entity_id": "a"}, {"entity_id": "b"}],
+    }
+    state = ControlState(mode=mode, setpoint=22.5)
+    model = Learning(["warm", "cold"], ["a", "b"])
+    devices = {
+        s: Device(mode=mode, current_temperature=24, temperature=19.5, name=s.upper())
+        for s in model.systems
+    }
+    readings = {"warm": Reading(24), "cold": Reading(18.8)}
+    return config, state, model, devices, readings
+
+
+def test_system_mean_prior_and_confidence_blend():
+    model = Learning(["one", "two", "new"], ["a", "b"])
+    assert model.blended("new", "a") == PRIOR_B
+    model.rows["one"].counts = [24, 0]  # confidence 0.5
+    model.rows["two"].counts = [72, 0]  # confidence 0.75
+    model.rows["one"].theta[1] = 0.2
+    model.rows["two"].theta[1] = 0.5
+    prior = (0.5 * 0.2 + 0.75 * 0.5) / 1.25
+    assert model.blended("new", "a") == pytest.approx(prior)
+    assert model.blended("one", "a") == pytest.approx(0.5 * 0.2 + 0.5 * prior)
+    assert model.blended("new", "b") == PRIOR_B
+    model.rows["new"].theta[1] = 100  # no runtime: this estimate is no evidence
+    assert model.system_prior("a") == pytest.approx(prior)
+
+
+def tick(parts, now, **kwargs):
+    config, state, model, devices, readings = parts
+    return control(config, state, readings, devices, now, learning=model, **kwargs)
+
+
+def test_excitation_waits_then_holds_local_target_and_one_system():
+    parts = setup()
+    config, state, _, devices, _ = parts
+    tick(parts, 0)
+    tick(parts, 7199)
+    assert not state.excitation
+    result = tick(parts, 7200)
+    assert state.excitation["system"] == "a"
+    assert state.excitation["target"] == 25
+    assert "exploring: running A to learn which rooms it reaches" in result.explanation
+    assert ("a", "set_temperature", {"temperature": 25}) in result.commands
+    assert len(state.excitation) > 0
+    devices["a"].current_temperature = 24.5
+    devices["a"].hvac_action = "heating"
+    tick(parts, 7500)
+    assert state.excitation["runtime"] == 0
+    assert state.excitation["target"] == 25
+    # Transition between ticks: only actual heating seconds count.
+    state.observe_action("a", "idle", 8100)
+    tick(parts, 8400)
+    assert state.excitation["runtime"] == 600
+    state.observe_action("a", "heating", 8500)
+    tick(parts, 9700)
+    assert not state.excitation  # 30 observed running minutes, not 30 wall minutes
+    tick(parts, 10000)
+    assert state.excitation["system"] == "b"
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "past",
+        "equal",
+        "disabled",
+        "off",
+        "veto",
+        "confident",
+        "missing",
+        "zero_weight",
+        "stale",
+        "not_reporting",
+        "no_local",
+        "unavailable",
+        "recent_run",
+    ],
+)
+def test_excitation_conditions(reason):
+    parts = setup()
+    config, state, model, devices, readings = parts
+    tick(parts, 0)
+    kwargs = {}
+    if reason in ("past", "equal"):
+        readings["cold"] = Reading(24 if reason == "past" else 21.75)
+    elif reason == "disabled":
+        kwargs["enabled"] = False
+    elif reason == "off":
+        state.mode = "off"
+    elif reason == "veto":
+        kwargs["outdoor"] = 30
+    elif reason in ("confident", "missing", "zero_weight", "stale", "not_reporting"):
+        model.rows["warm"].counts = [200, 200]
+        readings["warm"] = Reading(21)
+        if reason == "confident":
+            model.rows["cold"].counts = [200, 200]
+        elif reason == "missing":
+            readings["cold"] = Reading(None)
+        elif reason == "zero_weight":
+            config["sensors"][1]["weight"] = 0
+        elif reason == "stale":
+            readings["cold"].age = 50000
+        else:
+            readings["cold"].reporting = False
+    elif reason == "no_local":
+        for d in devices.values():
+            d.current_temperature = None
+    elif reason == "unavailable":
+        for d in devices.values():
+            d.available = False
+    else:
+        for s in devices:
+            state.observe_action(s, "heating", 7100)
+            state.observe_action(s, "idle", 7150)
+    result = tick(parts, 7200, **kwargs)
+    if reason == "disabled":
+        assert not result.commands
+    assert not state.excitation
+
+
+@pytest.mark.parametrize(
+    "mode,local,expected", [("heat", 26, 25.5), ("cool", 18, 19.5)]
+)
+def test_excitation_clamp_cooling_and_device_limits(mode, local, expected):
+    parts = setup(mode)
+    _, state, _, devices, readings = parts
+    for d in devices.values():
+        d.current_temperature = local
+    if mode == "cool":
+        readings["cold"] = Reading(26)
+    tick(parts, 0)
+    tick(parts, 7200)
+    assert state.excitation["target"] == expected
+    parts = setup(mode)
+    _, state, _, devices, readings = parts
+    for d in devices.values():
+        d.current_temperature = 24 if mode == "heat" else 22
+        d.maximum = 24.5
+        d.minimum = 21.5
+    readings["cold"] = Reading(18 if mode == "heat" else 26)
+    tick(parts, 0)
+    tick(parts, 7200)
+    assert state.excitation["target"] == (24.5 if mode == "heat" else 21.5)
+
+
+def test_timeout_cooldown_abort_and_persistence():
+    parts = setup()
+    _, state, _, _, readings = parts
+    tick(parts, 0)
+    tick(parts, 7200)
+    saved = asdict(state)
+    assert ControlState(**deepcopy(saved)) == state
+    tick(parts, 10800)
+    assert not state.excitation
+    tick(parts, 11100)
+    assert state.excitation["system"] == "b"  # a cannot retry immediately
+    tick(parts, 11200, enabled=False)
+    assert not state.excitation
+    tick(parts, 11400)
+    assert not state.excitation
+    tick(parts, 18300)
+    assert state.excitation
+    readings["cold"] = Reading(25)
+    tick(parts, 18400)
+    assert not state.excitation
+
+
+class LegacyLearning(Learning):
+    """v0.4.1 comparison: fixed prior blend and dither, no forced runs."""
+
+    def blended(self, sensor, system):
+        c = self.confidence(sensor, system)
+        return (
+            c * self.rows[sensor].theta[self.systems.index(system) + 1]
+            + (1 - c) * PRIOR_B
+        )
+
+
+def simulate_late_sensors(legacy=False):
+    rooms, systems = ["living", "living_other", "downstairs", "guest"], ["a", "b"]
+    truth = [[0.50, 0.26], [0.50, 0.50], [0.005, 0.40], [0.004, 0.45]]
+    losses = [0.5 / 17, 0.5 / 17, 0.005 / 11.8, 0.004 / 11.8]
+    model = (LegacyLearning if legacy else Learning)(rooms[:2], systems)
+    for i, room in enumerate(rooms[:2]):
+        model.rows[room].theta = [losses[i], *truth[i], 0, 0]
+        model.rows[room].counts = [80, 80]
+    model.reconcile(rooms, systems)  # cold sensors join AFTER b last ran
+    config = {
+        "sensors": [{"entity_id": r, "weight": w} for r, w in zip(rooms, [1, 1, 2, 2])],
+        "systems": [{"entity_id": s} for s in systems],
+    }
+    if legacy:
+        config["excite_after_minutes"] = float("inf")
+    state = ControlState(
+        mode="heat",
+        setpoint=22.5,
+        offsets={"a": -3, "b": -3},
+        last_run={"a": 0, "b": -14 * 3600},
+    )
+    devices = {
+        s: Device(mode="heat", temperature=19.5, hvac_action="idle") for s in systems
+    }
+    temperatures = [24, 24, 18.8, 18.8]
+    first_b = None
+    spreads = []
+    weights = [1, 1, 2, 2]
+    for step in range(576):
+        now = step * 300
+        # A's local sensor is 4.5 C cooler than the living-room member sensor.
+        # At its 19.5 C target, A keeps B's local sensor near 24 C.
+        # The cold-room losses balance A's tiny effects near 18.8 C; B's
+        # much stronger reach is unknown because these sensors just joined.
+        devices["a"].current_temperature = temperatures[0] - 4.5
+        devices["b"].current_temperature = temperatures[0]
+        result = control(
+            config,
+            state,
+            dict(zip(rooms, map(Reading, temperatures))),
+            devices,
+            now,
+            outdoor=7,
+            learning=model,
+        )
+        for s, service, data in result.commands:
+            if service == "set_temperature":
+                devices[s].temperature = data["temperature"]
+        before = temperatures[:]
+        efforts = dict.fromkeys(systems, 0.0)
+        for minute in range(5):
+            for s, sensor in [("a", 0), ("b", 0)]:
+                running = (
+                    temperatures[sensor] - (4.5 if s == "a" else 0)
+                    < devices[s].temperature
+                )
+                devices[s].hvac_action = "heating" if running else "idle"
+                state.observe_action(s, devices[s].hvac_action, now + minute * 60)
+                efforts[s] += running / 5
+                if s == "b" and running and first_b is None:
+                    first_b = (now + minute * 60) / 60
+            temperatures = [
+                t
+                + (
+                    loss * (7 - t)
+                    + sum(
+                        b * (devices[s].hvac_action == "heating")
+                        for b, s in zip(bs, systems)
+                    )
+                )
+                / 5
+                for t, loss, bs in zip(temperatures, losses, truth)
+            ]
+        model.update(
+            dict(zip(rooms, before)), dict(zip(rooms, temperatures)), 7, efforts
+        )
+        average = sum(w * t for w, t in zip(weights, temperatures)) / sum(weights)
+        spreads.append(
+            sqrt(
+                sum(w * (t - average) ** 2 for w, t in zip(weights, temperatures))
+                / sum(weights)
+            )
+        )
+    return model, first_b, spreads
+
+
+def test_late_sensor_two_day_regression():
+    model, first_b, spreads = simulate_late_sensors()
+    baseline_model, baseline_first, baseline = simulate_late_sensors(True)
+    coefficients = {r: model.rows[r].theta[1:3] for r in ("downstairs", "guest")}
+    print(
+        f"\nLate sensors: first B run {first_b} min (v0.4.1 {baseline_first}); weighted spread final {spreads[-1]:.4f} vs {baseline[-1]:.4f} C; day2 mean spread {sum(spreads[288:]) / 288:.4f} vs {sum(baseline[288:]) / 288:.4f} C; learned [A,B] {coefficients}"
+    )
+    assert first_b is not None and first_b <= 180
+    assert baseline_first is None
+    assert baseline_model.rows["guest"].counts[1] == 0
+    for room in coefficients:
+        assert model.rows[room].theta[2] > model.rows[room].theta[1]
+    assert spreads[-1] < baseline[-1]
+    assert sum(spreads[288:]) < sum(baseline[288:])

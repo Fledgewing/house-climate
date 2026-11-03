@@ -91,6 +91,14 @@ class HouseCoordinator(DataUpdateCoordinator):
             if selected in modes(self.config):
                 self.priority_mode = selected
             self.state = ControlState(**saved["state"])
+            # Retain inactivity/cooldown clocks, but never count downtime as runtime.
+            self.state.actions.clear()
+            self.state.action_times.clear()
+            if self.state.excitation:
+                self.state.last_excite[self.state.excitation["system"]] = (
+                    dt_util.utcnow().timestamp()
+                )
+                self.state.excitation = {}
             self.enabled = saved.get("enabled", True)
             self.fan_enabled = saved.get("fan_enabled", True)
             self.fans = FanLearning(
@@ -202,6 +210,13 @@ class HouseCoordinator(DataUpdateCoordinator):
         old, new = event.data.get("old_state"), event.data.get("new_state")
         # Runtime changes must be captured even during service calls under lock.
         entity_id = event.data["entity_id"]
+        self.state.observe_action(
+            entity_id,
+            new.attributes.get("hvac_action")
+            if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+            else None,
+            dt_util.utcnow().timestamp(),
+        )
         self.reporting.activity(
             dt_util.utcnow().timestamp(),
             {
@@ -414,6 +429,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                     maximum=self.number(entity_id, "max_temp") or 35,
                     preset=entity.attributes.get("preset_mode"),
                     hvac_action=entity.attributes.get("hvac_action"),
+                    current_temperature=self.number(entity_id, "current_temperature"),
+                    name=entity.name,
                 )
             adoption = ""
             if not self.initialized:

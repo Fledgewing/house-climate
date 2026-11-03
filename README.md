@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.4.0 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.4.2 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 It computes a weighted house temperature and learns how strongly each HVAC system affects each room. Separate PI offsets use those learned effects so systems push harder for the rooms they reach, helping the house mean track the setpoint while reducing temperature differences. All room/system pairs start equally; there are no configured room mappings. Learning begins helping within hours of informative runtime and continues adapting.
 
@@ -97,9 +97,22 @@ Changes made directly on physical systems are noted in `last_decision` and re-as
 
 ## Online learning and visibility
 
-Each room learns `ΔT = a × (outdoor − room) + Σ b × signed_runtime_fraction + c × solar_kW + d` using recursive least squares. HVAC action changes are tracked between passes: heating contributes positive running effort, cooling negative. Every `b` starts at 0.03 °C per interval, with zero prior heat-loss, sun-gain and drift means and broad covariance. Default forgetting is 0.998 per sample. Each room/system confidence is `n/(n+24)`, where n is the forgetting-weighted number of intervals with nonzero effort. The blend shifts smoothly from the equal prior toward learned effects; these two learning tunables are available in options.
+Each room learns `ΔT = a × (outdoor − room) + Σ b × signed_runtime_fraction + c × solar_kW + d` using recursive least squares. HVAC action changes are tracked between passes: heating contributes positive running effort, cooling negative. Every `b` starts at 0.03 °C per interval, with zero prior heat-loss, sun-gain and drift means and broad covariance. Default forgetting is 0.998 per sample. Each room/system confidence is `n/(n+24)`, where n is the forgetting-weighted number of intervals with nonzero effort. In v0.4.2, low-confidence pairs blend toward that system's confidence-weighted mean learned b across rooms with runtime evidence, falling back to 0.03 only when none has been explored. A new sensor therefore inherits measured system reach while its own effect is learned; no room mappings are assumed. Forgetting and prior sample count are available in options.
 
-While a system's least-confident room is below 80%, it gets a ±0.5 °C two-hour square-wave exploration offset, with different phases per system. The amplitude fades to zero at 80%, inside the existing clamps and slew limit. `last_decision` says **exploring** and lists the rooms driving each system's error, strongest contributions first.
+While a system's least-confident active, weighted room is below `explore_threshold` (default 0.8), it gets a ±0.5 °C two-hour square-wave exploration offset, with different phases per system. The amplitude fades to zero at that threshold, inside the existing clamps and slew limit. `last_decision` says **exploring** and lists the rooms driving each system's error, strongest contributions first.
+
+If a system has unexplored active rooms but has not actually heated/cooled for
+`excite_after_minutes` (default **120**), v0.4.2 commands a learning run when the weighted
+house mean still needs heat/cooling. Only one system explores this way at a time. Its target
+is its own current temperature **+1 °C in heat / −1 °C in cool**, rounded and bounded by device
+limits and the house offset clamp. This held target bypasses the normal slew limit so a warm
+local sensor cannot prevent learning about cold rooms. It ends after `excite_minutes` (default
+**30**) of reported running action or **60** elapsed minutes, then normal PI control resumes.
+Control off, mode changes, unavailable systems or reaching/passing the house setpoint cancel
+the run. A system waits another inactivity interval before retrying. Restart retains inactivity
+clocks but cancels an active run without counting downtime. Options expose both durations and
+the confidence threshold; threshold zero disables thermal exploration. `last_decision` explains
+“exploring: running <name> to learn which rooms it reaches”.
 
 Read `sensor.house_learning` for overall confidence percent (the mean across room/system pairs). Under its attributes:
 
@@ -185,3 +198,12 @@ Fan tests include a separate seeded physical-house simulation with three anonymo
 reduces equilibrium spread from 4.0 °C to 0.6 °C, select it in over 90% of the final 100 windows,
 and keep the mean within 0.05 °C of target. HA tests verify commands, hold timing, switches,
 outside changes, skipped windows, options and Store reloads.
+
+
+The v0.4.2 late-sensor regression recreates two warm living-room sensors and two newly added
+cold-room sensors, with the idle system's own thermostat in the warm living room. With its
+last run 14 hours earlier, it starts immediately; v0.4.1 behavior leaves it idle for both days.
+Final weighted room standard deviation is 0.926 °C versus 2.452 °C; the day-two average is
+0.840 °C versus 2.452 °C. Learned cold-room b values are about 0.399/0.449 for B versus
+0.0040/0.0029 for A, in °C per full-running interval. These are deterministic simulation
+results, not measured house performance.

@@ -522,6 +522,18 @@ async def test_config_flow_empty_defaults_and_selector_filters(hass):
     assert {field.schema for field in result["data_schema"].schema} == {"preset"}
     result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
     assert result["step_id"] == "tunables"
+    fields = {
+        field.schema: (field, value)
+        for field, value in result["data_schema"].schema.items()
+    }
+    for key, default in {
+        "explore_threshold": 0.8,
+        "excite_after_minutes": 120,
+        "excite_minutes": 30,
+    }.items():
+        field, value = fields[key]
+        assert field.default() == default
+        assert isinstance(value, selector.NumberSelector)
     expected = {
         "outdoor_sensor": ("sensor", "temperature"),
         "weather_entity": ("weather", None),
@@ -1279,7 +1291,12 @@ async def test_held_step_resolves_without_reports_and_fans_resume(hass, installe
     ]
 
 
-async def test_quiet_window_caps_fan_on_first_pass(hass, installed):
+async def test_quiet_window_caps_fan_on_first_pass(hass, installed, freezer):
+    before = dt_util.now().replace(hour=21, minute=59, second=0, microsecond=0)
+    freezer.move_to(dt_util.as_utc(before))
+    # Refresh the fixture member at the simulated evening, not the real clock.
+    hass.states.async_set("sensor.room", "19.1", {"unit_of_measurement": "°C"})
+    await hass.async_block_till_done()
     c, system, calls = await prepare_fans(hass, installed)
     c.config.update(quiet_hours_enabled=True, quiet_start="22:00", quiet_end="07:00")
     c.config["systems"][0]["quiet_max_fan"] = "gentle"
@@ -1650,3 +1667,67 @@ async def test_fan_startup_correction_explains_blocker(hass, installed, cause):
     # The subsequent no-command return must refresh the explanation too.
     await c.async_tick()
     assert expected in c.fans.last_decision
+
+
+async def test_excitation_dispatch_between_tick_runtime_and_restart(hass, installed):
+    from custom_components.house_climate.coordinator import HouseCoordinator
+
+    entry, calls = installed
+    coordinator = entry.runtime_data
+    start = dt_util.utcnow()
+    for system in coordinator.config["systems"]:
+        key = system["entity_id"]
+        entity = hass.data[DATA_COMPONENT].get_entity(key)
+        entity._attr_current_temperature = 24
+        entity.async_write_ha_state()
+    await hass.async_block_till_done()
+    coordinator.state.last_run = {
+        system["entity_id"]: start.timestamp() - 3 * 3600
+        for system in coordinator.config["systems"]
+    }
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow", return_value=start
+    ):
+        await coordinator.async_change(setpoint=22.5, mode="heat", enabled=True)
+    assert coordinator.state.excitation["system"] == "climate.ducted"
+    assert any(
+        key == "climate.ducted"
+        and service == "set_temperature"
+        and data["temperature"] == 25
+        for key, service, data in calls
+    )
+    assert (
+        "exploring: running ducted to learn which rooms it reaches"
+        in coordinator.data.explanation
+    )
+    # Changes during commands under the coordinator lock still count accurately.
+    entity = hass.data[DATA_COMPONENT].get_entity("climate.ducted")
+    async with coordinator.lock:
+        for minutes, action in [(1, HVACAction.HEATING), (11, HVACAction.IDLE)]:
+            with patch(
+                "custom_components.house_climate.coordinator.dt_util.utcnow",
+                return_value=start + timedelta(minutes=minutes),
+            ):
+                entity._attr_hvac_action = action
+                entity.async_write_ha_state()
+                await hass.async_block_till_done()
+    assert coordinator.state.excitation["runtime"] == 600
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(minutes=12),
+    ):
+        await coordinator.async_tick(record=False)
+    restored = HouseCoordinator(hass, entry)
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(hours=3),
+    ):
+        await restored.async_load()
+    assert not restored.state.excitation
+    assert not restored.state.actions
+    assert not restored.state.action_times
+    assert restored.state.last_run == coordinator.state.last_run
+    assert (
+        restored.state.last_excite["climate.ducted"]
+        == (start + timedelta(hours=3)).timestamp()
+    )
