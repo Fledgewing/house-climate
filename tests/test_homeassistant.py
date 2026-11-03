@@ -850,6 +850,29 @@ async def test_recorder_seeds_numeric_changes_and_activity_on_startup(hass, sett
         hass.data.pop(DATA_INSTANCE)
 
 
+DEFROST_SEQUENCE = [
+    22,
+    22.5,
+    22,
+    21.5,
+    20.5,
+    18.5,
+    18,
+    19,
+    20,
+    21,
+    21.5,
+    22,
+    23,
+    23.5,
+    24,
+    23.5,
+    23,
+    22.5,
+    22,
+]
+
+
 async def test_real_house_transient_replay(hass, installed):
     """All minute events reach the filter; control/learning run every five minutes."""
     from custom_components.house_climate.filtering import SensorFilter
@@ -866,31 +889,10 @@ async def test_real_house_transient_replay(hass, installed):
     c.learning_baseline = None
     # Keep the exploration square wave in one phase throughout this replay.
     start = dt_util.parse_datetime("2026-11-02T17:30:00+00:00")
-    sequence = [
-        22,
-        22.5,
-        22,
-        21.5,
-        20.5,
-        18.5,
-        18,
-        19,
-        20,
-        21,
-        21.5,
-        22,
-        23,
-        23.5,
-        24,
-        23.5,
-        23,
-        22.5,
-        22,
-    ]
     temperatures = []
     targets = []
     for minute in range(-15, 26):
-        value = sequence[minute] if 0 <= minute < len(sequence) else 22
+        value = DEFROST_SEQUENCE[minute] if 0 <= minute < len(DEFROST_SEQUENCE) else 22
         # The other room remains in the observed 23–24 °C band.
         other = 23.5 + 0.5 * min(1, max(0, minute) / 25)
         with patch(
@@ -1110,7 +1112,7 @@ async def test_options_quiet_limit_from_runtime_modes(hass, settings):
     assert entry.options["learn_exclude_modes"] == "auto, strong"
 
 
-@pytest.mark.parametrize("reason", ["transient", "not_reporting", "mode", "setpoint"])
+@pytest.mark.parametrize("reason", ["not_reporting", "mode", "setpoint"])
 async def test_fan_windows_skip_real_contamination(hass, installed, reason):
     c, system, _ = await prepare_fans(hass, installed)
     start = dt_util.utc_from_timestamp(c.fans.window["start"])
@@ -1119,9 +1121,7 @@ async def test_fan_windows_skip_real_contamination(hass, installed, reason):
             "custom_components.house_climate.coordinator.dt_util.utcnow",
             return_value=start + timedelta(minutes=minute),
         ):
-            if reason == "transient":
-                hass.states.async_set("sensor.room", "15" if minute == 1 else "19")
-            elif reason == "not_reporting":
+            if reason == "not_reporting":
                 if minute == 1:
                     c.reporting.sensors["sensor.room"]["frozen"] = True
                     await c.async_tick()
@@ -1269,7 +1269,8 @@ async def test_held_step_resolves_without_reports_and_fans_resume(hass, installe
             await c.async_tick()
         if minute < 16:
             assert c.filters["sensor.room"].blocked
-            assert c.fans.window is None
+            assert c.fans.window is not None
+            assert not c.fans.window["dirty"]
     assert not c.filters["sensor.room"].blocked
     assert c.data.readings["sensor.room"] == 23
     assert c.fans.window is not None
@@ -1555,3 +1556,97 @@ async def test_options_new_sensor_all_modes_and_default_edit_active(hass, settin
         "balance": {"sensor.new": 1},
         "night": {"sensor.new": 1},
     }
+
+
+async def test_major_defrost_replay_completes_fan_windows(hass, installed, freezer):
+    """v0.2.2 minute replay repeats every 40 minutes for four hours."""
+    from custom_components.house_climate.filtering import SensorFilter
+
+    freezer.move_to("2026-11-02 12:05:00+00:00")
+    c, _, _ = await prepare_fans(hass, installed)
+    c.config["priority_modes"]["balance"]["sensor.room"] = 0.5
+    c.config["sensors"].append({"entity_id": "sensor.other", "weight": 1})
+    c.config["priority_modes"]["balance"]["sensor.other"] = 1
+    c.filters = {key: SensorFilter() for key in ("sensor.room", "sensor.other")}
+    c.learning.reconcile(list(c.filters), c.learning.systems)
+    c.learning_baseline = None
+    hass.states.async_set("sensor.outdoor", "7")
+    c.fans.window = None  # Begin after the initial HVAC mode switch.
+    start = dt_util.utcnow()
+    initial = sum(
+        arm["samples"]
+        for actions in c.fans.arms.values()
+        for buckets in actions.values()
+        for arms in buckets.values()
+        for arm in arms.values()
+    )
+    assert c.sensor_blocks_fans("sensor.room")
+    transients = 0
+    for minute in range(241):
+        freezer.move_to(start + timedelta(minutes=minute))
+        phase = minute % 40
+        value = DEFROST_SEQUENCE[phase] if phase < len(DEFROST_SEQUENCE) else 22
+        hass.states.async_set(
+            "sensor.room", str(value), {"friendly_name": "living-room"}
+        )
+        hass.states.async_set("sensor.other", "23.5")
+        await hass.async_block_till_done()
+        if minute % 5 == 0:
+            await c.async_tick()
+            if "living-room sensor transient ignored" in c.data.explanation:
+                transients += 1
+                assert not c.fans.window["dirty"], (minute, c.fans.window)
+            assert "Waiting for fan learning context" not in c.fans.last_decision
+    count = sum(
+        arm["samples"]
+        for actions in c.fans.arms.values()
+        for buckets in actions.values()
+        for arms in buckets.values()
+        for arm in arms.values()
+    )
+    assert transients >= 18
+    assert count - initial == 8
+    assert any(
+        arm["samples"] and "sensor.room" in arm["rooms"]
+        for actions in c.fans.arms.values()
+        for buckets in actions.values()
+        for arms in buckets.values()
+        for arm in arms.values()
+    )
+
+
+@pytest.mark.parametrize("cause", ["missing", "stale", "not_reporting", "outdoor"])
+async def test_fan_startup_correction_explains_blocker(hass, installed, cause):
+    from custom_components.house_climate.fans import FanLearning
+
+    c, system, calls = await prepare_fans(hass, installed)
+    c.fans = FanLearning()
+    system._attr_fan_mode = "auto"
+    system.async_write_ha_state()
+    await hass.async_block_till_done()
+    if cause == "missing":
+        hass.states.async_set("sensor.room", "unavailable")
+    elif cause == "stale":
+        c.config["stale_after"] = -1
+    elif cause == "not_reporting":
+        c.reporting.sensors["sensor.room"]["frozen"] = True
+    else:
+        hass.states.async_set("sensor.outdoor", "unavailable")
+    await hass.async_block_till_done()
+    calls.clear()
+    await c.async_tick()
+    assert system.fan_mode in ("gentle", "strong")
+    assert any(service == "set_fan_mode" for _, service, _ in calls)
+    expected = {
+        "missing": "sensor.room missing",
+        "stale": "sensor.room stale",
+        "not_reporting": "sensor.room not reporting",
+        "outdoor": "missing outdoor",
+    }[cause]
+    assert expected in c.fans.last_decision
+    assert expected in c.data.explanation
+    attrs = hass.states.get("sensor.house_fan_learning").attributes
+    assert expected in attrs["wait_reason"]
+    # The subsequent no-command return must refresh the explanation too.
+    await c.async_tick()
+    assert expected in c.fans.last_decision

@@ -74,7 +74,8 @@ class FanLearning:
         self.cursor = saved.get("cursor", 0)
         self.window = None
         self.resume = saved.get("window")
-        self.last_decision = "Waiting for fan learning context."
+        self.last_decision = "Fan learning has not received its first control pass."
+        self.wait_reason = None
         self.reconcile(self.arms.keys() | self.chosen.keys())
 
     def learnable_modes(self, modes):
@@ -107,9 +108,10 @@ class FanLearning:
         ):
             self.window = None
 
-    def invalidate(self):
+    def invalidate(self, reason="Fan experiment interrupted"):
         if self.window:
             self.window["dirty"] = True
+            self.window["reason"] = reason
 
     def options(self, system, action, bucket, modes):
         arms = (
@@ -167,6 +169,7 @@ class FanLearning:
         *,
         valid=True,
         enabled=True,
+        invalid_reason=None,
     ):
         """Systems map IDs to available, running, fan/swing_modes and fan/swing_mode.
 
@@ -197,9 +200,34 @@ class FanLearning:
                 if modes:
                     self.options(system, action, bucket, modes)
                     candidates.append((system, action, bucket, modes))
+        if not enabled:
+            reason = "fan control disabled or House mode off"
+        elif not valid:
+            reason = invalid_reason or "required room reading missing or not reporting"
+        elif outdoor is None or not isfinite(outdoor):
+            reason = "missing outdoor temperature reading"
+        elif mode not in ("heat", "cool"):
+            reason = f"HVAC mode {mode!r} has no heat/cool learning context"
+        elif not candidates:
+            unavailable = [
+                s for s, d in systems.items() if not d.get("available", True)
+            ]
+            reason = (
+                f"systems unavailable: {', '.join(unavailable)}"
+                if unavailable
+                else "no learnable fan/vane modes (missing options or all excluded)"
+            )
+        elif not values:
+            reason = "no reporting room temperature readings"
+        else:
+            reason = None
+        self.wait_reason = reason
         sample = (
-            {k: v - setpoint for k, v in values.items()} if valid and values else None
+            {k: v - setpoint for k, v in values.items()} if reason is None else None
         )
+        if reason:
+            self.invalidate(reason)
+            self.last_decision = f"Fan learning paused: {reason}."
         # Quiet limits take effect on this pass, interrupting any global hold.
         if enabled:
             for system, device in systems.items():
@@ -220,17 +248,59 @@ class FanLearning:
                     choice = modes[0]
                     self.chosen.setdefault(system, {})["fan"] = choice
                     bucket = context(mode, outdoor, device.get("running", False))
-                    if bucket is not None and sample is not None:
+                    if bucket is not None:
                         self.options(system, "fan", bucket, modes)
+                    if bucket is not None and sample is not None:
                         self._start(
                             now, system, "fan", bucket, choice, setpoint, sample
                         )
                     self.last_decision = (
                         f"{system} fan capped at {choice} for quiet hours."
+                        + (f" Fan learning paused: {reason}." if reason else "")
                     )
                     return self._command(system, "fan", choice)
-        if not enabled or not candidates or sample is None:
-            self.invalidate()
+        if not enabled:
+            return None
+        # Corrections do not depend on reward eligibility or outdoor context.
+        for system, device in systems.items():
+            if not device.get("available", True):
+                continue
+            for action in ("fan", "swing"):
+                modes = device.get(f"{action}_modes", [])
+                if not modes:
+                    continue
+                current = device.get(f"{action}_mode")
+                chosen = self.chosen.get(system, {}).get(action)
+                excluded = str(current).casefold() in self.excluded
+                if not excluded and not (chosen in modes and current != chosen):
+                    continue
+                self.invalidate(f"{system} {action} setting changed")
+                if (
+                    self.window
+                    and now - self.window["start"] < self.hold
+                    and (system, action)
+                    != (self.window["system"], self.window["action"])
+                ):
+                    self.last_decision = (
+                        f"{system} {action} correction waits for the current fan hold deadline."
+                        + (f" Fan learning paused: {reason}." if reason else "")
+                    )
+                    return None
+                bucket = context(mode, outdoor, device.get("running", False))
+                choice = chosen if chosen in modes else self.rng.choice(modes)
+                self.chosen.setdefault(system, {})[action] = choice
+                if bucket is not None:
+                    self.options(system, action, bucket, modes)
+                self.resume = None
+                self._start(now, system, action, bucket, choice, setpoint, sample)
+                self.last_decision = (
+                    f"{system} {action} excluded mode {current}; trying {device.get('name', system)} "
+                    f"{'vane' if action == 'swing' else 'fan'} {choice} to learn."
+                    if excluded
+                    else f"{system} {action} differs; re-asserting {choice}."
+                ) + (f" Fan learning paused: {reason}." if reason else "")
+                return self._command(system, action, choice)
+        if reason:
             return None
         if self.resume:
             old = self.resume
@@ -251,13 +321,21 @@ class FanLearning:
                 )
         if self.window:
             w = self.window
-            matching = any(
-                (s, a, b) == (w["system"], w["action"], w["bucket"])
-                and w["choice"] in modes
-                for s, a, b, modes in candidates
-            )
-            if not matching or setpoint != w["setpoint"]:
-                self.invalidate()
+            if (
+                w["bucket"] is None
+                or mode != w["bucket"].split("|")[0]
+                or setpoint != w["setpoint"]
+            ):
+                self.invalidate("HVAC mode or user setpoint changed")
+            device = systems.get(w["system"], {})
+            if (
+                w["system"] not in systems
+                or not device.get("available", True)
+                or w["choice"] not in device.get(f"{w['action']}_modes", [])
+            ):
+                self.invalidate(
+                    f"{w['system']} unavailable or selected {w['action']} mode no longer offered"
+                )
             duration = max(0, now - w["last"])
             for room, error in w["reward"].items():
                 stats = w["rooms"].setdefault(room, [0.0, 0.0, 0.0])
@@ -265,24 +343,14 @@ class FanLearning:
                 stats[1] += duration * error
                 stats[2] += duration * error**2
             w["last"], w["reward"] = now, sample
-        # Re-assert one outside change, then hold again before any other command.
-        for system, action, bucket, modes in candidates:
-            choice = self.chosen.get(system, {}).get(action)
-            if choice in modes and systems[system].get(f"{action}_mode") != choice:
-                self.invalidate()
-                if (
-                    self.window
-                    and now - self.window["start"] < self.hold
-                    and (system, action)
-                    != (self.window["system"], self.window["action"])
-                ):
-                    continue
-                self._start(now, system, action, bucket, choice, setpoint, sample)
-                self.last_decision = (
-                    f"{system} {action} differs; re-asserting {choice}."
-                )
-                return self._command(system, action, choice)
         if self.window and now - self.window["start"] < self.hold:
+            w = self.window
+            self.last_decision = (
+                f"Fan window invalid: {w.get('reason', 'experiment interrupted')}; "
+                "holding setting until the deadline."
+                if w["dirty"]
+                else f"Holding {w['system']} {w['action']} {w['choice']} for fan learning."
+            )
             return None
         if self.window:
             w = self.window
@@ -342,9 +410,10 @@ class FanLearning:
             bucket=bucket,
             choice=choice,
             setpoint=setpoint,
-            reward=sample,
+            reward=sample or {},
             rooms={},
-            dirty=False,
+            dirty=sample is None or bucket is None,
+            reason=self.wait_reason,
         )
 
     @staticmethod
@@ -373,6 +442,8 @@ class FanLearning:
                 for s, actions in self.arms.items()
             },
             "last_decision": self.last_decision,
+            "wait_reason": self.wait_reason,
+            "window": deepcopy(self.window),
         }
 
     @property

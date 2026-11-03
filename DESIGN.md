@@ -193,7 +193,7 @@ loop. It checks every learned coefficient within 0.003 °C/interval of truth, ho
 0.5 °C throughout day two, spread improvement against learning disabled, useful learning within
 hours, and exploration active early but absent at the end.
 
-## Fan/vane learning (v0.4.0)
+## Fan/vane learning (v0.4.1)
 
 Pure `fans.py` implements a contextual UCB bandit per system and per action (`fan`, `swing`).
 Action options are read from each climate entity's `fan_modes` and `swing_modes` on every pass;
@@ -228,14 +228,17 @@ Hold the selected setting for at least `fan_hold_minutes` (default 30, options: 
 Only one action of one system can be commanded in a hold window; other chosen settings remain
 fixed. The PI temperature controller continues tracking the house setpoint throughout.
 
-A sensor transient or missing/stale/not-reporting member with at least
+A missing/stale/not-reporting member with at least
 `minor_weight_share` of the total active-mode positive sensor weight (default 0.05),
 an HVAC mode switch, user house/physical
-setpoint change or selected-context change dirties the complete experiment. Events between ticks
+setpoint change or fan-control toggle dirties the complete experiment. Rejected/pending
+transients do not: fan rewards use the robust filtered value, including its held anchor.
+Outdoor band and runtime context changes apply to the next selection; each hold retains
+its starting context. Events between ticks
 latch dirtiness; recovery before a tick cannot make it train. Dirty windows retain their deadline
 but contribute no sample. Disabled house/fan control invalidates experiments and sends no fan/vane
-commands. Blocked minor members are still excluded from fan rewards and their
-thermal learning rows, while healthy rooms continue training. Commands use `climate.set_fan_mode` / `climate.set_swing_mode` only when different.
+commands. Missing/stale/not-reporting minor members are excluded from fan rewards;
+transients still block their thermal learning rows while fan rewards use filtered values. Commands use `climate.set_fan_mode` / `climate.set_swing_mode` only when different.
 Failures discard the window. Re-assert outside changes to chosen settings, restarting a full
 hold; another action's re-assertion waits for the global deadline. Outside-change notices use the
 same two-minute echo grace as targets. The required preset path remains unchanged.
@@ -364,3 +367,25 @@ service effects on mean and both system errors with untouched learned state, Sto
 entry reloads, mode CRUD and last-mode protection, active weight editing, sensor membership,
 legacy scalar fan loading, time-weighted error moments and reversed fan ranking under two
 room priorities.
+
+
+## 0.4.1 fixes
+
+Fan windows now use reporting filtered room values even through pending or rejected
+transients. Previously, both the sensor event listener and `fan_clean` treated filter
+rejection as invalidation, starving experiments on a significant-weight defrost sensor.
+The invalid/context early return also bypassed excluded-mode correction and left
+`last_decision` at its startup message indefinitely across restarts.
+
+Excluded-mode correction, chosen-setting re-assertion and quiet-hour caps run before
+learning eligibility checks. Corrections preserve the global hold rule (quiet caps
+interrupt it), send at most one changed setting per pass, and collect no invalid reward.
+Each paused return states its cause, including sensor IDs and missing outdoor readings;
+fan sensor diagnostics expose `wait_reason` and the active `window` with its dirty reason.
+Track in-flight temperature commands so PI adjustments do not masquerade as user changes.
+
+Regression coverage reuses the v0.2.2 minute replay every 40 minutes for four hours with
+a 0.5-weight member above `minor_weight_share`, completing eight fan windows despite
+repeated defrost-shaped dips. It also checks startup auto correction with invalid room
+readings or missing outdoor context, re-assertions, quiet caps, concrete pause reasons,
+and continued rejection of real missing/not-reporting/mode/setpoint contamination.

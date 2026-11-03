@@ -71,13 +71,13 @@ def test_hold_and_one_change_across_systems_and_actions():
 
 
 @pytest.mark.parametrize(
-    "reason", ["transient", "not_reporting", "setpoint", "mode", "disabled"]
+    "reason", ["missing", "not_reporting", "setpoint", "mode", "disabled"]
 )
 def test_contaminated_windows_do_not_train(reason):
     model = FanLearning(rng=Random(1))
     systems = devices()
     tick(model, systems, 0)
-    if reason in ("transient", "not_reporting", "mode", "setpoint"):
+    if reason in ("missing", "not_reporting", "mode", "setpoint"):
         model.invalidate()  # Event between scheduled passes, even if recovered.
     else:
         tick(model, systems, 300, enabled=False)
@@ -427,3 +427,77 @@ def test_fan_moments_time_weighting_penalty_and_removed_room():
     assert arm["mean_reward"] == pytest.approx(-9)
     model.weights = {"A": 1}
     assert model.score(arm) == pytest.approx(-13.25)
+
+
+@pytest.mark.parametrize("action", ["fan", "swing"])
+@pytest.mark.parametrize("outdoor", [None, 7])
+@pytest.mark.parametrize("correction", ["excluded", "reassert"])
+def test_corrections_with_invalid_window_and_incomplete_context(
+    action, outdoor, correction
+):
+    model = FanLearning()
+    systems = {"unit": {f"{action}_modes": ["low", "auto"], f"{action}_mode": "auto"}}
+    if correction == "reassert":
+        systems["unit"][f"{action}_mode"] = "outside"
+        model.chosen = {"unit": {action: "low"}}
+    command = model.tick(
+        0,
+        "heat",
+        outdoor,
+        systems,
+        {},
+        {},
+        21,
+        valid=False,
+        invalid_reason="sensor.living_room unavailable",
+    )
+    assert command == ("unit", f"set_{action}_mode", {f"{action}_mode": "low"})
+    assert "sensor.living_room unavailable" in model.last_decision
+    assert samples(model) == 0
+    assert model.window["dirty"]
+
+
+@pytest.mark.parametrize(
+    "mode,outdoor,systems,values,enabled,expected",
+    [
+        ("heat", None, devices(), {"one": 21}, True, "missing outdoor"),
+        ("off", 7, devices(), {"one": 21}, True, "HVAC mode 'off'"),
+        (
+            "heat",
+            7,
+            {"unit": {"available": False}},
+            {"one": 21},
+            True,
+            "unavailable: unit",
+        ),
+        (
+            "heat",
+            7,
+            {"unit": {"fan_modes": ["auto"]}},
+            {"one": 21},
+            True,
+            "all excluded",
+        ),
+        ("heat", 7, devices(), {}, True, "no reporting room"),
+        ("heat", 7, devices(), {"one": 21}, False, "control disabled"),
+    ],
+)
+def test_every_paused_tick_updates_decision(
+    mode, outdoor, systems, values, enabled, expected
+):
+    model = FanLearning()
+    model.last_decision = "previous decision"
+    assert (
+        model.tick(0, mode, outdoor, systems, values, {}, 21, enabled=enabled) is None
+    )
+    assert expected in model.last_decision
+    assert expected in model.diagnostics()["wait_reason"]
+
+
+def test_outdoor_band_and_runtime_context_changes_keep_filtered_window():
+    model = FanLearning(rng=Random(1))
+    systems = devices()
+    tick(model, systems, 0)
+    systems["unit"]["running"] = False
+    model.tick(1800, "heat", 7, systems, {"one": 21}, {}, 21)
+    assert samples(model) == 1

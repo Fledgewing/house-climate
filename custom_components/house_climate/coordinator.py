@@ -54,6 +54,7 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
         self.lock = asyncio.Lock()
         self.last_commands = {}
+        self.pending_commands = {}
         self.last_fan_commands = {}
         self.learning = self.new_learning()
         self.effort = EffortTracker()
@@ -189,9 +190,9 @@ class HouseCoordinator(DataUpdateCoordinator):
             dt_util.utcnow().timestamp(),
         )
         if self.sensor_blocks_fans(entity_id) and (
-            value is None or not isfinite(value) or self.filters[entity_id].blocked
+            value is None or not isfinite(value)
         ):
-            self.fans.invalidate()
+            self.fans.invalidate(f"{entity_id} missing or unavailable reading")
         # Recover control and repairs on the first numeric change, even between ticks.
         if entity_id in self.not_reporting:
             self.hass.async_create_task(self.async_tick(record=False))
@@ -221,13 +222,17 @@ class HouseCoordinator(DataUpdateCoordinator):
         )
         if old and new:
             commanded_target = self.last_commands.get(entity_id)
+            pending_target = self.pending_commands.get(entity_id, {}).get("temperature")
             if old.attributes.get("temperature") != new.attributes.get(
                 "temperature"
             ) and (
-                not commanded_target
-                or new.attributes.get("temperature") != commanded_target[1]
+                new.attributes.get("temperature") != pending_target
+                and (
+                    not commanded_target
+                    or new.attributes.get("temperature") != commanded_target[1]
+                )
             ):
-                self.fans.invalidate()
+                self.fans.invalidate(f"{entity_id} user setpoint changed")
             if old.state != new.state or any(
                 old.attributes.get(f"{action}_mode")
                 != new.attributes.get(f"{action}_mode")
@@ -235,7 +240,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 != self.fans.chosen.get(entity_id, {}).get(action)
                 for action in ("fan", "swing")
             ):
-                self.fans.invalidate()
+                self.fans.invalidate(f"{entity_id} mode or fan/vane setting changed")
         if self.lock.locked() or self.data is None or old is None or new is None:
             return
         for action in ("fan", "swing"):
@@ -419,24 +424,27 @@ class HouseCoordinator(DataUpdateCoordinator):
             if outdoor is None:
                 outdoor = self.number(self.config.get("weather_entity"), "temperature")
             solar = self.solar_kw()
-            fan_clean = all(
-                not self.filters[key].blocked
-                and reading.reporting
-                and reading.value is not None
-                and reading.age <= self.config.get("stale_after", 720) * 60
-                for key, reading in readings.items()
-                if self.sensor_blocks_fans(key)
-            )
+            # Fan rewards use the robust filter's value, including its held anchor.
+            # Pending/rejected excursions block thermal rows, not fan experiments.
+            fan_problems = []
+            clean_values = {}
+            for key, reading in readings.items():
+                reason = None
+                if not reading.reporting:
+                    reason = (
+                        f"{key} not reporting ({self.not_reporting[key]['reason']})"
+                    )
+                elif reading.value is None:
+                    reason = f"{key} missing or unavailable reading"
+                elif reading.age > self.config.get("stale_after", 720) * 60:
+                    reason = f"{key} stale reading"
+                if reason is None:
+                    clean_values[key] = reading.value
+                elif self.sensor_blocks_fans(key):
+                    fan_problems.append(reason)
+            fan_clean = not fan_problems
             if not fan_clean:
-                self.fans.invalidate()
-            clean_values = {
-                key: r.value
-                for key, r in readings.items()
-                if not self.filters[key].blocked
-                and r.reporting
-                and r.value is not None
-                and r.age <= self.config.get("stale_after", 720) * 60
-            }
+                self.fans.invalidate("; ".join(fan_problems))
             if record:
                 efforts, duration = self.effort.finish(
                     {
@@ -448,7 +456,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                 learning_values = {
                     key: value
                     for key, value in clean_values.items()
-                    if not self.filters[key].contaminated
+                    if not self.filters[key].blocked
+                    and not self.filters[key].contaminated
                 }
                 if (
                     self.learning_baseline is not None
@@ -528,6 +537,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 self.priority_weights,
                 self.state.setpoint,
                 valid=fan_clean,
+                invalid_reason="; ".join(fan_problems),
                 enabled=self.enabled and self.fan_enabled and self.state.mode != "off",
             )
             if fan_command:
@@ -539,6 +549,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 if entity_id in failures:
                     continue
                 try:
+                    self.pending_commands[entity_id] = data
                     await self.hass.services.async_call(
                         "climate",
                         service,
@@ -566,6 +577,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                     self.fans.invalidate()
                     decision.explanation += f" {entity_id}: command failed ({err})."
                     _LOGGER.warning("Command to %s failed: %s", entity_id, err)
+                finally:
+                    self.pending_commands.pop(entity_id, None)
             _LOGGER.debug("%s", decision.explanation)
             if record:
                 occupancy = self.hass.states.get(
@@ -771,7 +784,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             if any(
                 v is not None for v in (delta, setpoint, mode, enabled, fan_enabled)
             ):
-                self.fans.invalidate()
+                self.fans.invalidate("House setpoint, mode or control switch changed")
             if priority_mode is not None:
                 if priority_mode not in modes(self.config):
                     raise ValueError("Unknown priority mode")
