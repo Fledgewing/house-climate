@@ -78,8 +78,8 @@ async def async_unload_entry(hass, entry):
 
 
 async def async_migrate_entry(hass, entry):
-    """Remove v1 mappings and migrate legacy weights to balance in options."""
-    if entry.version > 3:
+    """Migrate room mappings, priority modes and the separate average weight."""
+    if entry.version > 4:
         return False
     if entry.version == 1:
 
@@ -102,4 +102,8 @@ async def async_migrate_entry(hass, entry):
         settings = dict(entry.options or entry.data)
         settings["priority_modes"] = modes(settings)
         hass.config_entries.async_update_entry(entry, options=settings, version=3)
+    if entry.version < 4:
+        settings = dict(entry.options or entry.data)
+        settings.setdefault("average_weight", 1.0)
+        hass.config_entries.async_update_entry(entry, options=settings, version=4)
     return True

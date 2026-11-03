@@ -126,7 +126,7 @@ def test_mean_integrates_once_per_interval(config):
     state = ControlState(mode="heat")
     for i in range(3):
         run(config, state, {"sensor.a": Reading(20.9)}, now=10000 + i * 300)
-    assert state.integrals["mean"] == pytest.approx(0.0003)
+    assert state.integrals["mean"] == pytest.approx(0.00015)
     before = dict(state.integrals)
     run(config, state, {"sensor.a": Reading(20.9)}, now=10601)
     assert state.integrals == before
@@ -258,3 +258,11 @@ def test_outdoor_veto_thresholds_are_configurable(config):
         state = ControlState(mode=mode)
         run(config, state, outdoor=outdoor)
         assert state.active_mode == mode
+
+
+@pytest.mark.parametrize("weight", [1, 0.5, 0.2, 0.1])
+def test_mean_integral_respects_average_weight(config, weight):
+    config.update(average_weight=weight, mean_integral_gain=0.001)
+    state = ControlState(mode="heat")
+    run(config, state, {"sensor.a": Reading(20.9)})
+    assert state.integrals["mean"] == pytest.approx(0.001 * 0.1 * weight / (1 + weight))

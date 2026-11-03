@@ -115,8 +115,9 @@ Every control interval, and immediately when the house setpoint or mode changes:
    + switch_penalty × Σ_j 1[on(u_j) ≠ reported_on_j]
    + effort_change_penalty × Σ_j |u_j − previous_u_j|`.
 
-   Normalize the active positive room weights to sum to one. Reuse `fan_reward_lambda`
-   for λ (default 1). `learning.forecast` propagates each interval model
+   Normalize the active positive room weights to sum to one. Use `average_weight`
+   for λ (default 1, options 0.01–10), independently of the fan override. Lower λ
+   prioritizes spread and deliberately permits a mean below S in heating. `learning.forecast` propagates each interval model
    `ΔT_i = a_i(T_out − T_i) + Σ_j b_ij u_j + Σ_k e_ik source_k + c_i solar + d_i`
    to the horizon (default 45 minutes), holding current outdoor, source states and solar
    constant. Propagate losses every step; the resulting forecast is affine in effort.
@@ -145,8 +146,11 @@ Every control interval, and immediately when the house setpoint or mode changes:
    cycling/comfort holds and the state-change cost still apply to a running actuator.
 
    A single persisted mean-error integral biases S by at most ±1 °C. Its separate
-   `mean_integral_gain` defaults to 0.001 per scheduled interval; immediate requests do not
-   integrate. Conditional integration stops increasing the bias when the predicted mean
+   `mean_integral_gain` defaults to 0.001 per scheduled interval, multiplied by
+   `average_weight / (1 + average_weight)`; immediate requests do not integrate.
+   This smooth gain scaling weakens mean correction along with the mean objective
+   (effective gain 0.0005 at λ=1, 0.000167 at λ=0.2). It does not alone eliminate
+   long-term bias: the existing reachability gate below remains essential. Conditional integration stops increasing the bias when the predicted mean
    cannot follow it in the requested direction (0.05 °C² tolerance). Old per-system PI
    integrals remain loadable but are unused. This keeps upgrades from applying old PI
    gains or room errors to the joint objective.
@@ -284,7 +288,9 @@ among the arm's observed member rooms and score:
 
 `r = −(Σ w_i E[e_i²] − (Σ w_i E[e_i])²) − λ (Σ w_i E[e_i])²`.
 
-`fan_reward_lambda` is λ, default 1 (options: 0–100). This is the variance/mean-error reward
+`fan_reward_lambda` is the optional fan-only λ override (options: 0–100).
+Unset/None follows `average_weight` dynamically; explicit zero remains zero.
+The optional options-flow field has no numeric default and clearing it restores following. This is the variance/mean-error reward
 expressed as room moments, so historical evidence can be reweighted without resetting it.
 Removed rooms do not contribute to scores. Legacy scalar-only arms load with empty room
 statistics and zero sample counts; other scheduler identities survive. `mean_reward` is a derived
@@ -830,3 +836,23 @@ off. Forecast copies never advance persisted time or the reported runtime eviden
 Tests cover heat/cool target crossings in both the horizon and elapsed outage state,
 fresh real own readings, JSON/Store restart continuity, hysteresis latching and learning,
 and own-row contributions from joint efforts, outdoor temperature, solar and heat sources.
+
+
+## Average/balance separation (0.5.6)
+
+Config-entry version 4 adds missing `average_weight=1.0` to the effective options,
+preserving an existing value and all explicit fan overrides. Legacy fan weights no
+longer affect allocation. New entries leave the fan override unset; coordinator
+construction, Store restoration and learning reset all resolve that override in the
+same way. Existing fan statistics are re-scored using the resolved weight.
+
+The 12-hour weak-basement regression and its assumptions/results are recorded in
+README's “Average versus balance” section. It runs the controller with its default
+integral enabled at λ=1/0.5/0.2/0.1 and compares λ=0.2 with integral disabled.
+The mean-reachability gate blocks integration throughout this fixture, so lower λ
+cannot be wound back toward the setpoint. Separate tests verify gain scaling when
+the target is reachable. The two-day thermal-learning benchmark explicitly retains
+its original effective mean gain (configured 0.002 × 1/2), isolating model-learning
+accuracy from this intentional change in integral dynamics. This objective provides
+no hard 0.5 °C gap bound: forecasts, passive losses and actuator reach determine
+what spread can be achieved.

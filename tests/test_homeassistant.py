@@ -292,7 +292,15 @@ async def test_sample_retention_and_restore(hass, installed):
     assert not entry.runtime_data.enabled
 
 
-async def complete_flow(manager, result, sensors, systems, stale_after=720):
+async def complete_flow(
+    manager,
+    result,
+    sensors,
+    systems,
+    stale_after=720,
+    average_weight=1.0,
+    fan_reward_lambda=None,
+):
     result = await manager.async_configure(
         result["flow_id"], {"sensors": sensors, "systems": systems}
     )
@@ -309,11 +317,14 @@ async def complete_flow(manager, result, sensors, systems, stale_after=720):
     tunables = {
         k: v
         for k, v in DEFAULTS.items()
-        if k not in ("sensors", "systems", "extra_heat_sources") and v != ""
+        if k not in ("sensors", "systems", "extra_heat_sources") and v not in ("", None)
     }
     fields = {field.schema: field for field in result["data_schema"].schema}
     assert fields["stale_after"].default() == 720
     tunables["stale_after"] = stale_after
+    tunables["average_weight"] = average_weight
+    if fan_reward_lambda is not None:
+        tunables["fan_reward_lambda"] = fan_reward_lambda
     return await manager.async_configure(result["flow_id"], tunables)
 
 
@@ -339,6 +350,8 @@ async def test_config_flow_creates_entry(hass):
                 "occupancy_sensor",
             )
         )
+        assert result["data"]["average_weight"] == 1.0
+        assert result["data"]["fan_reward_lambda"] is None
         assert len(result["data"]["systems"]) == 3
         assert result["data"]["sensors"][0]["weight"] == 1
         await hass.async_block_till_done()
@@ -539,6 +552,7 @@ async def test_config_flow_empty_defaults_and_selector_filters(hass):
         for field, value in result["data_schema"].schema.items()
     }
     for key, default in {
+        "average_weight": 1.0,
         "explore_threshold": 0.8,
         "excite_after_minutes": 120,
         "excite_minutes": 30,
@@ -546,6 +560,9 @@ async def test_config_flow_empty_defaults_and_selector_filters(hass):
         field, value = fields[key]
         assert field.default() == default
         assert isinstance(value, selector.NumberSelector)
+    assert fields["average_weight"][1].config["min"] == 0.01
+    assert fields["average_weight"][1].config["max"] == 10
+    assert fields["fan_reward_lambda"][0].description == {}
     expected = {
         "outdoor_sensor": ("sensor", "temperature"),
         "weather_entity": ("weather", None),
@@ -577,7 +594,7 @@ async def test_v1_entry_migration(hass, settings, options):
     )
     entry.add_to_hass(hass)
     assert await async_migrate_entry(hass, entry)
-    assert entry.version == 3
+    assert entry.version == 4
     assert all("influence" not in s for s in entry.data["systems"])
     assert all("influence" not in s for s in entry.options.get("systems", []))
     assert entry.data["systems"][0]["preset"] == "manual"
@@ -1135,7 +1152,7 @@ async def test_options_quiet_limit_from_runtime_modes(hass, settings):
     inputs = {
         k: v
         for k, v in DEFAULTS.items()
-        if k not in ("sensors", "systems", "extra_heat_sources") and v != ""
+        if k not in ("sensors", "systems", "extra_heat_sources") and v not in ("", None)
     }
     inputs["quiet_hours_enabled"] = True
     inputs["learn_exclude_modes"] = "auto, strong"
@@ -1513,7 +1530,7 @@ async def finish_priority_wizard(
     tunables = {
         k: v
         for k, v in DEFAULTS.items()
-        if k not in ("sensors", "systems", "extra_heat_sources") and v != ""
+        if k not in ("sensors", "systems", "extra_heat_sources") and v not in ("", None)
     }
     return await flow.async_configure(result["flow_id"], tunables)
 
@@ -1789,7 +1806,7 @@ async def test_options_onboard_sources(hass, settings):
     tunables = {
         k: v
         for k, v in DEFAULTS.items()
-        if k not in ("sensors", "systems", "extra_heat_sources") and v != ""
+        if k not in ("sensors", "systems", "extra_heat_sources") and v not in ("", None)
     }
     result = await flow.async_configure(result["flow_id"], tunables)
     assert result["type"] == FlowResultType.CREATE_ENTRY
@@ -2576,3 +2593,68 @@ async def test_upgrade_seeds_outage_thermostat_from_samples_without_recorder(
     assert thermostat["time"] == now - 300
     assert thermostat["running"] is True
     assert restored.state.thermostat_points["climate.ducted"] == pytest.approx([0.7])
+
+
+@pytest.mark.parametrize("options", [False, True])
+@pytest.mark.parametrize("average_weight", [None, 0.2])
+async def test_v3_average_weight_migration(hass, settings, options, average_weight):
+    from custom_components.house_climate import async_migrate_entry
+
+    settings.pop("average_weight", None)
+    settings["fan_reward_lambda"] = 3.0
+    if average_weight is not None:
+        settings["average_weight"] = average_weight
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=3,
+        data=settings,
+        options=deepcopy(settings) if options else {},
+    )
+    entry.add_to_hass(hass)
+    assert await async_migrate_entry(hass, entry)
+    assert entry.version == 4
+    assert entry.options["average_weight"] == (
+        1.0 if average_weight is None else average_weight
+    )
+    assert entry.options["fan_reward_lambda"] == 3.0
+
+
+@pytest.mark.parametrize("override,expected", [(None, 0.2), (0, 0), (3, 3)])
+async def test_fan_weight_follows_allocator_on_load_and_reset(
+    hass, settings, override, expected
+):
+    from custom_components.house_climate.coordinator import HouseCoordinator
+
+    settings.update(average_weight=0.2)
+    settings.pop("fan_reward_lambda", None)
+    if override is not None:
+        settings["fan_reward_lambda"] = override
+    entry = MockConfigEntry(domain=DOMAIN, data=settings, version=4)
+    entry.add_to_hass(hass)
+    c = entry.runtime_data = HouseCoordinator(hass, entry)
+    assert c.fans.penalty == expected
+    await c.store.async_save({"state": asdict(c.state), "fans": c.fans.to_dict()})
+    await c.async_load()
+    assert c.fans.penalty == expected
+    with patch.object(c, "async_tick"):
+        await c.async_reset_learning()
+    assert c.fans.penalty == expected
+
+
+@pytest.mark.parametrize("override", [None, 0, 3])
+async def test_options_average_and_fan_override(hass, settings, override):
+    settings["fan_reward_lambda"] = 4
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=DOMAIN, data=settings, version=4)
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await complete_flow(
+        hass.config_entries.options,
+        result,
+        ["sensor.room"],
+        ["climate.ducted"],
+        average_weight=0.2,
+        fan_reward_lambda=override,
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert entry.options["average_weight"] == 0.2
+    assert entry.options["fan_reward_lambda"] == override

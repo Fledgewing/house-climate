@@ -483,7 +483,7 @@ def allocate(
         sum(w * line[j] for w, line in zip(weights, effects))
         for j in range(len(systems))
     ]
-    penalty = config.get("fan_reward_lambda", 1)
+    penalty = config.get("average_weight", 1.0)
     # Residual rows: weighted deviations about the predicted mean and mean error.
     residual = [t - mean_base for t in base] + [mean_base - setpoint]
     matrix = [[v - mean_effect[j] for j, v in enumerate(line)] for line in effects] + [
@@ -748,9 +748,18 @@ def control(
         error = state.setpoint - house
         # Integrate only when the model can reach the biased mean in this horizon.
         # This prevents an unavailable/ineffective system winding the mean bias up.
+        # Scale gain by lambda/(1+lambda) so balance-first settings also weaken
+        # mean correction rather than quietly undoing the allocator trade-off.
+        average_weight = config.get("average_weight", 1.0)
         if dt and (state.setpoint + integral - predicted) * error <= 0.05:
             state.integrals["mean"] = clamp(
-                integral + config.get("mean_integral_gain", 0.001) * error, -1, 1
+                integral
+                + config.get("mean_integral_gain", 0.001)
+                * average_weight
+                / (1 + average_weight)
+                * error,
+                -1,
+                1,
             )
     for system in config["systems"]:
         entity_id = system["entity_id"]

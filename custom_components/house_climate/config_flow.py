@@ -307,6 +307,7 @@ class HouseSteps:
     async def async_step_tunables(self, user_input=None):
         if user_input is not None:
             self.settings.update(user_input)
+            self.settings["fan_reward_lambda"] = user_input.get("fan_reward_lambda")
             for key in (
                 "outdoor_sensor",
                 "weather_entity",
@@ -344,7 +345,7 @@ class HouseSteps:
             ("temporary_hours", 0, 168, 0.25),
             ("interval", 1, 60, 1),
             ("fan_hold_minutes", 1, 1440, 1),
-            ("fan_reward_lambda", 0, 100, 0.1),
+            ("average_weight", 0.01, 10, 0.01),
             ("filter_minutes", 1, 120, 1),
             ("max_rate", 0.01, 10, 0.01),
             ("minor_weight_share", 0, 1, 0.01),
@@ -380,6 +381,14 @@ class HouseSteps:
                 low, high, step
             )
         fields[
+            vol.Optional(
+                "fan_reward_lambda",
+                description={"suggested_value": self.settings["fan_reward_lambda"]}
+                if self.settings.get("fan_reward_lambda") is not None
+                else {},
+            )
+        ] = number(0, 100, 0.1)
+        fields[
             vol.Required(
                 "learn_exclude_modes", default=self.settings["learn_exclude_modes"]
             )
@@ -397,7 +406,7 @@ class HouseSteps:
 
 
 class HouseConfigFlow(HouseSteps, config_entries.ConfigFlow, domain=DOMAIN):
-    VERSION = 3
+    VERSION = 4
 
     async def async_step_user(self, user_input=None):
         await self.async_set_unique_id(DOMAIN)

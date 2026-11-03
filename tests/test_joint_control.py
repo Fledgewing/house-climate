@@ -122,7 +122,8 @@ def test_one_available_system_is_objective_minimum(mode, sign, penalty):
     config = {
         "sensors": [{"entity_id": r, "weight": w} for r, w in zip(ROOMS, WEIGHTS)],
         "systems": [{"entity_id": s} for s in SYSTEMS],
-        "fan_reward_lambda": penalty,
+        "average_weight": penalty,
+        "fan_reward_lambda": 99,  # Explicit fan tuning must not alter allocation.
     }
     model = Learning(ROOMS, SYSTEMS)
     values = dict(zip(ROOMS, [24.5, 19.4, 18.7] if sign == 1 else [20.5, 25.6, 26.3]))
@@ -272,3 +273,70 @@ def test_unavailable_reported_input_reduces_remaining_effort(
     state.observe_report(config["systems"][0], Device(hvac_action="idle"), config)
     idle, _ = allocate(config, values, devices, mode, 21, learning=model, state=state)
     assert idle == pytest.approx(off)
+
+
+def balance_replay(average_weight, integral_gain=0.001):
+    """12h fixed-model replay: weak basement reach, explicit passive losses.
+
+    Effects are degrees per five-minute interval at full output. Outdoor is 7 C,
+    passive losses are 0.01/interval in living and b_B*0.5/13.2 in the
+    cold rooms (half of B offsets their initial loss); weights are 1:2:2.
+    Fine targets model continuous output; no new learning obscures the comparison.
+    """
+    truth = [[0.83, 0.37], [0.03, 0.02], [0.09, 0.09]]
+    config = {
+        "sensors": [{"entity_id": r, "weight": w} for r, w in zip(ROOMS, WEIGHTS)],
+        "systems": [{"entity_id": s, "modulating": True} for s in SYSTEMS],
+        "average_weight": average_weight,
+        "mean_integral_gain": integral_gain,
+        "excite_after_minutes": 10080,
+    }
+    losses = [0.01, 0.02 * 0.5 / 13.2, 0.09 * 0.5 / 13.2]
+    model = Learning(ROOMS, SYSTEMS)
+    for room, bs, loss in zip(ROOMS, truth, losses):
+        model.rows[room].theta = [loss, *bs, 0, 0]
+        model.rows[room].counts = [1e12, 1e12]
+    state = ControlState(mode="heat", setpoint=22.5)
+    temperatures = [25, 20.2, 20.2]
+    devices = {s: Device(mode="heat", step=0.01) for s in SYSTEMS}
+    peak_integral = 0
+    for step in range(12 * 12):
+        for device in devices.values():
+            device.current_temperature = temperatures[0]
+        control(
+            config,
+            state,
+            dict(zip(ROOMS, map(Reading, temperatures))),
+            devices,
+            step * 300,
+            outdoor=7,
+            learning=model,
+        )
+        # Perfect continuous actuator tracks the requested thermal allocation.
+        efforts = [state.requested_efforts[s] for s in SYSTEMS]
+        temperatures = [
+            t + loss * (7 - t) + sum(b * u for b, u in zip(bs, efforts))
+            for t, bs, loss in zip(temperatures, truth, losses)
+        ]
+        peak_integral = max(peak_integral, abs(state.integrals.get("mean", 0)))
+    average = sum(w * t for w, t in zip(WEIGHTS, temperatures)) / sum(WEIGHTS)
+    variance = sum(w * (t - average) ** 2 for w, t in zip(WEIGHTS, temperatures)) / sum(
+        WEIGHTS
+    )
+    return temperatures, average, sqrt(variance), peak_integral
+
+
+def test_weak_basement_reach_balance_replay():
+    results = {weight: balance_replay(weight) for weight in (1, 0.5, 0.2, 0.1)}
+    for weight, (rooms, average, spread, integral) in results.items():
+        print(
+            f"\nlambda={weight}: rooms={rooms}, mean={average:.4f}, weighted RMS spread={spread:.4f}, peak integral={integral:.6f}"
+        )
+    assert results[1][0][0] > 24
+    assert results[0.2][1] < 22.5
+    assert results[0.2][2] < results[1][2] * 0.6
+    assert results[0.2][3] == 0
+    assert results[0.2] == balance_replay(0.2, integral_gain=0)
+    assert all(
+        results[a][2] > results[b][2] for a, b in zip((1, 0.5, 0.2), (0.5, 0.2, 0.1))
+    )

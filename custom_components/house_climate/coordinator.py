@@ -21,7 +21,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
+from .const import DOMAIN, fan_reward_weight
 from .controller import ControlState, Device, Reading, control
 from .fans import FanLearning, quiet_modes
 from .filtering import SensorFilter
@@ -47,7 +47,7 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.source_effort = EffortTracker()
         self.fans = FanLearning(
             self.config.get("fan_hold_minutes", 30),
-            self.config.get("fan_reward_lambda", 1),
+            fan_reward_weight(self.config),
             learn_exclude_modes=self.config.get("learn_exclude_modes", "auto"),
         )
         self.restored = False
@@ -143,7 +143,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.learning_resume_at = saved.get("learning_resume_at")
             self.fans = FanLearning(
                 self.config.get("fan_hold_minutes", 30),
-                self.config.get("fan_reward_lambda", 1),
+                fan_reward_weight(self.config),
                 learn_exclude_modes=self.config.get("learn_exclude_modes", "auto"),
                 saved=saved.get("fans"),
             )
@@ -1125,7 +1125,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.learning = self.new_learning()
             self.fans = FanLearning(
                 self.config.get("fan_hold_minutes", 30),
-                self.config.get("fan_reward_lambda", 1),
+                fan_reward_weight(self.config),
                 learn_exclude_modes=self.config.get("learn_exclude_modes", "auto"),
             )
             self.reset_learning_interval()

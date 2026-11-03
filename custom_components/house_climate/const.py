@@ -20,7 +20,8 @@ DEFAULTS = {
     "occupancy_sensor": "",
     "interval": 5,
     "fan_hold_minutes": 30,
-    "fan_reward_lambda": 1.0,
+    "average_weight": 1.0,
+    "fan_reward_lambda": None,
     "learn_exclude_modes": "auto",
     "quiet_hours_enabled": False,
     "quiet_start": "22:00",
@@ -56,3 +57,9 @@ DEFAULTS = {
     "excite_after_minutes": 120,
     "excite_minutes": 30,
 }
+
+
+def fan_reward_weight(config):
+    """An unset fan override follows the allocator, including after options edits."""
+    override = config.get("fan_reward_lambda")
+    return config.get("average_weight", 1.0) if override is None else override

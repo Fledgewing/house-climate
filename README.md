@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.3 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.6 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 The setpoint is the weighted **house average**. Each pass jointly chooses how much every available system should run to bring that average to the setpoint and reduce each room's deviation from it. A 45-minute prediction uses the learned room responses, outdoor losses, extra heat sources, solar gain and drift. There are no configured room mappings or individual room targets. A shared comfort band holds starts and stops only when every weighted room is comfortable.
 
@@ -21,7 +21,7 @@ Alternatively, manually copy `custom_components/house_climate` from this reposit
 
 Use the integration's **Configure** options to add or remove sensors and systems, change weights or required presets, and edit tunables. Added sensors count in the house mean immediately, start with neutral learning priors, and learn independently; removed sensors lose their model rows. Removing a system stops controlling it and leaves its last device settings in place.
 
-Defaults: 5-minute control interval, 45-minute prediction horizon, 1 °C own-sensor run margin, effort hysteresis 0.05 and 5-minute effort on/off dwell. The mean-error integral gain is 0.001 per interval, with anti-windup and a ±1 °C bias limit. The joint objective and fan learner share `fan_reward_lambda` (default 1), balancing weighted room variance against weighted mean error. Legacy PI gains, house offset clamps and slew settings are retained for compatibility and are unused by the new allocator; the new mean integral has its own setting so upgrades use its small default.
+Defaults: 5-minute control interval, 45-minute prediction horizon, 1 °C own-sensor run margin, effort hysteresis 0.05 and 5-minute effort on/off dwell. The mean-error integral gain is 0.001 per interval, with anti-windup and a ±1 °C bias limit. The allocator uses `average_weight` (λ, default 1, range 0.01–10) to balance weighted room variance against squared mean error. Lower it when keeping rooms even matters more than reaching the average setpoint; the average may remain below setpoint in heat. The fan learner follows this weight unless `fan_reward_lambda` is explicitly set (clear that optional field to follow again). The mean integral gain is multiplied by λ/(1+λ): 0.5 at λ=1 and 1/6 at λ=0.2, with the existing predicted-reachability anti-windup check retained. Legacy PI gains, house offset clamps and slew settings are retained for compatibility and are unused by the new allocator; the new mean integral has its own setting so upgrades use its small default.
 
 Automatic mode retains its 1 °C deadband and 60-minute heat/cool dwell. Cooling is vetoed below 10 °C outdoors; heating above 24 °C. Explicit heat/cool requests take effect immediately, subject to the outdoor veto. Starts and stops obey cycling protection on scheduled and immediate passes. Explicit House off and outdoor vetoes still stop operation.
 
@@ -233,7 +233,7 @@ normalized weights, reward is `−(Σ w·E[e²] − (Σ w·E[e])²) − λ·(Σ 
 These statistics survive priority changes and rewards are recomputed before choosing an arm.
 There is no fan-statistic forgetting (as in v0.3.2). Legacy scalar-only arms load with empty
 room statistics and zero samples so they can relearn; thermal learning is retained.
-`fan_reward_lambda` defaults to **1**. `fan_hold_minutes` defaults to **30 minutes**; a single
+`fan_reward_lambda` defaults to following `average_weight` (**1** on new installs); an explicit fan override, including zero, is retained. `fan_hold_minutes` defaults to **30 minutes**; a single
 global schedule holds each experiment before measuring and selecting the next action. Only one
 action of one system changes at a time. Required hold presets continue to be re-asserted.
 
@@ -269,7 +269,7 @@ per pass; vanes have no quiet restriction.
 
 The integration persists the target, mode, integrators, offsets, and last mode-switch time in Home Assistant's `Store`, with `RestoreEntity` as a thermostat-state fallback. Each interval records every member sensor (including unavailable/stale readings), outdoor temperature, solar power, occupancy, and each system's observed mode, target, offset, and HVAC action. Observations are taken before commands. Records older than 30 days are pruned on each control run. Data lives in `.storage/house_climate.<entry_id>` under the HA config directory.
 
-The Store also persists model coefficients, covariance, confidence counts and fit errors. Restarting retains learning and begins a fresh runtime interval rather than guessing what happened while HA was stopped. Config-entry version 3 stores named priority modes in entry options. Upgrades preserve existing sensor weights in balance, remove obsolete v1 room mappings, and retain other settings and control state. The active priority mode is stored alongside control state.
+The Store also persists model coefficients, covariance, confidence counts and fit errors. Restarting retains learning and begins a fresh runtime interval rather than guessing what happened while HA was stopped. Config-entry version 4 stores named priority modes and migrates missing `average_weight` to **1.0**, preserving explicit fan overrides. Version 3 introduced named priority modes. Upgrades preserve existing sensor weights in balance, remove obsolete v1 room mappings, and retain other settings and control state. The active priority mode is stored alongside control state.
 
 ## Development
 
@@ -345,3 +345,18 @@ In the seeded simulations, a permanent window change and a week of portable AC
 were accepted after 24 h 10 min. Removing the AC restored the unchanged original
 model after 4 h; bringing the AC back a week later reused its saved model after 4 h.
 A two-hour heater and nightly unconfigured stove caused no switches.
+
+## Average versus balance (0.5.6)
+
+In Configure, **Average vs balance (lower = keep rooms even, higher = hold the average on the setpoint)** controls the allocator independently of fan learning. Existing installations migrate to 1.0; choose 0.2 manually to favor balance. This is a soft objective, not a maximum room-gap guarantee. A finite weight still trades some spread for mean improvement, and weak room reach can leave cold rooms cold.
+
+The deterministic 12-hour weak-basement replay starts at 25/20.2/20.2 °C with setpoint 22.5 °C and weights 1:2:2. A's room effects are 0.83/0.03/0.09 and B's 0.37/0.02/0.09 °C per five-minute full-output interval. Because live heat losses were not supplied, the fixture assumes outdoor 7 °C, loss coefficients 0.01/0.000758/0.003409 per interval, a fixed known model and continuous actuators. These are simulated results, not a fitted forecast for the real house. Spread below is normalized weighted RMS deviation (the square root of J's spread term).
+
+| λ | Living °C | Cold rooms °C | Average °C | Weighted RMS spread °C | Peak integral bias °C |
+|---|---:|---|---:|---:|---:|
+| 1 | 24.166 | 20.061 / 19.704 | 20.739 | 1.721 | 0 |
+| 0.5 | 22.567 | 19.874 / 19.044 | 20.081 | 1.298 | 0 |
+| 0.2 | 20.886 | 19.690 / 18.377 | 19.404 | 0.946 | 0 |
+| 0.1 | 20.094 | 19.606 / 18.072 | 19.090 | 0.850 | 0 |
+
+At 0.2 the weighted spread is 45% smaller than at 1, and the integral-on replay exactly matches integral-off. The average remains 3.10 °C below setpoint. The final living-to-cold gaps are 1.20/2.51 °C; a 0.5 °C gap cannot be promised by this objective or these assumed losses.

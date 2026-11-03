@@ -126,6 +126,9 @@ def simulate(enabled=True):
     """
     rng = random.Random(742)
     config = {
+        # Keep this thermal-learning benchmark at its original effective mean gain:
+        # lambda=1 now multiplies the configured gain by 1/2.
+        "mean_integral_gain": 0.002,
         "sensors": [{"entity_id": r} for r in ROOMS],
         "systems": [{"entity_id": s} for s in SYSTEMS],
     }
