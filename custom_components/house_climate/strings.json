@@ -29,7 +29,7 @@
       },
       "tunables": {
         "title": "Control settings",
-        "description": "Temperatures are in °C. Solar power is converted to kW for online learning. PI integral gain is per control interval.",
+        "description": "Temperatures are in \u00b0C. Solar power is converted to kW for online learning. PI integral gain is per control interval.",
         "data": {
           "outdoor_sensor": "Outdoor temperature sensor",
           "weather_entity": "Fallback weather entity",
@@ -37,19 +37,19 @@
           "occupancy_sensor": "Occupancy sensor",
           "interval": "Control interval (minutes)",
           "stale_after": "Sensor stale after (minutes)",
-          "deadband": "Auto mode deadband (°C)",
+          "deadband": "Auto mode deadband (\u00b0C)",
           "minimum_dwell": "Minimum time in mode (minutes)",
-          "offset_clamp": "Maximum absolute offset (°C)",
-          "max_offset_change": "Maximum offset change per interval (°C)",
-          "cool_outdoor_min": "Veto cooling below outdoor temperature (°C)",
-          "heat_outdoor_max": "Veto heating above outdoor temperature (°C)",
+          "offset_clamp": "Maximum absolute offset (\u00b0C)",
+          "max_offset_change": "Maximum offset change per interval (\u00b0C)",
+          "cool_outdoor_min": "Veto cooling below outdoor temperature (\u00b0C)",
+          "heat_outdoor_max": "Veto heating above outdoor temperature (\u00b0C)",
           "kp": "Proportional gain",
           "ki": "Integral gain",
           "learning_forgetting": "Learning forgetting factor per sample",
           "learning_n0": "Learning prior blend sample count",
           "frozen_after": "Unchanged sensor limit during HVAC activity (hours)",
           "filter_minutes": "Sensor median window (minutes)",
-          "max_rate": "Maximum sensor rate (°C/min)",
+          "max_rate": "Maximum sensor rate (\u00b0C/min)",
           "minor_weight_share": "Minimum sensor weight share that blocks fan learning",
           "fan_hold_minutes": "Fan/vane hold window (minutes)",
           "fan_reward_lambda": "Fan learning mean error penalty",
@@ -57,13 +57,17 @@
           "quiet_hours_enabled": "Enable quiet hours (off by default)",
           "quiet_start": "Quiet hours start",
           "quiet_end": "Quiet hours end",
-          "explore_threshold": "Exploration confidence threshold (0–1)",
+          "explore_threshold": "Exploration confidence threshold (0\u20131)",
           "excite_after_minutes": "Explore after no actual runtime (minutes)",
           "excite_minutes": "Exploration actual runtime (minutes)",
           "disturbance_sigma": "Disturbance sigma (0 disables protection)",
           "disturbance_intervals": "Consecutive intervals to flag a disturbance",
           "disturbance_clear_intervals": "Clean intervals to clear a disturbance",
-          "learning_pause_hours": "Learning pause auto-resume (hours; 0 until switched on)"
+          "learning_pause_hours": "Learning pause auto-resume (hours; 0 until switched on)",
+          "regime_margin": "Required model error reduction (fraction)",
+          "regime_hours": "New model evidence (hours)",
+          "regime_return_hours": "Saved model return evidence (hours)",
+          "temporary_hours": "Temporary change auto-off (hours; 0 manual)"
         }
       },
       "priority": {
@@ -123,7 +127,7 @@
       },
       "tunables": {
         "title": "Control settings",
-        "description": "Temperatures are in °C. Solar power is converted to kW for online learning. PI integral gain is per control interval.",
+        "description": "Temperatures are in \u00b0C. Solar power is converted to kW for online learning. PI integral gain is per control interval.",
         "data": {
           "outdoor_sensor": "Outdoor temperature sensor",
           "weather_entity": "Fallback weather entity",
@@ -131,19 +135,19 @@
           "occupancy_sensor": "Occupancy sensor",
           "interval": "Control interval (minutes)",
           "stale_after": "Sensor stale after (minutes)",
-          "deadband": "Auto mode deadband (°C)",
+          "deadband": "Auto mode deadband (\u00b0C)",
           "minimum_dwell": "Minimum time in mode (minutes)",
-          "offset_clamp": "Maximum absolute offset (°C)",
-          "max_offset_change": "Maximum offset change per interval (°C)",
-          "cool_outdoor_min": "Veto cooling below outdoor temperature (°C)",
-          "heat_outdoor_max": "Veto heating above outdoor temperature (°C)",
+          "offset_clamp": "Maximum absolute offset (\u00b0C)",
+          "max_offset_change": "Maximum offset change per interval (\u00b0C)",
+          "cool_outdoor_min": "Veto cooling below outdoor temperature (\u00b0C)",
+          "heat_outdoor_max": "Veto heating above outdoor temperature (\u00b0C)",
           "kp": "Proportional gain",
           "ki": "Integral gain",
           "learning_forgetting": "Learning forgetting factor per sample",
           "learning_n0": "Learning prior blend sample count",
           "frozen_after": "Unchanged sensor limit during HVAC activity (hours)",
           "filter_minutes": "Sensor median window (minutes)",
-          "max_rate": "Maximum sensor rate (°C/min)",
+          "max_rate": "Maximum sensor rate (\u00b0C/min)",
           "minor_weight_share": "Minimum sensor weight share that blocks fan learning",
           "fan_hold_minutes": "Fan/vane hold window (minutes)",
           "fan_reward_lambda": "Fan learning mean error penalty",
@@ -151,13 +155,17 @@
           "quiet_hours_enabled": "Enable quiet hours (off by default)",
           "quiet_start": "Quiet hours start",
           "quiet_end": "Quiet hours end",
-          "explore_threshold": "Exploration confidence threshold (0–1)",
+          "explore_threshold": "Exploration confidence threshold (0\u20131)",
           "excite_after_minutes": "Explore after no actual runtime (minutes)",
           "excite_minutes": "Exploration actual runtime (minutes)",
           "disturbance_sigma": "Disturbance sigma (0 disables protection)",
           "disturbance_intervals": "Consecutive intervals to flag a disturbance",
           "disturbance_clear_intervals": "Clean intervals to clear a disturbance",
-          "learning_pause_hours": "Learning pause auto-resume (hours; 0 until switched on)"
+          "learning_pause_hours": "Learning pause auto-resume (hours; 0 until switched on)",
+          "regime_margin": "Required model error reduction (fraction)",
+          "regime_hours": "New model evidence (hours)",
+          "regime_return_hours": "Saved model return evidence (hours)",
+          "temporary_hours": "Temporary change auto-off (hours; 0 manual)"
         }
       },
       "priority": {
@@ -188,6 +196,10 @@
     "not_reporting": {
       "title": "Temperature sensor is not reporting",
       "description": "{sensor} is not reporting and has been excluded from House Climate control and learning. Last real value change: {last_change}. Please check its battery and connection. The sensor rejoins automatically when it recovers."
+    },
+    "regime": {
+      "title": "Room behavior has changed",
+      "description": "{room} behaves differently than learned; if something changed, press Accept new normal."
     }
   }
 }

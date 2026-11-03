@@ -88,6 +88,10 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.config.get("disturbance_sigma", 3),
             self.config.get("disturbance_intervals", 2),
             self.config.get("disturbance_clear_intervals", 3),
+            self.config.get("regime_margin", 0.3),
+            self.config.get("regime_hours", 24),
+            self.config.get("regime_return_hours", 4),
+            self.config.get("interval", 5),
         )
 
     async def async_load(self):
@@ -136,11 +140,15 @@ class HouseCoordinator(DataUpdateCoordinator):
                 self.learning.forgetting = self.config.get("learning_forgetting", 0.998)
                 self.learning.n0 = self.config.get("learning_n0", 24)
                 for key, default in (
+                    ("regime_margin", 0.3),
+                    ("regime_hours", 24),
+                    ("regime_return_hours", 4),
                     ("disturbance_sigma", 3),
                     ("disturbance_intervals", 2),
                     ("disturbance_clear_intervals", 3),
                 ):
                     setattr(self.learning, key, self.config.get(key, default))
+                self.learning.interval_minutes = self.config.get("interval", 5)
 
     def start(self):
         cancel_timer = async_track_time_interval(
@@ -564,16 +572,35 @@ class HouseCoordinator(DataUpdateCoordinator):
                         previous_solar,
                         duration / (self.config.get("interval", 5) * 60),
                         sources=source_fractions,
+                        now=now.timestamp(),
+                        local_hour=dt_util.as_local(now).hour
+                        + dt_util.as_local(now).minute / 60
+                        + dt_util.as_local(now).second / 3600,
                     )
                 self.learning_baseline = (
                     (learning_values, outdoor, solar) if self.learning_enabled else None
                 )
                 for sensor_filter in self.filters.values():
                     sensor_filter.finish_interval()
+            for sensor, state in self.learning.regimes.items():
+                if (
+                    state["temporary"]
+                    and state["temporary_until"] is not None
+                    and now.timestamp() >= state["temporary_until"]
+                ):
+                    self.learning.set_temporary(sensor, False)
+                    if self.learning_baseline is not None:
+                        self.learning_baseline[0].pop(sensor, None)
+            self.sync_regime_issues(now.timestamp())
             for key in self.learning.disturbed:
                 clean_values.pop(key, None)
                 if self.sensor_blocks_fans(key):
                     fan_problems.append(f"{key} unexplained temperature disturbance")
+            for key, state in self.learning.regimes.items():
+                if state["temporary"]:
+                    clean_values.pop(key, None)
+                    if self.sensor_blocks_fans(key):
+                        fan_problems.append(f"{key} temporary change")
             if not self.learning_enabled:
                 fan_problems.append("learning paused by switch")
             fan_clean = not fan_problems
@@ -859,6 +886,44 @@ class HouseCoordinator(DataUpdateCoordinator):
         unit = self.hass.states.get(entity_id).attributes.get("unit_of_measurement")
         factors = {"W": 0.001, "kW": 1, "MW": 1000}
         return value * factors[unit] if unit in factors else None
+
+    def sync_regime_issues(self, now):
+        for sensor, state in self.learning.regimes.items():
+            issue_id = f"{self.config_entry.entry_id}_{sensor}_regime"
+            since = state["disturbed_since"]
+            if since is not None and now - since >= 12 * 3600:
+                entity = self.hass.states.get(sensor)
+                ir.async_create_issue(
+                    self.hass,
+                    DOMAIN,
+                    issue_id,
+                    is_fixable=False,
+                    severity=ir.IssueSeverity.WARNING,
+                    translation_key="regime",
+                    translation_placeholders={
+                        "room": entity.name if entity else sensor
+                    },
+                )
+            else:
+                ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+
+    async def async_room_learning(self, sensor, action, enabled=None):
+        async with self.lock:
+            self.learning.clock = dt_util.utcnow().timestamp()
+            if action == "accept":
+                self.learning.promote(sensor)
+            elif action == "relearn":
+                self.learning.relearn(sensor)
+            elif action == "temporary":
+                self.learning.set_temporary(
+                    sensor, enabled, self.config.get("temporary_hours", 0)
+                )
+            else:
+                raise ValueError("Unknown room learning action")
+            if self.learning_baseline is not None:
+                self.learning_baseline[0].pop(sensor, None)
+            self.fans.invalidate("Room learning control changed")
+        await self.async_tick(record=False)
 
     async def async_reset_learning(self):
         async with self.lock:

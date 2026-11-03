@@ -10,6 +10,10 @@ async def async_setup_entry(hass, entry, async_add_entities):
             HouseSwitch(entry.runtime_data, entry.entry_id),
             FanSwitch(entry.runtime_data, entry.entry_id),
             LearningSwitch(entry.runtime_data, entry.entry_id),
+            *[
+                TemporarySwitch(entry.runtime_data, entry.entry_id, sensor["entity_id"])
+                for sensor in entry.runtime_data.config["sensors"]
+            ],
         ]
     )
 
@@ -73,3 +77,32 @@ class LearningSwitch(HouseSwitch):
 
     async def async_turn_off(self, **kwargs):
         await self.coordinator.async_change(learning_enabled=False)
+
+
+class TemporarySwitch(CoordinatorEntity, SwitchEntity):
+    _attr_icon = "mdi:timer-pause"
+
+    def __init__(self, coordinator, entry_id, sensor):
+        super().__init__(coordinator)
+        self.sensor = sensor
+        entity = coordinator.hass.states.get(sensor)
+        self._attr_name = f"{entity.name if entity else sensor} Temporary change"
+        self._attr_unique_id = f"{entry_id}_{sensor}_temporary"
+
+    @property
+    def is_on(self):
+        return self.coordinator.learning.regimes[self.sensor]["temporary"]
+
+    @property
+    def extra_state_attributes(self):
+        return {
+            "auto_off_at": self.coordinator.learning.regimes[self.sensor][
+                "temporary_until"
+            ]
+        }
+
+    async def async_turn_on(self, **kwargs):
+        await self.coordinator.async_room_learning(self.sensor, "temporary", True)
+
+    async def async_turn_off(self, **kwargs):
+        await self.coordinator.async_room_learning(self.sensor, "temporary", False)

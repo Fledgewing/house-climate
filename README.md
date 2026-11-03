@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.0 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.1 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 It computes a weighted house temperature and learns how strongly each HVAC system affects each room. Separate PI offsets use those learned effects so systems push harder for the rooms they reach, helping the house mean track the setpoint while reducing temperature differences. All room/system pairs start equally; there are no configured room mappings. Learning begins helping within hours of informative runtime and continues adapting.
 
@@ -123,7 +123,7 @@ Press `button.house_reset_learning` to clear the model and confidence back to ne
 
 Learning requires outdoor temperature, known HVAC actions, and both temperature endpoints. Missing/stale room readings skip that row; missing outdoor context or a missing system action skips the interval. With no solar source selected its input is zero; a configured missing solar reading or unsupported unit skips the interval. Control continues with the current learned/prior blend during gaps.
 
-## Extra heat, disturbances and pausing learning (0.5.0)
+## Extra heat, disturbances and pausing learning (0.5.1)
 
 In **Configure**, select optional **Extra heat source entities**, then choose **binary**
 (on/off states) or **power** for each. Power inputs use an **on above W** threshold,
@@ -262,3 +262,37 @@ Final weighted room standard deviation is 0.926 °C versus 2.452 °C; the day-tw
 0.840 °C versus 2.452 °C. Learned cold-room b values are about 0.399/0.449 for B versus
 0.0040/0.0029 for A, in °C per full-running interval. These are deterministic simulation
 results, not measured house performance.
+
+## Lasting room changes
+
+Each room learns a fast challenger alongside its protected active model. A lasting
+change can become the new normal after the challenger predicts at least 30% better
+in 80% of the two-hour blocks over 24 hours, with evidence across day/night and every
+system running/idle. Brief heater use and recurring evening heat do not qualify.
+The previous model is saved, including all its learning; up to three saved models
+are kept per room, evicting the one that has gone longest without fitting. Returning
+to a proven saved model needs only four hours of evidence. All models and evidence
+survive restarts.
+
+Each room sensor creates controls named after that sensor:
+
+- **Accept new normal**: use the challenger immediately and save the previous model.
+- **Relearn room**: restart that room's active learning, keeping saved models.
+- **Temporary change**: hold the current model and pause room learning and automatic
+  model changes. Turn it off manually, or configure `temporary_hours` for auto-off
+  (default 0 means manual). Ordinary temperature control continues.
+
+Options expose `regime_margin` (default 0.30), `regime_hours` (24),
+`regime_return_hours` (4), and `temporary_hours` (0). Windows use complete two-hour
+blocks; missing data or insufficient runtime/day-night variety can delay a switch.
+A warning repair appears after 12 hours of continuous disturbance, suggesting
+**Accept new normal** if the room has changed. It clears on a switch or recovery.
+
+`sensor.house_learning` includes each room's active model, saved models with last-fit
+timestamps, and challenger advantage in percent. Positive advantage means the
+challenger predicts better. Removing a room sensor removes its controls and models.
+
+In the seeded simulations, a permanent window change and a week of portable AC
+were accepted after 24 h 10 min. Removing the AC restored the unchanged original
+model after 4 h; bringing the AC back a week later reused its saved model after 4 h.
+A two-hour heater and nightly unconfigured stove caused no switches.

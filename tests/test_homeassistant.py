@@ -2148,3 +2148,116 @@ async def test_recorder_running_tail_uses_observation_without_inventing_downtime
         assert c.state.last_run["climate.ducted"] == observed.timestamp()
     finally:
         hass.data.pop(DATA_INSTANCE)
+
+
+async def test_room_learning_entities_repairs_and_restore(hass, installed):
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.house_climate.coordinator import HouseCoordinator
+
+    entry, _ = installed
+    c = entry.runtime_data
+    now = dt_util.utcnow().timestamp()
+    row = c.learning.rows["sensor.room"]
+    row.theta[0] = 0.021
+    c.learning.regimes["sensor.room"]["challenger"].theta[0] = 0.047
+    c.learning.disturbed["sensor.room"] = "cooling"
+    c.learning.regimes["sensor.room"]["disturbed_since"] = now - 12 * 3600
+    await c.async_tick(record=False)
+    issue_id = f"{entry.entry_id}_sensor.room_regime"
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is not None
+    await hass.services.async_call(
+        "button", "press", {"entity_id": "button.room_accept_new_normal"}, blocking=True
+    )
+    assert c.learning.rows["sensor.room"].theta[0] == 0.047
+    assert c.learning.regimes["sensor.room"]["saved"][0]["row"].theta[0] == 0.021
+    assert not c.learning.disturbed
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
+    diagnostics = hass.states.get("sensor.house_learning").attributes["sensors"][
+        "sensor.room"
+    ]
+    assert diagnostics["active_model"].startswith("promoted at")
+    assert diagnostics["saved_models"][0]["last_fit"] is not None
+    assert "challenger_advantage" in diagnostics
+    c.config["temporary_hours"] = 1
+    await hass.services.async_call(
+        "switch",
+        "turn_on",
+        {"entity_id": "switch.room_temporary_change"},
+        blocking=True,
+    )
+    assert hass.states.get("switch.room_temporary_change").state == "on"
+    deadline = c.learning.regimes["sensor.room"]["temporary_until"]
+    assert deadline == pytest.approx(now + 3600, abs=1)
+    frozen = deepcopy(c.learning.rows["sensor.room"])
+    challenger = deepcopy(c.learning.regimes["sensor.room"]["challenger"])
+    c.learning.update(
+        {"sensor.room": 20},
+        {"sensor.room": 22},
+        5,
+        {"climate.ducted": 1, "climate.split": 0},
+        now=now + 100,
+    )
+    assert c.learning.rows["sensor.room"] == frozen
+    assert c.learning.regimes["sensor.room"]["challenger"] == challenger
+    await c.async_tick(record=False)
+    restored = HouseCoordinator(hass, entry)
+    await restored.async_load()
+    assert restored.learning.to_dict() == c.learning.to_dict()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=dt_util.utc_from_timestamp(deadline + 1),
+    ):
+        await c.async_tick(record=False)
+    assert hass.states.get("switch.room_temporary_change").state == "off"
+    await hass.services.async_call(
+        "button", "press", {"entity_id": "button.room_relearn_room"}, blocking=True
+    )
+    assert c.learning.rows["sensor.room"].samples == 0
+    assert c.learning.rows["sensor.room"].theta[0] == 0
+    assert c.learning.regimes["sensor.room"]["saved"][0]["row"].theta[0] == 0.021
+    # A settled room clears its repair independently of a promotion.
+    c.learning.regimes["sensor.room"]["disturbed_since"] = now - 13 * 3600
+    await c.async_tick(record=False)
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id)
+    c.learning.regimes["sensor.room"]["disturbed_since"] = None
+    await c.async_tick(record=False)
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
+
+
+async def test_room_controls_follow_sensor_membership(hass, installed):
+    from homeassistant.helpers import entity_registry as er
+    from homeassistant.helpers import issue_registry as ir
+
+    entry, _ = installed
+    c = entry.runtime_data
+    c.learning.regimes["sensor.room"]["disturbed_since"] = (
+        dt_util.utcnow().timestamp() - 13 * 3600
+    )
+    await c.async_tick(record=False)
+    options = deepcopy(dict(entry.options or entry.data))
+    options["sensors"] = [{"entity_id": "sensor.guest", "weight": 1}]
+    hass.states.async_set("sensor.guest", "20", {"friendly_name": "Guest bedroom"})
+    hass.config_entries.async_update_entry(entry, options=options)
+    await hass.async_block_till_done()
+    registry = er.async_get(hass)
+    for entity_id in (
+        "button.room_accept_new_normal",
+        "button.room_relearn_room",
+        "switch.room_temporary_change",
+    ):
+        assert registry.async_get(entity_id) is None
+        assert hass.states.get(entity_id) is None
+    for entity_id in (
+        "button.guest_bedroom_accept_new_normal",
+        "button.guest_bedroom_relearn_room",
+        "switch.guest_bedroom_temporary_change",
+    ):
+        assert hass.states.get(entity_id) is not None
+    assert set(entry.runtime_data.learning.regimes) == {"sensor.guest"}
+    assert (
+        ir.async_get(hass).async_get_issue(
+            DOMAIN, f"{entry.entry_id}_sensor.room_regime"
+        )
+        is None
+    )

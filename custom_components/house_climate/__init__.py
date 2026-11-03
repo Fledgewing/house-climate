@@ -25,6 +25,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: HouseClimateEntry) -> bo
         hass.config_entries.async_update_entry(entry, options=settings)
     coordinator = entry.runtime_data = HouseCoordinator(hass, entry)
     await coordinator.async_load()
+    from homeassistant.helpers import entity_registry as er
+    from homeassistant.helpers import issue_registry as ir
+
+    registry = er.async_get(hass)
+    sensors = {s["entity_id"] for s in coordinator.config["sensors"]}
+    for entity in list(er.async_entries_for_config_entry(registry, entry.entry_id)):
+        for suffix in ("_accept", "_relearn", "_temporary"):
+            prefix = f"{entry.entry_id}_"
+            if entity.unique_id.startswith(prefix) and entity.unique_id.endswith(
+                suffix
+            ):
+                sensor = entity.unique_id[len(prefix) : -len(suffix)]
+                if sensor not in sensors:
+                    registry.async_remove(entity.entity_id)
+    issues = ir.async_get(hass)
+    for domain, issue_id in list(issues.issues):
+        prefix = f"{entry.entry_id}_"
+        if (
+            domain == "house_climate"
+            and issue_id.startswith(prefix)
+            and issue_id.endswith("_regime")
+        ):
+            if issue_id[len(prefix) : -len("_regime")] not in sensors:
+                ir.async_delete_issue(hass, domain, issue_id)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     async def begin(_event=None):

@@ -525,3 +525,89 @@ Every modeled b is within 0.003 of truth; source e estimates are
 286/295 source-on intervals, flags the unaffected room zero times, and leaves it
 learning for all 2880 intervals. The modeled case has zero flags. Protection reduces
 omitted-source HVAC coefficient error by about 42 times in this simulation.
+
+## Room regimes (v0.5.1)
+
+Each member now owns an active RLS row, an independent challenger and a library of
+up to three frozen rows. Control and disturbance detection always use the active
+row. The challenger trains on every valid room interval, including disturbed
+intervals; missing/filter-rejected data and the global learning pause still skip
+training. Its forgetting factor is `exp(-elapsed_minutes / 1440)`, an effective
+24-hour memory independent of the configured interval. The active row retains
+ordinary slow forgetting and the existing disturbance guards. The disturbance
+floor now decreases with runtime confidence: `max(0.1, 0.3 × (1 − confidence))`,
+still bounded below by `disturbance_sigma × fit RMS`. Active configured sources
+with fewer than N0 effective samples retain the 0.3 °C commissioning floor.
+This protects established models from smaller persistent changes without an age
+or days threshold; cold-start and new-source learning retain their allowance.
+
+To identify abrupt changes promptly, two challenger innovations exceeding
+`max(0.1, 6 × active fit RMS)` restore its neutral prior covariance after at least
+24 training samples. Its coefficients, counts and errors remain intact. This
+uncertainty boost starts a fresh identification evidence period; automatic new-model
+promotion needs `regime_hours` of stability after it. Repeated evening events
+therefore cannot accumulate evidence as though they were one continuous change.
+
+Score predictions **before** training using duration-normalized absolute error,
+weighted by observed seconds, in UTC-aligned two-hour blocks. Intervals crossing
+boundaries contribute proportionally to each block. Only completed blocks in the
+latest evidence window count; every block must have at least 90% observed coverage.
+Unobserved time, including restart downtime, supplies no score. New-model promotion
+requires a reduction strictly greater than `regime_margin` (default 0.30) in at
+least 80% of blocks over `regime_hours` (default 24). Winning blocks must cover
+local day (06:00–18:00), night, and each system both running and idle. The 80% win
+requirement also applies within each of those contexts, preventing a few nighttime
+wins or losses from being hidden by the daytime majority. A negligible active
+error (≤0.00001 °C/interval) cannot establish a win. Evidence horizons round up
+to complete two-hour blocks.
+
+Library rows receive identical pre-update scores but never train. A proven saved
+row can return after `regime_return_hours` (default 4), with the same error margin
+and 80% block requirement; it need not repeat the day/night commissioning variety.
+Saved rows that qualify take precedence over a new challenger. On every switch,
+archive the old active row with its complete covariance, counts and error history;
+activate the selected row, clear disturbance/repair evidence, and create a neutral
+challenger. The new active row learns with slow forgetting. When the library would
+exceed three rows, evict the row with the oldest last-fit timestamp. A model fits
+when its error is within 10% of the best scored model or within 0.01 °C/interval;
+the active model's last-fit clock is retained when archived.
+
+Each configured temperature sensor creates two buttons and one switch, named after
+its friendly sensor name and identified by its entity ID:
+
+- **Accept new normal** immediately promotes its challenger and archives the active row.
+- **Relearn room** resets only that room's active row and challenger to neutral, preserving its library.
+- **Temporary change** holds its active model and stops all thermal training, scoring
+  and automatic switching for that room. Fan rewards also exclude the room, invalidating
+  the experiment if its priority share is significant. `temporary_hours` defaults to
+  0 (manual); a positive value stores an absolute auto-off deadline. Toggle/expiry
+  discard the partial room interval and old comparison blocks.
+
+Global reset remains an explicit reset of all learning. Room controls preserve
+house control state and other rooms. Options reload creates controls for added
+sensors and removes registry entities and regime repairs for removed sensors.
+
+A room continuously flagged disturbed for 12 hours raises a warning repair:
+“<room> behaves differently than learned; if something changed, press Accept new
+normal”. Settling, a switch, or a room reset clears it. `sensor.house_learning` adds
+`active_model` (`main`, `saved #n`, or `promoted at <UTC timestamp>`), `saved_models`
+with identity, last-fit UTC timestamp and coefficients, and `challenger_advantage`
+(percent reduction in recent absolute prediction error) under each sensor. Temporary
+status/deadline and disturbance start time are also exposed.
+
+Store persists challenger/library rows, model identities, bounded comparison blocks,
+last-fit clocks, identification stability, disturbance start and temporary deadlines.
+Legacy Store files create neutral challengers and empty libraries; reconciliation
+maps **all** rows' coefficients and covariance by input kind/entity ID. Changed input
+columns clear comparison blocks. Runtime intervals still restart fresh.
+
+The seeded 21-day simulations use independently cycling HVAC systems, variable
+weather and sun, and measurement noise. The two-hour heater and four-hour nightly
+unconfigured stove cause zero switches. Increased loss from day 3 promotes after
+24 h 10 min, with heat-loss coefficient approximately 0.045002 (truth 0.045).
+Portable AC from day 3 promotes after 24 h 10 min; removing it at the start of day
+10 restores the original after 4 h, with its archived coefficients/covariance/counts
+unchanged. Returning the AC one week later reuses its saved model after 4 h.
+Tests also cover context/margin/coverage gates, eviction, old Store compatibility,
+reconciliation, independent rooms, real HA buttons/switch, deadline restoration,
+repair creation/clearing and sensor entity removal.
