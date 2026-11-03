@@ -5,6 +5,11 @@ PLATFORMS = ["climate", "button", "sensor", "switch", "select"]
 DEFAULTS = {
     "sensors": [],
     "systems": [],
+    "extra_heat_sources": [],
+    "disturbance_sigma": 3,
+    "disturbance_intervals": 2,
+    "disturbance_clear_intervals": 3,
+    "learning_pause_hours": 0,
     "outdoor_sensor": "",
     "weather_entity": "",
     "solar_sensor": "",

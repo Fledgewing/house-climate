@@ -46,7 +46,11 @@ class HouseSteps:
             }
             if not user_input["sensors"] or not user_input["systems"]:
                 errors["base"] = "empty_selection"
-            elif own_ids.intersection(user_input["sensors"] + user_input["systems"]):
+            elif own_ids.intersection(
+                user_input["sensors"]
+                + user_input["systems"]
+                + user_input.get("extra_heat_sources", [])
+            ):
                 errors["base"] = "self_reference"
             else:
                 old = {s["entity_id"]: s for s in self.settings["sensors"]}
@@ -59,6 +63,21 @@ class HouseSteps:
                 self.settings["systems"] = [
                     old.get(s, {"entity_id": s, "preset": ""})
                     for s in dict.fromkeys(user_input["systems"])
+                ]
+                old = {
+                    s["entity_id"]: s
+                    for s in self.settings.get("extra_heat_sources", [])
+                }
+                self.settings["extra_heat_sources"] = [
+                    old.get(
+                        key,
+                        {
+                            "entity_id": key,
+                            "kind": "power" if key.startswith("sensor.") else "binary",
+                            "threshold": 10,
+                        },
+                    )
+                    for key in dict.fromkeys(user_input.get("extra_heat_sources", []))
                 ]
                 self.index = 0
                 return await self.async_step_sensor()
@@ -75,6 +94,15 @@ class HouseSteps:
                         "systems",
                         default=[s["entity_id"] for s in self.settings["systems"]],
                     ): entities("climate", True),
+                    vol.Optional(
+                        "extra_heat_sources",
+                        default=[
+                            s["entity_id"]
+                            for s in self.settings.get("extra_heat_sources", [])
+                        ],
+                    ): selector.EntitySelector(
+                        selector.EntitySelectorConfig(multiple=True)
+                    ),
                     **(
                         {
                             vol.Optional(
@@ -195,6 +223,9 @@ class HouseSteps:
                 system["quiet_max_fan"] = user_input["quiet_max_fan"]
             self.index += 1
             if self.index == len(self.settings["systems"]):
+                self.source_index = 0
+                if self.settings.get("extra_heat_sources"):
+                    return await self.async_step_source()
                 return await self.async_step_tunables()
             return await self.async_step_system()
         entity = self.hass.states.get(system["entity_id"])
@@ -219,6 +250,31 @@ class HouseSteps:
                         description={"suggested_value": system.get("preset", "")},
                     ): selector.TextSelector(),
                     **fan_fields,
+                }
+            ),
+        )
+
+    async def async_step_source(self, user_input=None):
+        source = self.settings["extra_heat_sources"][self.source_index]
+        if user_input is not None:
+            source.update(user_input)
+            self.source_index += 1
+            if self.source_index == len(self.settings["extra_heat_sources"]):
+                return await self.async_step_tunables()
+            return await self.async_step_source()
+        return self.async_show_form(
+            step_id="source",
+            description_placeholders={"entity": source["entity_id"]},
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        "kind", default=source.get("kind", "binary")
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(options=["binary", "power"])
+                    ),
+                    vol.Required(
+                        "threshold", default=source.get("threshold", 10)
+                    ): number(0, 1000000, 1),
                 }
             ),
         )
@@ -253,6 +309,10 @@ class HouseSteps:
                 )
             ] = entities(domain, device_class=device_class)
         for key, low, high, step in [
+            ("disturbance_sigma", 0, 20, 0.1),
+            ("disturbance_intervals", 1, 100, 1),
+            ("disturbance_clear_intervals", 1, 100, 1),
+            ("learning_pause_hours", 0, 168, 0.25),
             ("interval", 1, 60, 1),
             ("fan_hold_minutes", 1, 1440, 1),
             ("fan_reward_lambda", 0, 100, 0.1),

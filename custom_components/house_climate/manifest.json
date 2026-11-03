@@ -8,6 +8,6 @@
   "documentation": "https://github.com/Fledgewing/house-climate",
   "iot_class": "calculated",
   "requirements": [],
-  "version": "0.4.2",
+  "version": "0.5.0",
   "issue_tracker": "https://github.com/Fledgewing/house-climate/issues"
 }

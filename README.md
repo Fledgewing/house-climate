@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.4.2 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.0 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 It computes a weighted house temperature and learns how strongly each HVAC system affects each room. Separate PI offsets use those learned effects so systems push harder for the rooms they reach, helping the house mean track the setpoint while reducing temperature differences. All room/system pairs start equally; there are no configured room mappings. Learning begins helping within hours of informative runtime and continues adapting.
 
@@ -97,7 +97,7 @@ Changes made directly on physical systems are noted in `last_decision` and re-as
 
 ## Online learning and visibility
 
-Each room learns `ΔT = a × (outdoor − room) + Σ b × signed_runtime_fraction + c × solar_kW + d` using recursive least squares. HVAC action changes are tracked between passes: heating contributes positive running effort, cooling negative. Every `b` starts at 0.03 °C per interval, with zero prior heat-loss, sun-gain and drift means and broad covariance. Default forgetting is 0.998 per sample. Each room/system confidence is `n/(n+24)`, where n is the forgetting-weighted number of intervals with nonzero effort. In v0.4.2, low-confidence pairs blend toward that system's confidence-weighted mean learned b across rooms with runtime evidence, falling back to 0.03 only when none has been explored. A new sensor therefore inherits measured system reach while its own effect is learned; no room mappings are assumed. Forgetting and prior sample count are available in options.
+Each room learns `ΔT = a × (outdoor − room) + Σ b × signed_runtime_fraction + Σ e × source_on_fraction + c × solar_kW + d` using recursive least squares. HVAC action changes are tracked between passes: heating contributes positive running effort, cooling negative. Every `b` starts at 0.03 °C per interval, with zero prior heat-loss, sun-gain and drift means and broad covariance. Default forgetting is 0.998 per sample. Each room/system confidence is `n/(n+24)`, where n is the forgetting-weighted number of intervals with nonzero effort. In v0.4.2, low-confidence pairs blend toward that system's confidence-weighted mean learned b across rooms with runtime evidence, falling back to 0.03 only when none has been explored. A new sensor therefore inherits measured system reach while its own effect is learned; no room mappings are assumed. Forgetting and prior sample count are available in options.
 
 While a system's least-confident active, weighted room is below `explore_threshold` (default 0.8), it gets a ±0.5 °C two-hour square-wave exploration offset, with different phases per system. The amplitude fades to zero at that threshold, inside the existing clamps and slew limit. `last_decision` says **exploring** and lists the rooms driving each system's error, strongest contributions first.
 
@@ -122,6 +122,61 @@ Read `sensor.house_learning` for overall confidence percent (the mean across roo
 Press `button.house_reset_learning` to clear the model and confidence back to neutral priors. It retains the house target, mode and PI state and starts learning again. Adding a sensor can restart exploration while that room learns. Confidence measures runtime evidence; learning needs distinct system operation to identify separate effects.
 
 Learning requires outdoor temperature, known HVAC actions, and both temperature endpoints. Missing/stale room readings skip that row; missing outdoor context or a missing system action skips the interval. With no solar source selected its input is zero; a configured missing solar reading or unsupported unit skips the interval. Control continues with the current learned/prior blend during gaps.
+
+## Extra heat, disturbances and pausing learning (0.5.0)
+
+In **Configure**, select optional **Extra heat source entities**, then choose **binary**
+(on/off states) or **power** for each. Power inputs use an **on above W** threshold,
+default **10 W**; W, kW and MW are supported. These entities are only observed. For
+example, a blower switch can indicate an insert running, or a plug power sensor can
+indicate a portable heater. Choose an indication that reliably tracks the heat source.
+Adding, removing or reordering sources preserves the rest of the thermal model.
+
+Each source adds a learned effect `e` for every room, starting at zero with broad
+covariance. Its input is the fraction of the interval it was on, including state changes
+between control passes. `sensor.house_learning` exposes `sources → source entity → room`
+with `e` (°C per full-on interval), confidence percent and effective samples. Configured
+sources are part of the thermal prediction: their operation does not itself discard
+thermal samples or fan experiments. Missing source observations skip the thermal interval.
+Control continues responding to measured room temperatures.
+
+Unconfigured heat or cooling is detected separately for each room after its mean HVAC
+runtime confidence reaches **50%**. A residual outside
+`max(0.3 °C, disturbance_sigma × fit_error)` per configured interval for
+`disturbance_intervals` consecutive intervals in the same direction marks the room
+**disturbed**. Defaults are **3 sigma**, **2 intervals** to flag, and
+**3 within-bound intervals** to clear. A newly added source gets time to learn before
+its active intervals can flag rooms. Other rooms keep learning; disturbed temperatures
+remain in control. Only disturbed members with weight share at least
+`minor_weight_share` (default **5%**) invalidate fan experiments; minor disturbed members
+are excluded from rewards. `climate.house.disturbed` identifies the rooms and direction,
+and `last_decision` says, for example, “unexplained heat in Guest Bedroom; not learning
+from it”. Every RLS innovation is clipped to the same bound, including before confidence
+reaches 50%, and clipped residuals update fit error so outliers cannot inflate the bound.
+Set `disturbance_sigma` to **0** to disable detection and clipping.
+
+`switch.house_learning` defaults to **on**. Turn it off to freeze thermal updates and
+fan learning while temperature control continues using the current model. Set
+`learning_pause_hours` to **0** (default) to pause until you turn it back on, or choose a
+positive duration to auto-resume on the first control pass after the deadline. The switch
+and absolute resume deadline survive restarts, including a deadline that expires while
+HA is stopped. Resuming starts a fresh interval and fan hold; no paused time is learned.
+The switch's `resume_at` and the thermostat's `learning_enabled` / `learning_resume_at`
+attributes expose the status.
+
+Inactivity clocks for thermal excitation persist in Store. Unknown clocks are seeded
+from retained recorder heating/cooling history before control initializes them; an idle
+restart therefore does not erase an earlier run. With no Store or recorder evidence,
+observation begins at startup. Downtime never counts as observed runtime.
+
+The seeded ten-day source simulation heats two of three rooms on nine random evenings
+(295 full-on five-minute intervals). Mean absolute HVAC coefficient error is
+**0.000144 °C/interval** with the source modeled, **0.005379** with it unconfigured and
+disturbance protection enabled, versus **0.227647** with protection disabled. Learned
+source effects are **0.85005 / 0.69999 / −0.00010**, against truth **0.85 / 0.70 / 0**.
+Protection flags each heated room for **286/295** source-on intervals and never flags the
+unaffected room; the modeled-source run has no flags. These are deterministic simulated
+results, not measured house performance.
 
 ## Fan and vane learning (0.3.0)
 

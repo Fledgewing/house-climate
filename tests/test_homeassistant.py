@@ -305,7 +305,9 @@ async def complete_flow(manager, result, sensors, systems, stale_after=720):
     assert result["step_id"] == "tunables"
     # Unselected optional selectors are omitted by the HA frontend.
     tunables = {
-        k: v for k, v in DEFAULTS.items() if k not in ("sensors", "systems") and v != ""
+        k: v
+        for k, v in DEFAULTS.items()
+        if k not in ("sensors", "systems", "extra_heat_sources") and v != ""
     }
     fields = {field.schema: field for field in result["data_schema"].schema}
     assert fields["stale_after"].default() == 720
@@ -510,8 +512,10 @@ async def test_config_flow_empty_defaults_and_selector_filters(hass):
         if field.schema == "sensors":
             assert entity_selector.config["domain"] == ["sensor"]
             assert entity_selector.config["device_class"] == ["temperature"]
-        else:
+        elif field.schema == "systems":
             assert entity_selector.config["domain"] == ["climate"]
+        else:
+            assert field.schema == "extra_heat_sources"
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {"sensors": ["sensor.room"], "systems": ["climate.ducted"]}
     )
@@ -1114,7 +1118,9 @@ async def test_options_quiet_limit_from_runtime_modes(hass, settings):
     assert fields["quiet_end"].default() == "07:00"
     assert fields["learn_exclude_modes"].default() == "auto"
     inputs = {
-        k: v for k, v in DEFAULTS.items() if k not in ("sensors", "systems") and v != ""
+        k: v
+        for k, v in DEFAULTS.items()
+        if k not in ("sensors", "systems", "extra_heat_sources") and v != ""
     }
     inputs["quiet_hours_enabled"] = True
     inputs["learn_exclude_modes"] = "auto, strong"
@@ -1490,7 +1496,9 @@ async def finish_priority_wizard(
     for _ in range(system_count):
         result = await flow.async_configure(result["flow_id"], {"preset": ""})
     tunables = {
-        k: v for k, v in DEFAULTS.items() if k not in ("sensors", "systems") and v != ""
+        k: v
+        for k, v in DEFAULTS.items()
+        if k not in ("sensors", "systems", "extra_heat_sources") and v != ""
     }
     return await flow.async_configure(result["flow_id"], tunables)
 
@@ -1731,3 +1739,412 @@ async def test_excitation_dispatch_between_tick_runtime_and_restart(hass, instal
         restored.state.last_excite["climate.ducted"]
         == (start + timedelta(hours=3)).timestamp()
     )
+
+
+async def test_options_onboard_sources(hass, settings):
+    entry = MockConfigEntry(domain=DOMAIN, data=settings, version=3)
+    entry.add_to_hass(hass)
+    flow = hass.config_entries.options
+    result = await flow.async_init(entry.entry_id)
+    result = await flow.async_configure(
+        result["flow_id"],
+        {
+            "sensors": ["sensor.room"],
+            "systems": ["climate.ducted"],
+            "extra_heat_sources": ["switch.source", "sensor.power"],
+        },
+    )
+    result = await flow.async_configure(result["flow_id"], {"weight": 1})
+    result = await flow.async_configure(result["flow_id"], {"preset": ""})
+    assert result["step_id"] == "source"
+    result = await flow.async_configure(
+        result["flow_id"], {"kind": "binary", "threshold": 10}
+    )
+    fields = {k.schema: k for k in result["data_schema"].schema}
+    assert fields["kind"].default() == "power"
+    assert fields["threshold"].default() == 10
+    result = await flow.async_configure(
+        result["flow_id"], {"kind": "power", "threshold": 25}
+    )
+    tunables = {
+        k: v
+        for k, v in DEFAULTS.items()
+        if k not in ("sensors", "systems", "extra_heat_sources") and v != ""
+    }
+    result = await flow.async_configure(result["flow_id"], tunables)
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert entry.options["extra_heat_sources"] == [
+        {"entity_id": "switch.source", "kind": "binary", "threshold": 10},
+        {"entity_id": "sensor.power", "kind": "power", "threshold": 25},
+    ]
+
+
+async def test_source_events_model_reload_and_missing(hass, installed):
+    entry, _ = installed
+    c = entry.runtime_data
+    retained = deepcopy(c.learning.to_dict()["rows"]["sensor.room"])
+    settings = deepcopy(dict(entry.options))
+    settings["extra_heat_sources"] = [
+        {"entity_id": "switch.source", "kind": "binary"},
+        {"entity_id": "sensor.power", "kind": "power", "threshold": 10},
+    ]
+    settings["outdoor_sensor"] = "sensor.outdoor"
+    hass.states.async_set("sensor.outdoor", "5")
+    hass.states.async_set("switch.source", "off")
+    hass.states.async_set("sensor.power", "0.01", {"unit_of_measurement": "kW"})
+    hass.config_entries.async_update_entry(entry, options=settings)
+    await hass.async_block_till_done()
+    c = entry.runtime_data
+    assert c.learning.rows["sensor.room"].theta[:3] == retained["theta"][:3]
+    assert c.learning.rows["sensor.room"].samples == retained["samples"]
+    start = dt_util.utcnow()
+    # Reload establishes both interval endpoints; start explicitly at this time.
+    c.reset_learning_interval()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow", return_value=start
+    ):
+        await c.async_tick()
+    for seconds, state in [(60, "on"), (210, "off")]:
+        with patch(
+            "custom_components.house_climate.coordinator.dt_util.utcnow",
+            return_value=start + timedelta(seconds=seconds),
+        ):
+            async with c.lock:
+                hass.states.async_set("switch.source", state)
+                hass.states.async_set(
+                    "sensor.power",
+                    "0.02" if state == "on" else "0.01",
+                    {"unit_of_measurement": "kW"},
+                )
+                await hass.async_block_till_done()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(minutes=5),
+    ):
+        await c.async_tick()
+    assert c.samples[-1]["extra_heat_sources"] == {
+        "switch.source": 0.5,
+        "sensor.power": 0.5,
+    }
+    assert c.learning.rows["sensor.room"].samples == 1
+    assert set(hass.states.get("sensor.house_learning").attributes["sources"]) == {
+        "switch.source",
+        "sensor.power",
+    }
+    before = deepcopy(c.learning.to_dict())
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(minutes=6),
+    ):
+        hass.states.async_set("switch.source", "unavailable")
+        await hass.async_block_till_done()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(minutes=10),
+    ):
+        await c.async_tick()
+    assert c.learning.to_dict() == before
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(minutes=10),
+    ):
+        assert await hass.config_entries.async_reload(entry.entry_id)
+    assert entry.runtime_data.learning.to_dict() == before
+    settings = deepcopy(settings)
+    settings["extra_heat_sources"] = []
+    hass.config_entries.async_update_entry(entry, options=settings)
+    await hass.async_block_till_done()
+    assert entry.runtime_data.learning.rows["sensor.room"].samples == 1
+    assert len(entry.runtime_data.learning.rows["sensor.room"].theta) == 5
+
+
+@pytest.mark.parametrize("hours", [0, 1])
+async def test_learning_pause_switch_freezes_resumes_and_persists(
+    hass, installed, hours
+):
+    entry, _ = installed
+    c, _, calls = await prepare_fans(hass, installed)
+    c.config["learning_pause_hours"] = hours
+    start = dt_util.utcnow()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow", return_value=start
+    ):
+        await hass.services.async_call(
+            "switch", "turn_off", {"entity_id": "switch.house_learning"}, blocking=True
+        )
+    assert hass.states.get("switch.house_learning").state == "off"
+    before = deepcopy(c.learning.to_dict())
+    arms = deepcopy(c.fans.arms)
+    deadline = start.timestamp() + 3600 if hours else None
+    assert c.learning_resume_at == deadline
+    calls.clear()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(minutes=30),
+    ):
+        await c.async_change(setpoint=23, enabled=True)
+        await c.async_tick()
+    assert any(service == "set_temperature" for _, service, _ in calls)
+    assert c.learning.to_dict() == before
+    assert c.fans.arms == arms
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(minutes=31),
+    ):
+        assert await hass.config_entries.async_reload(entry.entry_id)
+    c = entry.runtime_data
+    assert not c.learning_enabled
+    assert c.learning_resume_at == deadline
+    c.config["outdoor_sensor"] = "sensor.outdoor"
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(hours=1),
+    ):
+        await c.async_tick()
+        if hours == 0:
+            assert not c.learning_enabled
+            await hass.services.async_call(
+                "switch",
+                "turn_on",
+                {"entity_id": "switch.house_learning"},
+                blocking=True,
+            )
+            await c.async_tick()
+    assert c.learning_enabled
+    assert c.learning_resume_at is None
+    # Auto-resume establishes a fresh baseline; no paused interval can train.
+    assert c.learning.to_dict() == before
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(minutes=65),
+    ):
+        await c.async_tick()
+    assert (
+        c.learning.rows["sensor.room"].samples
+        == before["rows"]["sensor.room"]["samples"] + 1
+    )
+
+
+@pytest.mark.parametrize("weight", [0.01, 1])
+async def test_disturbance_skips_room_learning_and_weight_gates_fans(
+    hass, installed, weight
+):
+    from custom_components.house_climate.filtering import SensorFilter
+
+    c, _, _ = await prepare_fans(hass, installed)
+    c.config["sensors"].append({"entity_id": "sensor.other", "weight": 1})
+    c.config["priority_modes"]["balance"] = {"sensor.room": weight, "sensor.other": 1}
+    c.learning.reconcile(["sensor.room", "sensor.other"], c.learning.systems)
+    for row in c.learning.rows.values():
+        row.counts = [100, 100]
+        row.theta = [0] * 5
+        row.covariance = [[0.001 if i == j else 0 for j in range(5)] for i in range(5)]
+    start = dt_util.utcnow()
+    c.learning_baseline = ({"sensor.room": 19, "sensor.other": 19}, 3, 0)
+    c.fans.window["dirty"] = False
+    for step in range(1, 4):
+        now = start + timedelta(minutes=5 * step)
+        with patch(
+            "custom_components.house_climate.coordinator.dt_util.utcnow",
+            return_value=now,
+        ):
+            hass.states.async_set(
+                "sensor.room", str(19 + step), {"friendly_name": "Guest Bedroom"}
+            )
+            hass.states.async_set("sensor.other", "19")
+            await hass.async_block_till_done()
+            for key, value in (("sensor.room", 19 + step), ("sensor.other", 19)):
+                c.filters[key] = SensorFilter(minutes=1)
+                c.filters[key].observe(value, now.timestamp() - 60)
+            await c.async_tick()
+        if step == 2:
+            frozen = deepcopy(c.learning.rows["sensor.room"])
+    assert c.learning.disturbed == {"sensor.room": "heat"}
+    assert c.learning.rows["sensor.room"] == frozen
+    assert c.learning.rows["sensor.other"].samples == 3
+    assert c.fans.window["dirty"] is (weight == 1)
+    assert (
+        "unexplained heat in Guest Bedroom; not learning from it" in c.data.explanation
+    )
+    assert hass.states.get("climate.house").attributes["disturbed"] == {
+        "sensor.room": "heat"
+    }
+    assert c.data.readings["sensor.room"] == 22  # Still used by control.
+
+
+async def test_last_run_seeds_from_full_history_before_control_and_persists(
+    hass, settings
+):
+    from homeassistant.helpers.recorder import DATA_INSTANCE
+
+    from custom_components.house_climate.coordinator import HouseCoordinator
+
+    entry = MockConfigEntry(domain=DOMAIN, data=settings)
+    entry.add_to_hass(hass)
+    c = HouseCoordinator(hass, entry)
+    now = dt_util.utcnow()
+    last_stop = now - timedelta(hours=14)
+    c.state.last_run["climate.split"] = now.timestamp() - 60
+    activity = {}
+    for key in ("climate.ducted", "climate.split"):
+        hass.states.async_set(
+            key,
+            "heat",
+            {"hvac_action": "idle", "temperature": 19, "current_temperature": 24},
+        )
+        activity[key] = [
+            State(
+                key,
+                "heat",
+                {"hvac_action": "heating"},
+                last_updated=last_stop - timedelta(hours=1),
+            ),
+            State(
+                key,
+                "heat",
+                {"hvac_action": "cooling"},
+                last_updated=last_stop - timedelta(minutes=30),
+            ),
+            State(key, "heat", {"hvac_action": "idle"}, last_updated=last_stop),
+            State(key, "unavailable", last_updated=now - timedelta(minutes=5)),
+        ]
+
+    class Recorder:
+        async def async_add_executor_job(self, job):
+            return job()
+
+    hass.data[DATA_INSTANCE] = Recorder()
+    try:
+        with patch(
+            "homeassistant.components.recorder.history.get_significant_states",
+            side_effect=[{}, activity],
+        ) as history:
+            await c.async_seed_history(now)
+        assert history.call_args.args[1] == dt_util.utc_from_timestamp(0)
+        assert c.state.last_run == {
+            "climate.ducted": last_stop.timestamp(),
+            "climate.split": now.timestamp() - 60,
+        }
+        assert not c.reporting.intervals  # Old activity is outside frozen window.
+        c.history_seeded = True
+        c.restored = True
+        c.state.mode = "heat"
+        c.state.setpoint = 22.5
+        hass.states.async_set("sensor.room", "19")
+        with patch("homeassistant.core.ServiceRegistry.async_call"):
+            await c.async_tick()
+        assert c.state.excitation["system"] == "climate.ducted"
+        restored = HouseCoordinator(hass, entry)
+        await restored.async_load()
+        assert restored.state.last_run == c.state.last_run
+        assert not restored.state.excitation
+    finally:
+        hass.data.pop(DATA_INSTANCE)
+
+
+async def test_modelled_heat_keeps_thermal_samples_and_fan_window_valid(
+    hass, installed
+):
+    from custom_components.house_climate.filtering import SensorFilter
+
+    c, _, _ = await prepare_fans(hass, installed)
+    c.config["extra_heat_sources"] = [{"entity_id": "switch.source", "kind": "binary"}]
+    hass.states.async_set("switch.source", "on")
+    c.learning.reconcile(["sensor.room"], c.learning.systems, ["switch.source"])
+    row = c.learning.rows["sensor.room"]
+    row.theta = [0, 0, 0, 0.8, 0, 0]
+    row.counts = [100, 100, 100]
+    start = dt_util.utc_from_timestamp(c.fans.window["start"])
+    c.source_effort.finish({"switch.source": "heating"}, start.timestamp())
+    c.learning_baseline = ({"sensor.room": 19}, 3, 0)
+    c.fans.window["dirty"] = False
+    for step in range(1, 7):
+        now = start + timedelta(minutes=5 * step)
+        value = 19 + 0.8 * step
+        with patch(
+            "custom_components.house_climate.coordinator.dt_util.utcnow",
+            return_value=now,
+        ):
+            hass.states.async_set("sensor.room", str(value))
+            await hass.async_block_till_done()
+            c.filters["sensor.room"] = SensorFilter(minutes=1)
+            c.filters["sensor.room"].observe(value, now.timestamp() - 60)
+            await c.async_tick()
+        assert not c.learning.disturbed
+        assert not c.fans.window["dirty"]
+    assert row.samples == 6
+    assert (
+        sum(
+            arm["samples"]
+            for actions in c.fans.arms.values()
+            for buckets in actions.values()
+            for arms in buckets.values()
+            for arm in arms.values()
+        )
+        == 1
+    )
+
+
+async def test_pause_deadline_expired_during_restart_resumes_without_sample(
+    hass, installed
+):
+    entry, _ = installed
+    c = entry.runtime_data
+    c.config["learning_pause_hours"] = 1
+    start = dt_util.utcnow()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow", return_value=start
+    ):
+        await c.async_change(learning_enabled=False)
+    before = deepcopy(c.learning.to_dict())
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(hours=2),
+    ):
+        assert await hass.config_entries.async_reload(entry.entry_id)
+    c = entry.runtime_data
+    assert c.learning_enabled
+    assert c.learning_resume_at is None
+    assert c.learning.to_dict() == before
+    assert hass.states.get("switch.house_learning").state == "on"
+
+
+async def test_recorder_running_tail_uses_observation_without_inventing_downtime(
+    hass, settings
+):
+    from homeassistant.helpers.recorder import DATA_INSTANCE
+
+    from custom_components.house_climate.coordinator import HouseCoordinator
+
+    entry = MockConfigEntry(domain=DOMAIN, data=settings)
+    entry.add_to_hass(hass)
+    c = HouseCoordinator(hass, entry)
+    now = dt_util.utcnow()
+    observed = now - timedelta(hours=14)
+
+    class Recorder:
+        async def async_add_executor_job(self, job):
+            return job()
+
+    hass.data[DATA_INSTANCE] = Recorder()
+    try:
+        with patch(
+            "homeassistant.components.recorder.history.get_significant_states",
+            side_effect=[
+                {},
+                {
+                    "climate.ducted": [
+                        State(
+                            "climate.ducted",
+                            "heat",
+                            {"hvac_action": "heating"},
+                            last_updated=observed,
+                        )
+                    ]
+                },
+            ],
+        ):
+            await c.async_seed_history(now)
+        assert c.state.last_run["climate.ducted"] == observed.timestamp()
+    finally:
+        hass.data.pop(DATA_INSTANCE)

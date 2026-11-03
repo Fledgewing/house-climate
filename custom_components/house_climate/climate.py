@@ -60,6 +60,9 @@ class HouseClimate(CoordinatorEntity, ClimateEntity, RestoreEntity):
         data = self.coordinator.data
         return {
             "last_decision": data.explanation if data else "Starting",
+            "disturbed": dict(self.coordinator.learning.disturbed),
+            "learning_enabled": self.coordinator.learning_enabled,
+            "learning_resume_at": self.coordinator.learning_resume_at,
             "not_reporting": self.coordinator.not_reporting,
             "raw_sensor_readings": self.coordinator.raw_readings,
             "filtered_sensor_readings": data.readings if data else {},

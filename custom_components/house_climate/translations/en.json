@@ -7,7 +7,8 @@
         "description": "Choose all member temperature sensors and controlled HVAC systems. Removing an entity here removes it from control.",
         "data": {
           "sensors": "Member temperature sensors",
-          "systems": "HVAC systems"
+          "systems": "HVAC systems",
+          "extra_heat_sources": "Extra heat source entities (optional)"
         }
       },
       "sensor": {
@@ -58,7 +59,11 @@
           "quiet_end": "Quiet hours end",
           "explore_threshold": "Exploration confidence threshold (0–1)",
           "excite_after_minutes": "Explore after no actual runtime (minutes)",
-          "excite_minutes": "Exploration actual runtime (minutes)"
+          "excite_minutes": "Exploration actual runtime (minutes)",
+          "disturbance_sigma": "Disturbance sigma (0 disables protection)",
+          "disturbance_intervals": "Consecutive intervals to flag a disturbance",
+          "disturbance_clear_intervals": "Clean intervals to clear a disturbance",
+          "learning_pause_hours": "Learning pause auto-resume (hours; 0 until switched on)"
         }
       },
       "priority": {
@@ -67,6 +72,14 @@
         "data": {
           "mode": "Mode",
           "name": "New name"
+        }
+      },
+      "source": {
+        "title": "Extra heat source",
+        "description": "Configure {entity}. Binary uses on/off states; power uses W, kW or MW. Threshold applies only to power inputs. These entities are observed, never controlled.",
+        "data": {
+          "kind": "Input type (binary or power)",
+          "threshold": "On above power (W)"
         }
       }
     },
@@ -88,7 +101,8 @@
         "data": {
           "sensors": "Member temperature sensors",
           "systems": "HVAC systems",
-          "priority_action": "Priority mode action (configure edits active weights)"
+          "priority_action": "Priority mode action (configure edits active weights)",
+          "extra_heat_sources": "Extra heat source entities (optional)"
         }
       },
       "sensor": {
@@ -139,7 +153,11 @@
           "quiet_end": "Quiet hours end",
           "explore_threshold": "Exploration confidence threshold (0–1)",
           "excite_after_minutes": "Explore after no actual runtime (minutes)",
-          "excite_minutes": "Exploration actual runtime (minutes)"
+          "excite_minutes": "Exploration actual runtime (minutes)",
+          "disturbance_sigma": "Disturbance sigma (0 disables protection)",
+          "disturbance_intervals": "Consecutive intervals to flag a disturbance",
+          "disturbance_clear_intervals": "Clean intervals to clear a disturbance",
+          "learning_pause_hours": "Learning pause auto-resume (hours; 0 until switched on)"
         }
       },
       "priority": {
@@ -148,6 +166,14 @@
         "data": {
           "mode": "Mode",
           "name": "New name"
+        }
+      },
+      "source": {
+        "title": "Extra heat source",
+        "description": "Configure {entity}. Binary uses on/off states; power uses W, kW or MW. Threshold applies only to power inputs. These entities are observed, never controlled.",
+        "data": {
+          "kind": "Input type (binary or power)",
+          "threshold": "On above power (W)"
         }
       }
     },

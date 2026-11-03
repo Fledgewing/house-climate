@@ -42,6 +42,9 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.state = ControlState()
         self.enabled = True
         self.fan_enabled = True
+        self.learning_enabled = True
+        self.learning_resume_at = None
+        self.source_effort = EffortTracker()
         self.fans = FanLearning(
             self.config.get("fan_hold_minutes", 30),
             self.config.get("fan_reward_lambda", 1),
@@ -81,6 +84,10 @@ class HouseCoordinator(DataUpdateCoordinator):
             [s["entity_id"] for s in self.config["systems"]],
             self.config.get("learning_forgetting", 0.998),
             self.config.get("learning_n0", 24),
+            [s["entity_id"] for s in self.config.get("extra_heat_sources", [])],
+            self.config.get("disturbance_sigma", 3),
+            self.config.get("disturbance_intervals", 2),
+            self.config.get("disturbance_clear_intervals", 3),
         )
 
     async def async_load(self):
@@ -101,6 +108,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                 self.state.excitation = {}
             self.enabled = saved.get("enabled", True)
             self.fan_enabled = saved.get("fan_enabled", True)
+            self.learning_enabled = saved.get("learning_enabled", True)
+            self.learning_resume_at = saved.get("learning_resume_at")
             self.fans = FanLearning(
                 self.config.get("fan_hold_minutes", 30),
                 self.config.get("fan_reward_lambda", 1),
@@ -122,9 +131,16 @@ class HouseCoordinator(DataUpdateCoordinator):
                 self.learning.reconcile(
                     [s["entity_id"] for s in self.config["sensors"]],
                     [s["entity_id"] for s in self.config["systems"]],
+                    [s["entity_id"] for s in self.config.get("extra_heat_sources", [])],
                 )
                 self.learning.forgetting = self.config.get("learning_forgetting", 0.998)
                 self.learning.n0 = self.config.get("learning_n0", 24)
+                for key, default in (
+                    ("disturbance_sigma", 3),
+                    ("disturbance_intervals", 2),
+                    ("disturbance_clear_intervals", 3),
+                ):
+                    setattr(self.learning, key, self.config.get(key, default))
 
     def start(self):
         cancel_timer = async_track_time_interval(
@@ -144,13 +160,54 @@ class HouseCoordinator(DataUpdateCoordinator):
             self._sensor_changed,
         )
 
+        source_ids = [s["entity_id"] for s in self.config.get("extra_heat_sources", [])]
+        cancel_sources = (
+            async_track_state_change_event(self.hass, source_ids, self._source_changed)
+            if source_ids
+            else lambda: None
+        )
+
         @callback
         def cancel():
             cancel_timer()
             cancel_states()
             cancel_sensors()
+            cancel_sources()
 
         return cancel
+
+    def source_action(self, source):
+        entity = self.hass.states.get(source["entity_id"])
+        if not entity or entity.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return None
+        if source.get("kind", "binary") == "power":
+            value = self.number(source["entity_id"])
+            factors = {"W": 1, "kW": 1000, "MW": 1000000}
+            factor = factors.get(entity.attributes.get("unit_of_measurement"))
+            if value is None or factor is None:
+                return None
+            on = value * factor > source.get("threshold", 10)
+        elif entity.state in ("on", "off"):
+            on = entity.state == "on"
+        else:
+            return None
+        return "heating" if on else "off"
+
+    @callback
+    def _source_changed(self, event):
+        key = event.data["entity_id"]
+        source = next(
+            s for s in self.config["extra_heat_sources"] if s["entity_id"] == key
+        )
+        self.source_effort.change(
+            key, self.source_action(source), dt_util.utcnow().timestamp()
+        )
+
+    def reset_learning_interval(self):
+        self.learning_baseline = None
+        self.effort = EffortTracker()
+        self.source_effort = EffortTracker()
+        self.learning.streaks.clear()
 
     @property
     def frozen_window(self):
@@ -302,6 +359,15 @@ class HouseCoordinator(DataUpdateCoordinator):
     async def async_tick(self, _now=None, *, record=True):
         async with self.lock:
             now = dt_util.utcnow()
+            if (
+                not self.learning_enabled
+                and self.learning_resume_at is not None
+                and now.timestamp() >= self.learning_resume_at
+            ):
+                self.learning_enabled = True
+                self.learning_resume_at = None
+                self.reset_learning_interval()
+                self.fans.window = self.fans.resume = None
             if not self.history_seeded:
                 await self.async_seed_history(now)
                 self.history_seeded = True
@@ -470,6 +536,13 @@ class HouseCoordinator(DataUpdateCoordinator):
                     },
                     now.timestamp(),
                 )
+                source_fractions, _ = self.source_effort.finish(
+                    {
+                        source["entity_id"]: self.source_action(source)
+                        for source in self.config.get("extra_heat_sources", [])
+                    },
+                    now.timestamp(),
+                )
                 learning_values = {
                     key: value
                     for key, value in clean_values.items()
@@ -477,7 +550,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                     and not self.filters[key].contaminated
                 }
                 if (
-                    self.learning_baseline is not None
+                    self.learning_enabled
+                    and self.learning_baseline is not None
                     and outdoor is not None
                     and solar is not None
                 ):
@@ -489,10 +563,22 @@ class HouseCoordinator(DataUpdateCoordinator):
                         efforts,
                         previous_solar,
                         duration / (self.config.get("interval", 5) * 60),
+                        sources=source_fractions,
                     )
-                self.learning_baseline = (learning_values, outdoor, solar)
+                self.learning_baseline = (
+                    (learning_values, outdoor, solar) if self.learning_enabled else None
+                )
                 for sensor_filter in self.filters.values():
                     sensor_filter.finish_interval()
+            for key in self.learning.disturbed:
+                clean_values.pop(key, None)
+                if self.sensor_blocks_fans(key):
+                    fan_problems.append(f"{key} unexplained temperature disturbance")
+            if not self.learning_enabled:
+                fan_problems.append("learning paused by switch")
+            fan_clean = not fan_problems
+            if not fan_clean:
+                self.fans.invalidate("; ".join(fan_problems))
             decision = control(
                 {**self.config, "sensors": members(self.config, self.priority_mode)},
                 self.state,
@@ -516,6 +602,14 @@ class HouseCoordinator(DataUpdateCoordinator):
                     f" {entity_id}: not reporting ({details['reason']}); "
                     f"last real change {details['last_change']}; check its battery."
                 )
+            for key, direction in self.learning.disturbed.items():
+                entity = self.hass.states.get(key)
+                name = entity.name if entity else key
+                decision.explanation += (
+                    f" unexplained {direction} in {name}; not learning from it."
+                )
+            if not self.learning_enabled:
+                decision.explanation += " Learning paused by switch."
             if adoption:
                 decision.explanation = f"{adoption} {decision.explanation}"
             fan_systems = {}
@@ -608,6 +702,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                         "outdoor": outdoor,
                         "solar": solar,
                         "efforts": efforts,
+                        "extra_heat_sources": source_fractions,
                         "occupancy": occupancy.state if occupancy else None,
                         "systems": {
                             key: {
@@ -626,6 +721,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                     "state": asdict(self.state),
                     "enabled": self.enabled,
                     "fan_enabled": self.fan_enabled,
+                    "learning_enabled": self.learning_enabled,
+                    "learning_resume_at": self.learning_resume_at,
                     "fans": self.fans.to_dict(),
                     "samples": self.samples,
                     "learning": self.learning.to_dict(),
@@ -682,7 +779,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 ),
                 get_significant_states(
                     self.hass,
-                    now - timedelta(seconds=self.frozen_window),
+                    dt_util.utc_from_timestamp(0),
                     now,
                     systems,
                     significant_changes_only=False,
@@ -722,7 +819,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                     "changed": changed,
                     "frozen": False,
                 }
-        for states in activity.values():
+        for entity_id, states in activity.items():
+            last_run = None
             for index, state in enumerate(states):
                 if state.state not in (
                     STATE_UNAVAILABLE,
@@ -733,6 +831,13 @@ class HouseCoordinator(DataUpdateCoordinator):
                         if index + 1 < len(states)
                         else now
                     )
+                    # With no following transition, only the retained observation
+                    # is evidence; a recorder tail must not count HA downtime.
+                    last_run = (
+                        end.timestamp()
+                        if index + 1 < len(states)
+                        else state.last_updated.timestamp()
+                    )
                     self.reporting.add_interval(
                         max(
                             state.last_updated.timestamp(),
@@ -740,6 +845,9 @@ class HouseCoordinator(DataUpdateCoordinator):
                         ),
                         end.timestamp(),
                     )
+
+            if last_run is not None:
+                self.state.last_run.setdefault(entity_id, last_run)
 
     def solar_kw(self):
         entity_id = self.config.get("solar_sensor")
@@ -760,8 +868,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 self.config.get("fan_reward_lambda", 1),
                 learn_exclude_modes=self.config.get("learn_exclude_modes", "auto"),
             )
-            self.learning_baseline = None
-            self.effort = EffortTracker()
+            self.reset_learning_interval()
         await self.async_tick(record=False)
 
     def adopt_systems(self, devices):
@@ -795,6 +902,7 @@ class HouseCoordinator(DataUpdateCoordinator):
         enabled=None,
         fan_enabled=None,
         priority_mode=None,
+        learning_enabled=None,
     ):
         # Mutations share the lock with in-flight commands.
         async with self.lock:
@@ -802,6 +910,17 @@ class HouseCoordinator(DataUpdateCoordinator):
                 v is not None for v in (delta, setpoint, mode, enabled, fan_enabled)
             ):
                 self.fans.invalidate("House setpoint, mode or control switch changed")
+            if learning_enabled is not None:
+                self.learning_enabled = learning_enabled
+                hours = self.config.get("learning_pause_hours", 0)
+                self.learning_resume_at = (
+                    dt_util.utcnow().timestamp() + hours * 3600
+                    if not learning_enabled and hours
+                    else None
+                )
+                self.reset_learning_interval()
+                self.fans.invalidate("learning switch changed")
+                self.fans.window = self.fans.resume = None
             if priority_mode is not None:
                 if priority_mode not in modes(self.config):
                     raise ValueError("Unknown priority mode")

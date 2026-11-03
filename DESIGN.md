@@ -32,6 +32,7 @@ by domain and, for temperature, power and occupancy sources, device class.
 - `sensor.house_learning` and `button.house_reset_learning`: model confidence, fitted room effects and reset.
 - `sensor.house_<system>_offset` per system: the current offset from the house setpoint.
 - `switch.house_climate_control`: when off, the integration observes and logs but sends no commands, including fan/vane commands.
+- `switch.house_learning` (default on): pause thermal and fan learning, with an optional persisted auto-resume deadline.
 - `switch.house_fan_control` (default on): when off, leave fan/vane settings alone.
 - `sensor.house_fan_learning`: confidence percent, per-context option rewards/counts and best fan/vane settings.
 - Attributes on `climate.house` explain the last decision in plain words (`last_decision`), plus
@@ -137,7 +138,7 @@ Restored state takes precedence over adoption.
 Every scheduled interval fits one thermal model per available room sensor using recursive least
 squares (RLS), in the pure `learning.py` module:
 
-`ΔT_i = a_i (T_out − T_i) + Σ_j b_ij u_j + c_i solar_kW + d_i`.
+`ΔT_i = a_i (T_out − T_i) + Σ_j b_ij u_j + Σ_k e_ik s_k + c_i solar_kW + d_i`.
 
 Coefficients describe one configured control interval (5 minutes by default); elapsed time scales
 regressors for delayed passes. `a_i` describes heat loss, `b_ij` the temperature response to each
@@ -434,3 +435,93 @@ controller and RLS learner at five-minute intervals. The comparison retains v0.4
 and dither but disables excitation and restores the fixed prior blend. Assert B runs within
 three hours, learns larger cold-room b than A, and lowers final and day-two average weighted
 standard deviation (the simulation's weighted spread metric). Production spread remains max−min.
+
+
+## External inputs and robust learning (v0.5.0)
+
+`extra_heat_sources` is an optional list of `{entity_id, kind, threshold}` records in
+entry data/options. The ordinary membership page selects any binary-like or numeric
+entity; each source page chooses `binary` (literal HA on/off states) or `power`
+(finite W, kW or MW, strictly above `threshold` W, default 10). No heat-source device
+names or room mappings appear in implementation. Sources are never commanded.
+
+RLS columns are `[outdoor−room, HVAC efforts..., source fractions..., solar, 1]`.
+Source coefficients have zero prior means, covariance diagonal 100 and zero initial
+cross-covariances. Source effective activity counts use the same forgetting and
+`n/(n+N0)` confidence as HVAC inputs. Sources use a separate `EffortTracker`, translating
+on/off to 1/0, and listen to every state transition even during command locks. Both
+trackers finish at the same scheduled passes; immediate control requests leave their
+integrals intact. Unknown observations make the interval unavailable. Observations
+record the integrated fractions. Startup and pause/resume reset the runtime baseline,
+so no unobserved interval is invented.
+
+Reconciliation maps covariance and coefficients by `(input kind, entity ID)`, retaining
+all surviving cross-covariances, fit errors, sample counts and effective activity counts.
+New columns alone start neutral; source removal shrinks rows without resetting HVAC,
+solar or drift. Old Store models with no source metadata load unchanged.
+`sensor.house_learning.sources[source][room]` exposes `e`, confidence percent and
+`effective_samples`; overall confidence remains the HVAC-pair mean used previously.
+
+For each available row interval, calculate the prediction residual before updating.
+Normalize residual and fit error to one configured interval; delayed intervals scale
+the bound by elapsed/configured duration. Bound is
+`max(0.3, disturbance_sigma × fit_error)` °C per interval. Default sigma is 3.
+The sensor's confidence is the mean across its HVAC pairs; below 50%, reset detection
+streaks and never flag. An active configured source must also have at least `N0`
+effective on samples (50% source confidence) before detection can flag its room: this
+allows a new zero-prior column to learn a strong effect without becoming quarantined.
+
+Two consecutive out-of-bound residuals in the same direction (configurable
+`disturbance_intervals`) mark that row disturbed. Missing/invalid intervals reset
+streaks; opposite-direction residuals start a new streak. While disturbed, coefficients,
+covariance, counts, samples and fit error stay unchanged, but predictions continue for
+recovery. Three consecutive within-bound intervals (`disturbance_clear_intervals`)
+clear the flag; the clearing interval can train. Before every accepted update, clip
+innovation to the bound (Huber-style). Update the RMS fit error using the clipped,
+duration-normalized residual, preventing one outlier from expanding its own future
+acceptance bounds. Sigma 0 disables both guards for comparison or troubleshooting.
+Detection streaks/flags restart fresh after process restart; the fitted model persists.
+
+Control still sees disturbed filtered temperatures. Thermal skipping is per row.
+The fan scheduler excludes disturbed room rewards and invalidates a complete window
+only if that member's active-priority share is at least `minor_weight_share`.
+Modeled source operation alone never dirties windows. Thermostat attributes expose
+`disturbed` as room entity to heat/cooling direction and `last_decision` uses friendly
+room names to explain skipped learning.
+
+`switch.house_learning` has a distinct unique ID from the existing learning sensor.
+Off blocks all RLS updates and fan reward updates while ordinary control/corrections
+continue. `learning_pause_hours` defaults to 0 (indefinite); positive values create an
+absolute UTC deadline. Store persists enabled state and deadline; the first pass at or
+after it resumes automatically, including after downtime. Toggle and auto-resume discard
+partial thermal intervals and fan holds, preserving all fitted evidence. Status is
+exposed on the thermostat and the switch. Reset-learning does not silently unpause.
+
+The v0.4.2 Store already serializes `ControlState.last_run`; v0.5.0 fills the missing
+startup evidence path. Recorder action history is read across retained history rather
+than only the frozen-sensor window. For systems without a stored clock, seed the end
+of the last observed heating/cooling interval before `control()` can use `setdefault`.
+A running history tail with no following transition supplies only its last retained
+observation timestamp, not invented runtime through downtime.
+Stored clocks take precedence. Reporting activity still clips to `frozen_after`, so
+old action history cannot freeze a room today. No history means observing from startup;
+active excitation is canceled on restore and downtime earns no runtime.
+
+Regression coverage includes source onboarding, power unit/threshold handling,
+between-pass source events under lock, missing sources, Store and options reconciliation,
+positive/negative two-hour single-room disturbances, same-direction and clear streaks,
+cold-start suppression, clipped outliers, minor/major fan invalidation, modeled heat
+with six valid thermal samples and a completed fan hold, indefinite/timed pause across
+reload, fresh resume baselines, and recorder seeding from a run 14 hours earlier.
+
+The seeded ten-day physical simulation has two HVAC systems and three rooms, independent
+weather/solar variation, random duty fractions correlated with evening heat, room losses
+and small measurement noise. A source heats two rooms at 0.85/0.70 °C per full-on interval,
+with no effect on the third. After one clean commissioning day it runs on nine random
+evenings for 295 intervals. Mean absolute HVAC b errors: modeled input 0.000144,
+unmodeled with detection 0.005379, unmodeled without protection 0.227647 °C/interval.
+Every modeled b is within 0.003 of truth; source e estimates are
+0.850051/0.699994/−0.000098 (tolerance 0.005). Detection flags both heated rooms for
+286/295 source-on intervals, flags the unaffected room zero times, and leaves it
+learning for all 2880 intervals. The modeled case has zero flags. Protection reduces
+omitted-source HVAC coefficient error by about 42 times in this simulation.
