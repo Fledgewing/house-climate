@@ -25,6 +25,7 @@ by domain and, for temperature, power and occupancy sources, device class.
 - `climate.house`: one thermostat. Target step 0.5 °C. Modes `off`, `heat`, `cool`, `heat_cool`
   (auto: the integration picks heat or cool). Current temperature = the house temperature.
   The standard thermostat card's +/− buttons are "warmer"/"colder".
+- `select.house_priority_mode`: named room priorities, persisted and available to HA automations.
 - `button.house_warmer` and `button.house_colder`: change the house setpoint by ±0.5 °C.
 - `sensor.house_temperature` (weighted mean of member sensors) and `sensor.house_temperature_spread`
   (max − min of member sensors).
@@ -47,7 +48,7 @@ by domain and, for temperature, power and occupancy sources, device class.
   mode 60 min, sensor stale after 720 min (12 h), frozen after 4 h, median window `filter_minutes` 15 min, maximum sensor rate
   `max_rate` 0.5 °C/min, offset clamp ±3.0 °C, max offset change per interval 0.5 °C.
 
-## Control loop (v0.3.1)
+## Control loop (v0.4.0)
 
 Every control interval, and immediately when the house setpoint or mode changes:
 
@@ -102,7 +103,7 @@ Every control interval, and immediately when the house setpoint or mode changes:
    vetoes nonsense: no cooling when outdoors is below 10 °C, no heating when above 24 °C
    (both tunable). Every system gets the same mode. `off` turns every system off.
 3. Per-system offset, from a PI controller on the learned influence-weighted room error:
-   `e_j = Σ_i w_i β_ij (S − T_i) / Σ_i w_i β_ij`. Here `w_i` is the configured sensor weight,
+   `e_j = Σ_i w_i β_ij (S − T_i) / Σ_i w_i β_ij`. Here `w_i` is the active priority mode's sensor weight,
    and `β_ij` is the nonnegative blended heating/cooling coefficient, normalized per system.
    With neutral priors all systems start on the weighted house mean error. If all coefficients
    are near zero, or their rooms are unavailable, use the available house mean error.
@@ -192,7 +193,7 @@ loop. It checks every learned coefficient within 0.003 °C/interval of truth, ho
 0.5 °C throughout day two, spread improvement against learning disabled, useful learning within
 hours, and exploration active early but absent at the end.
 
-## Fan/vane learning (v0.3.2)
+## Fan/vane learning (v0.4.0)
 
 Pure `fans.py` implements a contextual UCB bandit per system and per action (`fan`, `swing`).
 Action options are read from each climate entity's `fan_modes` and `swing_modes` on every pass;
@@ -209,17 +210,26 @@ random tie breaks; thereafter select the largest `mean_reward + sqrt(2 ln(N+1)/n
 score ties. Systems/actions take turns through one global experiment scheduler.
 
 Context keys encode heat/cool, `floor(outdoor/5)*5` (including negative bands), and whether that
-system is heating/cooling. Unknown outdoor temperature offers no context. On each observation,
-compute `r = −Σ w_i(T_i−mean)²/Σw_i − λ(mean−S)²` using filtered reporting temperatures and the
-configured sensor weights. `fan_reward_lambda` is λ, default 1 (options: 0–100). Hold the selected
-setting for at least `fan_hold_minutes` (default 30, options: 1–1440), then update that arm's mean
-with the time-weighted reward over the complete hold. Observation rewards are held until the
-next pass. Selecting an already-current option sends nothing but still starts a full experiment.
+system is heating/cooling. Unknown outdoor temperature offers no context. On each observation, retain each clean filtered room's error
+`e_i = T_i − S` until the next pass. Integrate error and squared error over observed seconds
+in the full hold. Each arm stores `rooms[sensor] = {seconds, mean_error, mean_squared_error}`,
+merging clean windows by duration, plus its window sample count. As before, the fan learner
+has no forgetting. At selection and diagnostics time, compute current normalized priority weights
+among the arm's observed member rooms and score:
+
+`r = −(Σ w_i E[e_i²] − (Σ w_i E[e_i])²) − λ (Σ w_i E[e_i])²`.
+
+`fan_reward_lambda` is λ, default 1 (options: 0–100). This is the variance/mean-error reward
+expressed as room moments, so historical evidence can be reweighted without resetting it.
+Removed rooms do not contribute to scores. Legacy scalar-only arms load with empty room
+statistics and zero sample counts; other scheduler identities survive. `mean_reward` is a derived
+cache, recomputed under the current weights rather than used as permanent learning evidence.
+Hold the selected setting for at least `fan_hold_minutes` (default 30, options: 1–1440). Selecting an already-current option sends nothing but still starts a full experiment.
 Only one action of one system can be commanded in a hold window; other chosen settings remain
 fixed. The PI temperature controller continues tracking the house setpoint throughout.
 
 A sensor transient or missing/stale/not-reporting member with at least
-`minor_weight_share` of the total configured positive sensor weight (default 0.05),
+`minor_weight_share` of the total active-mode positive sensor weight (default 0.05),
 an HVAC mode switch, user house/physical
 setpoint change or selected-context change dirties the complete experiment. Events between ticks
 latch dirtiness; recovery before a tick cannot make it train. Dirty windows retain their deadline
@@ -230,12 +240,12 @@ Failures discard the window. Re-assert outside changes to chosen settings, resta
 hold; another action's re-assertion waits for the global deadline. Outside-change notices use the
 same two-minute echo grace as targets. The required preset path remains unchanged.
 
-Store retains option means/counts by context, chosen settings, scheduler cursor and active
+Store retains per-room error moments and window counts by context, chosen settings, scheduler cursor and active
 experiment identity, plus the fan-control switch. Restarts keep the fit but restart a full hold,
 never crediting unobserved downtime. Removed systems are pruned; new options start neutral.
 The existing reset-learning button resets this learner too. `sensor.house_fan_learning` attributes
 are `systems[entity][fan/swing][context]` with sampled `best` and `options[mode]` containing
-`mean_reward` and `samples`, plus `last_decision`. Unobserved contexts have no best. Confidence
+`mean_reward`, `samples` and `rooms`, plus `last_decision`. Unobserved contexts have no best. Confidence
 is mean `100*n/(n+10)` across discovered contexts, where n is the minimum option count in that
 context: an evidence-coverage indicator, not statistical certainty. The thermostat's `last_decision`
 also explains trying a setting to learn, the best so far with heat/cool and outdoor band, or an
@@ -269,7 +279,8 @@ dispatch, both switches, options selectors, between-pass contamination and Store
 - `learning.py`: pure online RLS, confidence blending, runtime integration and model persistence.
 - `reporting.py`: pure persisted value-change and HVAC activity tracking for frozen sensors.
 - `filtering.py`: pure bounded time-weighted median and generic transient rejection.
-- `climate.py`, `button.py`, `sensor.py`, `switch.py`, `config_flow.py`, `__init__.py`,
+- `priority.py`: mode membership reconciliation and active room weights.
+- `climate.py`, `button.py`, `sensor.py`, `switch.py`, `select.py`, `config_flow.py`, `__init__.py`,
   `coordinator.py`: thin HA wiring around the controller.
 - Tests: `tests/test_controller.py` (pure), plus HA tests with
   `pytest-homeassistant-custom-component` for setup, the config flow and the commands sent.
@@ -325,3 +336,31 @@ Deferring startup avoids the no-sensor fallback resetting them before integratio
 Regression tests round-trip distinct offsets/integrals for both systems through Store,
 startup and reload, and cover silent permanent steps, repeated minor transients,
 missing/not-reporting minor members and immediate quiet caps.
+
+
+## Priority modes (v0.4.0)
+
+Entry options hold `priority_modes`, a mapping from mode name to sensor-ID/weight mapping.
+Config-entry version 3 migrates the old per-sensor weights into one `balance` mode, preserving
+control output and all RLS state. New setups also start with balance. The options wizard's
+priority action adds, edits, renames or deletes modes, protecting the last mode. Ordinary
+sensor weight editing edits the active priority mode; explicit edit selects another mode.
+New modes start at 1 per member. Membership reconciliation adds new sensors at weight 1 to
+all modes and drops removed sensors from all modes. Legacy member weights remain compatible
+configuration metadata; all runtime weighted paths use the selected mode's mapping.
+
+`select.house_priority_mode` exposes names as options and persists the active name in Store.
+Selection runs an immediate non-training control pass, preserving RLS coefficients, covariance,
+counts, residuals and sampling baseline. RLS fits raw room dynamics independently of priorities.
+House mean, eligible spread, per-system PI error, fan scoring and `minor_weight_share` checks
+use the active weights. `climate.house.priority_mode`, `priority_weights` and `last_decision`
+expose the choice; its existing `active_mode` continues to mean HVAC heat/cool mode.
+Renaming preserves the active selection through a saved name mapping; deleting the active mode
+falls back to the first remaining mode. No built-in scheduler is added: ordinary HA automations
+call `select.select_option` (README includes time triggers). An override is another selection.
+
+Regression coverage checks v1/v2 migration and identical control commands, immediate select
+service effects on mean and both system errors with untouched learned state, Store and actual
+entry reloads, mode CRUD and last-mode protection, active weight editing, sensor membership,
+legacy scalar fan loading, time-weighted error moments and reversed fan ranking under two
+room priorities.

@@ -26,6 +26,7 @@ from .controller import ControlState, Device, Reading, control
 from .fans import FanLearning, quiet_modes
 from .filtering import SensorFilter
 from .learning import EffortTracker, Learning
+from .priority import members, modes
 from .reporting import Reporting
 
 _LOGGER = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ class HouseCoordinator(DataUpdateCoordinator):
     def __init__(self, hass, entry):
         super().__init__(hass, _LOGGER, name=DOMAIN, config_entry=entry)
         self.config = dict(entry.options or entry.data)
+        self.priority_mode = next(iter(modes(self.config)))
         self.state = ControlState()
         self.enabled = True
         self.fan_enabled = True
@@ -68,6 +70,10 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.raw_readings = {}
         self.startup_sensors = set(self.filters)
 
+    @property
+    def priority_weights(self):
+        return modes(self.config)[self.priority_mode]
+
     def new_learning(self):
         return Learning(
             [s["entity_id"] for s in self.config["sensors"]],
@@ -78,6 +84,11 @@ class HouseCoordinator(DataUpdateCoordinator):
 
     async def async_load(self):
         if saved := await self.store.async_load():
+            selected = saved.get("priority_mode")
+            if selected not in modes(self.config):
+                selected = self.config.get("priority_renames", {}).get(selected)
+            if selected in modes(self.config):
+                self.priority_mode = selected
             self.state = ControlState(**saved["state"])
             self.enabled = saved.get("enabled", True)
             self.fan_enabled = saved.get("fan_enabled", True)
@@ -138,7 +149,8 @@ class HouseCoordinator(DataUpdateCoordinator):
 
     def sensor_blocks_fans(self, entity_id):
         weights = {
-            m["entity_id"]: max(0, m.get("weight", 1)) for m in self.config["sensors"]
+            m["entity_id"]: max(0, m.get("weight", 1))
+            for m in members(self.config, self.priority_mode)
         }
         total = sum(weights.values())
         return total > 0 and weights.get(entity_id, 0) / total >= self.config.get(
@@ -456,7 +468,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 for sensor_filter in self.filters.values():
                     sensor_filter.finish_interval()
             decision = control(
-                self.config,
+                {**self.config, "sensors": members(self.config, self.priority_mode)},
                 self.state,
                 readings,
                 devices,
@@ -464,6 +476,9 @@ class HouseCoordinator(DataUpdateCoordinator):
                 outdoor,
                 self.enabled,
                 self.learning,
+            )
+            decision.explanation = (
+                f"Priority mode {self.priority_mode}. " + decision.explanation
             )
             for entity_id, sensor_filter in self.filters.items():
                 if sensor_filter.pending or sensor_filter.rejected:
@@ -510,7 +525,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 outdoor,
                 fan_systems,
                 clean_values,
-                {m["entity_id"]: m.get("weight", 1) for m in self.config["sensors"]},
+                self.priority_weights,
                 self.state.setpoint,
                 valid=fan_clean,
                 enabled=self.enabled and self.fan_enabled and self.state.mode != "off",
@@ -577,6 +592,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.samples = [s for s in self.samples if s["timestamp"] >= cutoff]
             await self.store.async_save(
                 {
+                    "priority_mode": self.priority_mode,
                     "state": asdict(self.state),
                     "enabled": self.enabled,
                     "fan_enabled": self.fan_enabled,
@@ -741,7 +757,14 @@ class HouseCoordinator(DataUpdateCoordinator):
         return f"{note} Starting House target is {self.state.setpoint:.1f} °C."
 
     async def async_change(
-        self, *, setpoint=None, delta=None, mode=None, enabled=None, fan_enabled=None
+        self,
+        *,
+        setpoint=None,
+        delta=None,
+        mode=None,
+        enabled=None,
+        fan_enabled=None,
+        priority_mode=None,
     ):
         # Mutations share the lock with in-flight commands.
         async with self.lock:
@@ -749,6 +772,10 @@ class HouseCoordinator(DataUpdateCoordinator):
                 v is not None for v in (delta, setpoint, mode, enabled, fan_enabled)
             ):
                 self.fans.invalidate()
+            if priority_mode is not None:
+                if priority_mode not in modes(self.config):
+                    raise ValueError("Unknown priority mode")
+                self.priority_mode = priority_mode
             if fan_enabled is not None:
                 self.fan_enabled = fan_enabled
             if delta is not None:

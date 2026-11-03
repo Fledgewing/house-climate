@@ -1,6 +1,7 @@
 """Pure bandit, scheduling, quiet limits and simulated physical house."""
 
 import json
+from copy import deepcopy
 from random import Random
 
 import pytest
@@ -41,7 +42,7 @@ def samples(model):
 def test_neutral_start_explores_every_option():
     model = FanLearning(rng=Random(7))
     arms = model.options("unit", "fan", "heat|0|1", ["a", "b", "c"])
-    assert list(arms.values()) == [{"mean_reward": 0, "samples": 0}] * 3
+    assert list(arms.values()) == [{"mean_reward": 0, "samples": 0, "rooms": {}}] * 3
     assert model.confidence_percent == 0
     systems = devices()
     seen = set()
@@ -348,7 +349,7 @@ def test_saved_excluded_arms_choices_and_window_are_dropped_on_load():
     restored = FanLearning(saved=saved)
     for action in ("fan", "swing"):
         assert restored.arms["unit"][action]["heat|0|1"] == {
-            "low": {"samples": 2, "mean_reward": -1}
+            "low": {"samples": 2, "mean_reward": -1, "rooms": {}}
         }
     assert restored.chosen == {"unit": {"swing": "low"}}
     assert restored.resume is None
@@ -358,3 +359,71 @@ def test_saved_excluded_arms_choices_and_window_are_dropped_on_load():
 def test_quiet_cap_uses_only_list_order_for_auto():
     assert quiet_modes(["low", "Auto", "high"], "low", True, "23:00") == ["low"]
     assert quiet_modes(["Auto", "low", "high"], "low", True, "23:00") == ["Auto", "low"]
+
+
+def test_room_moments_reweight_simulated_arms_without_relearning():
+    model = FanLearning(hold_minutes=1, rng=Random(3))
+    systems = {"unit": {"fan_modes": ["a", "b"], "fan_mode": "a"}}
+    weights = {"A": 9, "B": 1}
+    model.tick(0, "heat", 3, systems, {"A": 21, "B": 21}, weights, 21)
+    # Deterministic rooms: a keeps A on target, b keeps B on target.
+    for now in range(60, 6060, 60):
+        choice = model.window["choice"]
+        systems["unit"]["fan_mode"] = choice
+        values = {"A": 21, "B": 24} if choice == "a" else {"A": 24, "B": 21}
+        # Record the just-selected setting's response for the whole window.
+        model.window["reward"] = {room: value - 21 for room, value in values.items()}
+        model.tick(now, "heat", 3, systems, values, weights, 21)
+    arms = model.arms["unit"]["fan"]["heat|0|0"]
+    saved = deepcopy(model.to_dict())
+    assert model.choose(arms)[0] == "a"
+    assert arms["a"]["mean_reward"] == pytest.approx(-0.9)
+    model.weights = {"A": 1, "B": 9}
+    model.rescore()
+    # Equalize UCB counts to isolate the measured preference.
+    ranked = deepcopy(arms)
+    for arm in ranked.values():
+        arm["samples"] = 100
+    assert model.choose(ranked)[0] == "b"
+    assert arms["b"]["mean_reward"] == pytest.approx(-0.9)
+    for name in arms:
+        assert (
+            arms[name]["rooms"]
+            == saved["arms"]["unit"]["fan"]["heat|0|0"][name]["rooms"]
+        )
+        assert (
+            arms[name]["samples"]
+            == saved["arms"]["unit"]["fan"]["heat|0|0"][name]["samples"]
+        )
+
+
+def test_old_scalar_fan_arms_load_as_untried():
+    saved = {
+        "arms": {
+            "unit": {"fan": {"heat|0|1": {"low": {"mean_reward": -3, "samples": 40}}}}
+        }
+    }
+    restored = FanLearning(saved=saved)
+    assert restored.arms["unit"]["fan"]["heat|0|1"]["low"] == {
+        "rooms": {},
+        "samples": 0,
+        "mean_reward": 0,
+    }
+    assert saved["arms"]["unit"]["fan"]["heat|0|1"]["low"]["samples"] == 40
+
+
+def test_fan_moments_time_weighting_penalty_and_removed_room():
+    model = FanLearning(hold_minutes=1, penalty=2)
+    systems = {"unit": {"fan_modes": ["a"], "fan_mode": "a"}}
+    model.tick(0, "heat", 3, systems, {"A": 22, "B": 24}, {}, 21)
+    model.tick(15, "heat", 3, systems, {"A": 24, "B": 22}, {}, 21)
+    model.tick(60, "heat", 3, systems, {"A": 24, "B": 22}, {}, 21)
+    arm = model.arms["unit"]["fan"]["heat|0|0"]["a"]
+    assert arm["rooms"]["A"] == {
+        "seconds": 60,
+        "mean_error": 2.5,
+        "mean_squared_error": 7,
+    }
+    assert arm["mean_reward"] == pytest.approx(-9)
+    model.weights = {"A": 1}
+    assert model.score(arm) == pytest.approx(-13.25)

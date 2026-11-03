@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.3.0 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.4.0 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 It computes a weighted house temperature and learns how strongly each HVAC system affects each room. Separate PI offsets use those learned effects so systems push harder for the rooms they reach, helping the house mean track the setpoint while reducing temperature differences. All room/system pairs start equally; there are no configured room mappings. Learning begins helping within hours of informative runtime and continues adapting.
 
@@ -22,6 +22,52 @@ Alternatively, manually copy `custom_components/house_climate` from this reposit
 Use the integration's **Configure** options to add or remove sensors and systems, change weights or required presets, and edit tunables. Added sensors count in the house mean immediately, start with neutral learning priors, and learn independently; removed sensors lose their model rows. Removing a system stops controlling it and leaves its last device settings in place.
 
 Defaults: 5-minute control interval, 1 °C auto deadband, 60-minute minimum auto mode dwell, ±3 °C offset clamp, and 0.5 °C maximum offset change per interval. Cooling is vetoed below 10 °C outdoors; heating is vetoed above 24 °C. PI gains default to proportional 1.0 and integral 0.1 per interval. Explicit heat/cool requests take effect immediately, subject to the outdoor veto; minimum dwell applies to automatic heat/cool changes.
+
+## Room priority modes
+
+`select.house_priority_mode` selects a named set of room weights. The initial **balance**
+mode preserves your existing weights on upgrade. For example, create **night**, **day**
+and **guests** to reduce guest-room priority overnight and give those rooms equal priority
+when occupied. Weights are positive relative priorities; 1 and 3 mean a room contributes
+one third as much as the other room.
+
+In **Configure**, use **Priority mode action** to add, edit, rename or delete a mode.
+**configure** follows the usual sensor/system wizard and edits the active mode's weights;
+**edit** lets you choose another mode. Add/edit saves after the last sensor's weights;
+rename/delete saves immediately. The last mode cannot be deleted. New modes start with weights of 1; newly added sensors get
+weight 1 in every mode unless you edit it, and removing a sensor removes it from every mode.
+If the active mode is deleted, the first remaining mode becomes active.
+
+Selecting a mode runs control immediately and persists across restarts. It updates the house
+mean, per-system errors, fan rewards and the `minor_weight_share` health threshold. Spread
+remains the range of eligible room temperatures. Mode changes preserve thermal learning and
+fan room statistics; fan preferences are recomputed under the selected weights.
+`climate.house` attributes `priority_mode` and `priority_weights` show the current priorities,
+and `last_decision` names the mode. The existing `active_mode` attribute still means heat/cool.
+
+There is no built-in scheduler. Use ordinary Home Assistant automations calling
+`select.select_option`. After creating modes named **day** and **night**, for example:
+
+```yaml
+alias: House room priorities by time
+triggers:
+  - trigger: time
+    at: "07:00:00"
+    id: day
+  - trigger: time
+    at: "22:00:00"
+    id: night
+actions:
+  - action: select.select_option
+    target:
+      entity_id: select.house_priority_mode
+    data:
+      option: "{{ trigger.id }}"
+```
+
+A manual override is simply selecting a mode (for example **guests**) in the UI or with the
+same action. It remains selected until another selection, including the next scheduled one.
+Disable or condition the automation if you want the override to outlast the next schedule.
 
 ## Warmer / colder
 
@@ -79,8 +125,12 @@ Every learnable option starts equally; no speed or vane position is assumed to b
 
 A contextual UCB bandit learns separately for each system and action type, heat/cool mode,
 5 °C outdoor band, and running/idle status. It explores untried options, then balances measured
-reward with further exploration. Reward is `−weighted_variance − fan_reward_lambda ×
-(house_mean − setpoint)²`, averaged over the hold window using filtered room temperatures.
+reward with further exploration. Each arm stores per-room mean error versus setpoint and
+mean squared error, weighted by observed seconds across clean hold windows. Under the current
+normalized weights, reward is `−(Σ w·E[e²] − (Σ w·E[e])²) − λ·(Σ w·E[e])²`.
+These statistics survive priority changes and rewards are recomputed before choosing an arm.
+There is no fan-statistic forgetting (as in v0.3.2). Legacy scalar-only arms load with empty
+room statistics and zero samples so they can relearn; thermal learning is retained.
 `fan_reward_lambda` defaults to **1**. `fan_hold_minutes` defaults to **30 minutes**; a single
 global schedule holds each experiment before measuring and selecting the next action. Only one
 action of one system changes at a time. Required hold presets continue to be re-asserted.
@@ -97,7 +147,7 @@ the same global schedule; outside-change notices use the existing two-minute ech
 
 `sensor.house_fan_learning` shows evidence confidence as a percentage. Attributes under
 `systems → system entity → fan/swing → context` show the current sampled `best` setting and
-`options` with each option's `mean_reward` and `samples`. Context keys are `heat|0|1`, for example:
+`options` with each option's current `mean_reward`, `samples` and `rooms` error statistics. Context keys are `heat|0|1`, for example:
 heat, 0–5 °C outdoors, running. Confidence averages `n/(n+10)` across contexts, with `n` the least
 sampled option's count; it measures coverage, not statistical certainty. `last_decision` on both
 this sensor and the house thermostat explains exploration, the best setting so far, or re-assertion.
@@ -117,7 +167,7 @@ per pass; vanes have no quiet restriction.
 
 The integration persists the target, mode, integrators, offsets, and last mode-switch time in Home Assistant's `Store`, with `RestoreEntity` as a thermostat-state fallback. Each interval records every member sensor (including unavailable/stale readings), outdoor temperature, solar power, occupancy, and each system's observed mode, target, offset, and HVAC action. Observations are taken before commands. Records older than 30 days are pruned on each control run. Data lives in `.storage/house_climate.<entry_id>` under the HA config directory.
 
-The Store also persists model coefficients, covariance, confidence counts and fit errors. Restarting retains learning and begins a fresh runtime interval rather than guessing what happened while HA was stopped. Upgrading from 0.1.2 automatically migrates the config entry to version 2, removes obsolete room mappings, and retains other settings and control state.
+The Store also persists model coefficients, covariance, confidence counts and fit errors. Restarting retains learning and begins a fresh runtime interval rather than guessing what happened while HA was stopped. Config-entry version 3 stores named priority modes in entry options. Upgrades preserve existing sensor weights in balance, remove obsolete v1 room mappings, and retain other settings and control state. The active priority mode is stored alongside control state.
 
 ## Development
 

@@ -37,7 +37,8 @@ def reward(values, weights, setpoint, penalty=1):
 class FanLearning:
     """Equal zero-count priors, random tie breaks, UCB exploration.
 
-    Reward is the time-weighted mean of observed rewards over the full hold.
+    Arms retain time-weighted per-room error moments over clean holds.
+    Rewards are recomputed under current priorities; no thermal weights enter fits.
     A dirty window keeps its deadline but never trains. Restarts preserve arms
     and choices, then begin a fresh full hold without crediting downtime.
     """
@@ -62,6 +63,13 @@ class FanLearning:
         self.rng = rng or Random()
         saved = deepcopy(saved or {})
         self.arms = saved.get("arms", {})
+        for actions in self.arms.values():
+            for buckets in actions.values():
+                for arms in buckets.values():
+                    for arm in arms.values():
+                        if "rooms" not in arm:
+                            arm.update(rooms={}, samples=0, mean_reward=0.0)
+        self.weights = {}
         self.chosen = saved.get("chosen", {})
         self.cursor = saved.get("cursor", 0)
         self.window = None
@@ -111,8 +119,28 @@ class FanLearning:
         )
         modes = self.learnable_modes(modes)
         for mode in modes:
-            arms.setdefault(mode, {"mean_reward": 0.0, "samples": 0})
+            arms.setdefault(mode, {"mean_reward": 0.0, "samples": 0, "rooms": {}})
         return {m: arms[m] for m in modes}
+
+    def score(self, arm):
+        pairs = [
+            (r, self.weights.get(k, 0) if self.weights else 1)
+            for k, r in arm["rooms"].items()
+            if (self.weights.get(k, 0) if self.weights else 1) > 0 and r["seconds"] > 0
+        ]
+        total = sum(w for _, w in pairs)
+        if not total:
+            return 0.0
+        mean = sum(w * r["mean_error"] for r, w in pairs) / total
+        square = sum(w * r["mean_squared_error"] for r, w in pairs) / total
+        return -(square - mean**2) - self.penalty * mean**2
+
+    def rescore(self):
+        for actions in self.arms.values():
+            for buckets in actions.values():
+                for arms in buckets.values():
+                    for arm in arms.values():
+                        arm["mean_reward"] = self.score(arm)
 
     def choose(self, arms):
         unseen = [m for m, a in arms.items() if not a["samples"]]
@@ -145,6 +173,8 @@ class FanLearning:
         Caller supplies already restricted option lists and clean filtered rooms.
         Returns at most one (system, service, data) command, only if different.
         """
+        self.weights = dict(weights)
+        self.rescore()
         systems = {
             system: {
                 **device,
@@ -167,7 +197,9 @@ class FanLearning:
                 if modes:
                     self.options(system, action, bucket, modes)
                     candidates.append((system, action, bucket, modes))
-        sample = reward(values, weights, setpoint, self.penalty) if valid else None
+        sample = (
+            {k: v - setpoint for k, v in values.items()} if valid and values else None
+        )
         # Quiet limits take effect on this pass, interrupting any global hold.
         if enabled:
             for system, device in systems.items():
@@ -226,7 +258,12 @@ class FanLearning:
             )
             if not matching or setpoint != w["setpoint"]:
                 self.invalidate()
-            w["sum"] += w["reward"] * max(0, now - w["last"])
+            duration = max(0, now - w["last"])
+            for room, error in w["reward"].items():
+                stats = w["rooms"].setdefault(room, [0.0, 0.0, 0.0])
+                stats[0] += duration
+                stats[1] += duration * error
+                stats[2] += duration * error**2
             w["last"], w["reward"] = now, sample
         # Re-assert one outside change, then hold again before any other command.
         for system, action, bucket, modes in candidates:
@@ -252,9 +289,21 @@ class FanLearning:
             if not w["dirty"]:
                 arm = self.arms[w["system"]][w["action"]][w["bucket"]][w["choice"]]
                 arm["samples"] += 1
-                arm["mean_reward"] += (
-                    w["sum"] / (now - w["start"]) - arm["mean_reward"]
-                ) / arm["samples"]
+                for room, (seconds, error, squared) in w["rooms"].items():
+                    if not seconds:
+                        continue
+                    stats = arm["rooms"].setdefault(
+                        room, dict(seconds=0.0, mean_error=0.0, mean_squared_error=0.0)
+                    )
+                    total = stats["seconds"] + seconds
+                    stats["mean_error"] += (
+                        error - seconds * stats["mean_error"]
+                    ) / total
+                    stats["mean_squared_error"] += (
+                        squared - seconds * stats["mean_squared_error"]
+                    ) / total
+                    stats["seconds"] = total
+                arm["mean_reward"] = self.score(arm)
             self.window = None
         restricted = [
             c
@@ -294,7 +343,7 @@ class FanLearning:
             choice=choice,
             setpoint=setpoint,
             reward=sample,
-            sum=0,
+            rooms={},
             dirty=False,
         )
 
@@ -303,6 +352,7 @@ class FanLearning:
         return system, f"set_{action}_mode", {f"{action}_mode": choice}
 
     def diagnostics(self):
+        self.rescore()
         return {
             "systems": {
                 s: {

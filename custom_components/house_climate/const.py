@@ -1,7 +1,7 @@
 """Configuration defaults; entity IDs belong only in configuration."""
 
 DOMAIN = "house_climate"
-PLATFORMS = ["climate", "button", "sensor", "switch"]
+PLATFORMS = ["climate", "button", "sensor", "switch", "select"]
 DEFAULTS = {
     "sensors": [],
     "systems": [],

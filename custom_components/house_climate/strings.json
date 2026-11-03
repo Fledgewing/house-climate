@@ -12,7 +12,7 @@
       },
       "sensor": {
         "title": "Sensor weight and zone",
-        "description": "Configure {entity}. Weights must be positive.",
+        "description": "Configure {entity}. Weight applies to the mode being edited (the active mode by default). Weights must be positive.",
         "data": {
           "weight": "Weight",
           "zone": "Zone label (optional)"
@@ -57,11 +57,21 @@
           "quiet_start": "Quiet hours start",
           "quiet_end": "Quiet hours end"
         }
+      },
+      "priority": {
+        "title": "Priority modes",
+        "description": "Add, edit, rename or delete a room priority mode. Add/edit saves after entering the room weights; rename/delete saves immediately.",
+        "data": {
+          "mode": "Mode",
+          "name": "New name"
+        }
       }
     },
     "error": {
       "empty_selection": "Choose at least one sensor and system.",
-      "self_reference": "The integration cannot control or read its own entities."
+      "self_reference": "The integration cannot control or read its own entities.",
+      "invalid_mode_name": "Choose a nonempty, unique mode name.",
+      "last_mode": "The last mode cannot be deleted."
     },
     "abort": {
       "already_configured": "House Climate is already configured."
@@ -74,12 +84,13 @@
         "description": "Choose all member temperature sensors and controlled HVAC systems. Removing an entity here removes it from control.",
         "data": {
           "sensors": "Member temperature sensors",
-          "systems": "HVAC systems"
+          "systems": "HVAC systems",
+          "priority_action": "Priority mode action (configure edits active weights)"
         }
       },
       "sensor": {
         "title": "Sensor weight and zone",
-        "description": "Configure {entity}. Weights must be positive.",
+        "description": "Configure {entity}. Weight applies to the mode being edited (the active mode by default). Weights must be positive.",
         "data": {
           "weight": "Weight",
           "zone": "Zone label (optional)"
@@ -124,11 +135,21 @@
           "quiet_start": "Quiet hours start",
           "quiet_end": "Quiet hours end"
         }
+      },
+      "priority": {
+        "title": "Priority modes",
+        "description": "Add, edit, rename or delete a room priority mode. Add/edit saves after entering the room weights; rename/delete saves immediately.",
+        "data": {
+          "mode": "Mode",
+          "name": "New name"
+        }
       }
     },
     "error": {
       "empty_selection": "Choose at least one sensor and system.",
-      "self_reference": "The integration cannot control or read its own entities."
+      "self_reference": "The integration cannot control or read its own entities.",
+      "invalid_mode_name": "Choose a nonempty, unique mode name.",
+      "last_mode": "The last mode cannot be deleted."
     }
   },
   "issues": {

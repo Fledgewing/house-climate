@@ -553,7 +553,7 @@ async def test_v1_entry_migration(hass, settings, options):
     )
     entry.add_to_hass(hass)
     assert await async_migrate_entry(hass, entry)
-    assert entry.version == 2
+    assert entry.version == 3
     assert all("influence" not in s for s in entry.data["systems"])
     assert all("influence" not in s for s in entry.options.get("systems", []))
     assert entry.data["systems"][0]["preset"] == "manual"
@@ -1197,6 +1197,7 @@ async def test_minor_sensor_does_not_block_fan_samples(
     c, _, _ = await prepare_fans(hass, installed)
     c.fans.window["dirty"] = False  # Initial HVAC mode change is already observed.
     c.config["sensors"].append({"entity_id": "sensor.minor", "weight": 0.01})
+    c.config["priority_modes"]["balance"]["sensor.minor"] = 0.01
     c.filters["sensor.minor"] = SensorFilter()
     c.learning.reconcile(["sensor.room", "sensor.minor"], list(c.learning.systems))
     start = dt_util.utc_from_timestamp(c.fans.window["start"])
@@ -1342,3 +1343,215 @@ async def test_load_reconciles_configured_fan_exclusions(hass, installed):
     c.config["learn_exclude_modes"] = "auto, STRONG"
     await c.async_reset_learning()
     assert "strong" not in c.fans.arms["climate.ducted"]["fan"][bucket]
+
+
+async def test_priority_select_immediate_errors_learning_and_restart(hass, installed):
+    entry, _ = installed
+    from custom_components.house_climate.coordinator import HouseCoordinator
+
+    settings = deepcopy(dict(entry.options))
+    settings["sensors"].append({"entity_id": "sensor.other", "weight": 1})
+    settings["priority_modes"] = {
+        "balance": {"sensor.room": 3, "sensor.other": 1},
+        "guests": {"sensor.room": 1, "sensor.other": 3},
+    }
+    hass.states.async_set("sensor.other", "23", {"unit_of_measurement": "°C"})
+    hass.config_entries.async_update_entry(entry, options=settings)
+    await hass.async_block_till_done()
+    c = entry.runtime_data
+    await c.async_change(mode="heat", setpoint=21, enabled=True)
+    c.learning.update(
+        {"sensor.room": 19, "sensor.other": 23},
+        {"sensor.room": 19.1, "sensor.other": 23.1},
+        5,
+        {"climate.ducted": 1, "climate.split": 0},
+    )
+    for row in c.learning.rows.values():
+        row.theta[1:3] = [0.03, 0.03]
+    before = deepcopy(c.learning.to_dict())
+    await c.async_tick(record=False)
+    assert c.data.temperature == 20
+    assert "error +1.00" in c.data.explanation
+    await hass.services.async_call(
+        "select",
+        "select_option",
+        {"entity_id": "select.house_priority_mode", "option": "guests"},
+        blocking=True,
+    )
+    assert c.data.temperature == 22
+    assert c.data.explanation.count("error -1.00") == 2
+    assert c.learning.to_dict() == before
+    assert c.sensor_blocks_fans("sensor.other")
+    c.config["minor_weight_share"] = 0.5
+    assert c.sensor_blocks_fans("sensor.other")
+    assert not c.sensor_blocks_fans("sensor.room")
+    house = hass.states.get("climate.house")
+    assert house.attributes["priority_mode"] == "guests"
+    assert house.attributes["priority_weights"] == settings["priority_modes"]["guests"]
+    assert "Priority mode guests" in house.attributes["last_decision"]
+    assert hass.states.get("select.house_priority_mode").state == "guests"
+    restored = HouseCoordinator(hass, entry)
+    await restored.async_load()
+    assert restored.priority_mode == "guests"
+    assert restored.learning.to_dict() == before
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass.states.get("select.house_priority_mode").state == "guests"
+    assert hass.states.get("climate.house").attributes["current_temperature"] == 22
+    flow = hass.config_entries.options
+    result = await flow.async_init(entry.entry_id)
+    result = await flow.async_configure(
+        result["flow_id"],
+        {
+            "sensors": ["sensor.room", "sensor.other"],
+            "systems": ["climate.ducted", "climate.split"],
+            "priority_action": "rename",
+        },
+    )
+    result = await flow.async_configure(
+        result["flow_id"], {"mode": "guests", "name": "day"}
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+    assert hass.states.get("select.house_priority_mode").state == "day"
+    assert entry.runtime_data.learning.to_dict() == before
+    result = await flow.async_init(entry.entry_id)
+    result = await flow.async_configure(
+        result["flow_id"],
+        {
+            "sensors": ["sensor.room", "sensor.other"],
+            "systems": ["climate.ducted", "climate.split"],
+            "priority_action": "delete",
+        },
+    )
+    await flow.async_configure(result["flow_id"], {"mode": "day"})
+    await hass.async_block_till_done()
+    assert hass.states.get("select.house_priority_mode").state == "balance"
+    assert entry.runtime_data.learning.to_dict() == before
+
+
+@pytest.mark.parametrize("options", [False, True])
+async def test_v2_priority_migration_preserves_output(hass, settings, options):
+    from custom_components.house_climate import async_migrate_entry
+    from custom_components.house_climate.controller import Device, Reading, control
+    from custom_components.house_climate.priority import members
+
+    settings["sensors"] += [{"entity_id": "sensor.second", "weight": 4}]
+    configured = deepcopy(settings)
+    configured["sensors"][0]["weight"] = 2
+    entry = MockConfigEntry(
+        domain=DOMAIN, version=2, data=settings, options=configured if options else {}
+    )
+    entry.add_to_hass(hass)
+    original = dict(entry.options or entry.data)
+    devices = {s["entity_id"]: Device() for s in settings["systems"]}
+    readings = {"sensor.room": Reading(19), "sensor.second": Reading(23)}
+    before = control(original, ControlState(mode="heat"), readings, devices, 0)
+    assert await async_migrate_entry(hass, entry)
+    assert entry.options["priority_modes"] == {
+        "balance": {s["entity_id"]: s["weight"] for s in original["sensors"]}
+    }
+    after = control(
+        {**entry.options, "sensors": members(entry.options, "balance")},
+        ControlState(mode="heat"),
+        readings,
+        devices,
+        0,
+    )
+    assert after == before
+
+
+async def finish_priority_wizard(
+    flow, result, sensor_count=1, system_count=2, weight=2
+):
+    for _ in range(sensor_count):
+        assert result["step_id"] == "sensor"
+        result = await flow.async_configure(result["flow_id"], {"weight": weight})
+    if result["type"] == FlowResultType.CREATE_ENTRY:
+        return result
+    for _ in range(system_count):
+        result = await flow.async_configure(result["flow_id"], {"preset": ""})
+    tunables = {
+        k: v for k, v in DEFAULTS.items() if k not in ("sensors", "systems") and v != ""
+    }
+    return await flow.async_configure(result["flow_id"], tunables)
+
+
+async def test_priority_options_add_edit_rename_delete_last_protected(hass, settings):
+    entry = MockConfigEntry(domain=DOMAIN, data=settings, version=3)
+    entry.add_to_hass(hass)
+    flow = hass.config_entries.options
+    selection = {
+        "sensors": ["sensor.room"],
+        "systems": [s["entity_id"] for s in settings["systems"]],
+    }
+
+    async def action(name):
+        result = await flow.async_init(entry.entry_id)
+        return await flow.async_configure(
+            result["flow_id"], {**selection, "priority_action": name}
+        )
+
+    result = await action("delete")
+    result = await flow.async_configure(result["flow_id"], {"mode": "balance"})
+    assert result["errors"] == {"base": "last_mode"}
+    flow.async_abort(result["flow_id"])
+    result = await action("add")
+    result = await flow.async_configure(result["flow_id"], {"name": "balance"})
+    assert result["errors"] == {"base": "invalid_mode_name"}
+    result = await flow.async_configure(result["flow_id"], {"name": "guests"})
+    result = await finish_priority_wizard(flow, result, weight=5)
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert entry.options["priority_modes"] == {
+        "balance": {"sensor.room": 1},
+        "guests": {"sensor.room": 5},
+    }
+    result = await action("edit")
+    result = await flow.async_configure(result["flow_id"], {"mode": "guests"})
+    await finish_priority_wizard(flow, result, weight=8)
+    assert entry.options["priority_modes"]["guests"]["sensor.room"] == 8
+    result = await action("rename")
+    result = await flow.async_configure(
+        result["flow_id"], {"mode": "guests", "name": "day"}
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert entry.options["priority_modes"]["day"] == {"sensor.room": 8}
+    result = await action("delete")
+    result = await flow.async_configure(result["flow_id"], {"mode": "day"})
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert list(entry.options["priority_modes"]) == ["balance"]
+
+
+async def test_options_new_sensor_all_modes_and_default_edit_active(hass, settings):
+    settings["priority_modes"] = {
+        "balance": {"sensor.room": 1},
+        "night": {"sensor.room": 7},
+    }
+    entry = MockConfigEntry(domain=DOMAIN, data=settings, version=3)
+    entry.runtime_data = SimpleNamespace(priority_mode="night")
+    entry.add_to_hass(hass)
+    flow = hass.config_entries.options
+    result = await flow.async_init(entry.entry_id)
+    result = await flow.async_configure(
+        result["flow_id"],
+        {
+            "sensors": ["sensor.room", "sensor.new"],
+            "systems": [s["entity_id"] for s in settings["systems"]],
+        },
+    )
+    fields = {f.schema: f for f in result["data_schema"].schema}
+    assert fields["weight"].default() == 7
+    result = await flow.async_configure(result["flow_id"], {"weight": 9})
+    fields = {f.schema: f for f in result["data_schema"].schema}
+    assert fields["weight"].default() == 1
+    await finish_priority_wizard(flow, result, weight=1)
+    assert entry.options["priority_modes"] == {
+        "balance": {"sensor.room": 1, "sensor.new": 1},
+        "night": {"sensor.room": 9, "sensor.new": 1},
+    }
+    result = await flow.async_init(entry.entry_id)
+    await complete_flow(flow, result, ["sensor.new"], ["climate.ducted"])
+    assert entry.options["priority_modes"] == {
+        "balance": {"sensor.new": 1},
+        "night": {"sensor.new": 1},
+    }

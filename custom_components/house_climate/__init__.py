@@ -17,7 +17,12 @@ from .const import PLATFORMS
 
 async def async_setup_entry(hass: HomeAssistant, entry: HouseClimateEntry) -> bool:
     from .coordinator import HouseCoordinator
+    from .priority import modes
 
+    if "priority_modes" not in entry.options:
+        settings = dict(entry.options or entry.data)
+        settings["priority_modes"] = modes(settings)
+        hass.config_entries.async_update_entry(entry, options=settings)
     coordinator = entry.runtime_data = HouseCoordinator(hass, entry)
     await coordinator.async_load()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -49,8 +54,8 @@ async def async_unload_entry(hass, entry):
 
 
 async def async_migrate_entry(hass, entry):
-    """Remove v1 room mappings while preserving all other settings."""
-    if entry.version > 2:
+    """Remove v1 mappings and migrate legacy weights to balance in options."""
+    if entry.version > 3:
         return False
     if entry.version == 1:
 
@@ -67,4 +72,10 @@ async def async_migrate_entry(hass, entry):
         hass.config_entries.async_update_entry(
             entry, data=clean(entry.data), options=clean(entry.options), version=2
         )
+    if entry.version < 3:
+        from .priority import modes
+
+        settings = dict(entry.options or entry.data)
+        settings["priority_modes"] = modes(settings)
+        hass.config_entries.async_update_entry(entry, options=settings, version=3)
     return True

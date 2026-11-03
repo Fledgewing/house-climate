@@ -64,6 +64,8 @@ class HouseClimate(CoordinatorEntity, ClimateEntity, RestoreEntity):
             "raw_sensor_readings": self.coordinator.raw_readings,
             "filtered_sensor_readings": data.readings if data else {},
             "sensor_readings": data.readings if data else {},
+            "priority_mode": self.coordinator.priority_mode,
+            "priority_weights": self.coordinator.priority_weights,
             "active_mode": self.coordinator.state.active_mode,
         }
 
