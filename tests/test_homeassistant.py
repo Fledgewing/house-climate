@@ -250,7 +250,9 @@ async def test_warmer_commands_and_disabled(hass, installed):
     targets = {
         entity_id for entity_id, service, _ in calls if service == "set_temperature"
     }
-    assert targets == {"climate.ducted", "climate.split"}
+    # Own-sensor effort targets can stay saturated after a house target change.
+    assert targets <= {"climate.ducted", "climate.split"}
+    assert entry.runtime_data.state.setpoint == 19.5
     await hass.services.async_call(
         "switch",
         "turn_off",
@@ -396,7 +398,7 @@ async def test_external_changes_are_explained_and_reasserted(hass, installed):
         await hass.services.async_call(
             "climate",
             "set_temperature",
-            {"entity_id": "climate.ducted", "temperature": 18},
+            {"entity_id": "climate.ducted", "temperature": 16},
             blocking=True,
         )
         await hass.async_block_till_done()
@@ -930,7 +932,8 @@ async def test_real_house_transient_replay(hass, installed):
                             "living-room sensor transient ignored" in c.data.explanation
                         )
     assert max(temperatures) - min(temperatures) <= 0.5
-    assert max(targets) <= targets[0]
+    # Proportional efforts alternate adjacent target steps to avoid rounding bias.
+    assert max(targets) - min(targets) <= 0.5
     # Warmup rows learn; the cold and hot excursions add no contaminated rows.
     assert c.learning.rows["sensor.room"].samples == 3
     assert c.learning.rows["sensor.other"].samples == 8
@@ -1395,7 +1398,7 @@ async def test_priority_select_immediate_errors_learning_and_restart(hass, insta
     before = deepcopy(c.learning.to_dict())
     await c.async_tick(record=False)
     assert c.data.temperature == 20
-    assert "error +1.00" in c.data.explanation
+    assert "House 20.00" in c.data.explanation
     await hass.services.async_call(
         "select",
         "select_option",
@@ -1403,7 +1406,7 @@ async def test_priority_select_immediate_errors_learning_and_restart(hass, insta
         blocking=True,
     )
     assert c.data.temperature == 22
-    assert c.data.explanation.count("error -1.00") == 2
+    assert "House 22.00" in c.data.explanation
     assert c.learning.to_dict() == before
     assert c.sensor_blocks_fans("sensor.other")
     c.config["minor_weight_share"] = 0.5

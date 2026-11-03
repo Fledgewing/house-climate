@@ -47,9 +47,11 @@ by domain and, for temperature, power and occupancy sources, device class.
   occupancy sensor.
 - Tunables with defaults: control interval 5 min, mode-switch deadband 1.0 °C, minimum time in a
   mode 60 min, sensor stale after 720 min (12 h), frozen after 4 h, median window `filter_minutes` 15 min, maximum sensor rate
-  `max_rate` 0.5 °C/min, offset clamp ±3.0 °C, max offset change per interval 0.5 °C.
+  `max_rate` 0.5 °C/min, prediction horizon 45 min, own-sensor `run_margin` 1 °C,
+  effort hysteresis 0.05 and effort on/off dwell 5 min. Legacy offset clamp, slew and PI
+  gains remain readable for compatibility but no longer govern commands.
 
-## Control loop (v0.4.0)
+## Control loop (v0.5.2)
 
 Every control interval, and immediately when the house setpoint or mode changes:
 
@@ -103,16 +105,55 @@ Every control interval, and immediately when the house setpoint or mode changes:
    keep the current mode; never switch sooner than the minimum time in a mode. Outdoor temperature
    vetoes nonsense: no cooling when outdoors is below 10 °C, no heating when above 24 °C
    (both tunable). Every system gets the same mode. `off` turns every system off.
-3. Per-system offset, from a PI controller on the learned influence-weighted room error:
-   `e_j = Σ_i w_i β_ij (S − T_i) / Σ_i w_i β_ij`. Here `w_i` is the active priority mode's sensor weight,
-   and `β_ij` is the nonnegative blended heating/cooling coefficient, normalized per system.
-   With neutral priors all systems start on the weighted house mean error. If all coefficients
-   are near zero, or their rooms are unavailable, use the available house mean error.
-   Each system pushes harder for the rooms it actually reaches, reducing spread while tracking
-   the house target. `last_decision` lists the rooms driving each error, largest absolute
-   weighted contribution first. During initial learning, add the exploration offset described below.
-   Keep conditional integration/anti-windup, ±offset clamp, interval slew limit, 0.5 °C rounding,
-   and device min/max target limits.
+3. Joint allocation. The House setpoint S is the weighted house **average**. Minimize
+   each room's deviation from that average and the average's error from S together:
+
+   `J(u) = Σ_i w_i (T_hat_i − T_hat_mean)² + λ (T_hat_mean − S)²`.
+
+   Normalize the active positive room weights to sum to one. Reuse `fan_reward_lambda`
+   for λ (default 1). `learning.forecast` propagates each interval model
+   `ΔT_i = a_i(T_out − T_i) + Σ_j b_ij u_j + Σ_k e_ik source_k + c_i solar + d_i`
+   to the horizon (default 45 minutes), holding current outdoor, source states and solar
+   constant. Propagate losses every step; the resulting forecast is affine in effort.
+   Missing context omits that term. All nonnegative b coefficients use the existing
+   optimistic confidence blend, preserving their physical scale rather than normalizing
+   each system's room effects. Without learning, use the same neutral b prior for every pair.
+   No room mappings, individual room targets or overshoot ceilings enter the objective.
+
+   Solve this small convex box problem using up to 200 cyclic exact coordinate minimizations,
+   stopping when effort changes fall below 1e-9. Heat efforts are 0..1; cool efforts −1..0.
+   Unavailable systems have no variable. With no learned positive reach, an actuator gets
+   zero effort instead of inventing reach from a cold room's error.
+
+   A single persisted mean-error integral biases S by at most ±1 °C. Its separate
+   `mean_integral_gain` defaults to 0.001 per scheduled interval; immediate requests do not
+   integrate. Conditional integration stops increasing the bias when the predicted mean
+   cannot follow it in the requested direction (0.05 °C² tolerance). Old per-system PI
+   integrals remain loadable but are unused. This keeps upgrades from applying old PI
+   gains or room errors to the joint objective.
+
+   Translate effort magnitude q to `own_current_temperature + direction × run_margin × (2q−1)`.
+   Thus full heat commands the system's own reading +1 °C and zero heat its own reading −1 °C;
+   cooling mirrors this. Intermediate efforts provide proportional targets for modulating
+   units. If the own sensor is missing, explicitly report using the house mean as a proxy.
+   Retain effort hysteresis and minimum on/off dwell (defaults 0.05 and 5 min). A scheduled
+   pass can cross the own sensor in either direction regardless of old house offsets or slew.
+   Round to the advertised target step (fallback 0.5 °C) and clamp to device min/max.
+   Offsets remain diagnostics: actual commanded target minus the house setpoint.
+
+   Cycling thermostats may deliver a different duty fraction from the proportional target.
+   Close that actuator loop using the previous requested effort and measured action runtime:
+   adjust a persisted drive bias by 0.1 times their difference, bounded to ±0.5 effort.
+   Apply it only to intermediate efforts; full on/off endpoints stay intact. Unknown runtime,
+   immediate requests and held excitation do not train it. Carry the bounded target-rounding
+   remainder into later scheduled passes so coarse target steps do not create a permanent
+   effort bias. Repeated immediate calls reuse the same rounding adjustment. A held excitation
+   keeps its exact target and suspends this remainder until normal allocation resumes.
+   Normal dither and inactivity excitation still apply, bounded in effort/device space.
+
+   `last_decision` names each system's on/low effort, the rooms its learned reach can lift/cool
+   toward the average, and the room above/below that average driving restraint. Room and device
+   friendly names are used when available; the implementation contains no house-specific names.
 4. Run the fan/vane scheduler described below, adding at most one changed fan/vane command.
    Write only what changed: `climate.set_hvac_mode`, then `climate.set_temperature`. For a system with a
    configured required preset, re-assert that preset if it has left it.
@@ -154,8 +195,8 @@ invalidate that interval. Sampling only the action at a pass would miss short cy
 The forgetting factor defaults to 0.998 per valid row sample. Effective activity counts follow
 `n_ij ← 0.998 n_ij + 1[u_j ≠ 0]`. Confidence is `n/(n+N0)` with `N0 = 24` by default (about two
 hours of active 5-minute samples to give learned and prior coefficients equal weight).
-Control blends `confidence × learned_b + (1 − confidence) × system_prior`, clips negative results to
-zero, then normalizes per system. `system_prior` is the confidence-weighted mean raw learned b
+Control blends `confidence × learned_b + (1 − confidence) × system_prior` and clips negative results to
+zero. Joint prediction uses those physical coefficients directly; normalized per-system influences remain diagnostic. `system_prior` is the confidence-weighted mean raw learned b
 over that system's sensors with nonzero runtime confidence, falling back to 0.03 only when
 none has evidence. Unexplored pairs therefore inherit measured system reach rather than
 being mistaken for weak influence. Learning starts affecting control from the first valid sample;
@@ -165,8 +206,8 @@ that two always-synchronized systems have been identified separately.
 
 To distinguish system effects, while a system's minimum room confidence is below `explore_threshold` (default 0.8), add a
 ±0.5 °C square-wave offset of period two hours, with system k shifted by k/N of a period. Its
-amplitude fades linearly to zero at the confidence threshold. This stays inside the existing clamp and slew
-limits, and `last_decision` says `exploring` while it is active. Off mode and observe-only control
+amplitude fades linearly to zero at the confidence threshold. It perturbs proportional effort within
+0..1 magnitude and device limits, and `last_decision` says `exploring` while it is active. Off mode and observe-only control
 send no exploration commands. Adding a room can restart exploration while its new row learns.
 
 A missing/nonfinite/stale/not-reporting room reading at either interval endpoint skips only that room's sample. Excluded rows retain all coefficients, covariance, counts and fit errors unchanged; their confidence also does not drive control exploration.
@@ -189,7 +230,7 @@ Its `systems[system_entity][sensor_entity]` attributes expose raw `b`, `blended_
 `influence`, confidence percent and `effective_samples`. Its `sensors[sensor_entity]` attributes
 expose `a` (heat loss), `c` (sun gain), `d`, `fit_error` (forgetting-weighted RMS prediction error
 in °C), and `samples` (valid updates). Press `button.house_reset_learning` to reset the model and
-confidence to neutral priors; house target, mode and PI control state remain in place.
+confidence to neutral priors; house target, mode and control state remain in place.
 
 The seeded two-day test uses two systems and six rooms, a nonuniform response matrix, outdoor
 5 °C with a day/night swing, solar gain, and cycling thermostats with the real controller in the
@@ -230,7 +271,7 @@ statistics and zero sample counts; other scheduler identities survive. `mean_rew
 cache, recomputed under the current weights rather than used as permanent learning evidence.
 Hold the selected setting for at least `fan_hold_minutes` (default 30, options: 1–1440). Selecting an already-current option sends nothing but still starts a full experiment.
 Only one action of one system can be commanded in a hold window; other chosen settings remain
-fixed. The PI temperature controller continues tracking the house setpoint throughout.
+fixed. The joint temperature allocator continues tracking the house setpoint throughout.
 
 A missing/stale/not-reporting member with at least
 `minor_weight_share` of the total active-mode positive sensor weight (default 0.05),
@@ -359,7 +400,7 @@ configuration metadata; all runtime weighted paths use the selected mode's mappi
 `select.house_priority_mode` exposes names as options and persists the active name in Store.
 Selection runs an immediate non-training control pass, preserving RLS coefficients, covariance,
 counts, residuals and sampling baseline. RLS fits raw room dynamics independently of priorities.
-House mean, eligible spread, per-system PI error, fan scoring and `minor_weight_share` checks
+House mean, eligible spread, joint thermal allocation, fan scoring and `minor_weight_share` checks
 use the active weights. `climate.house.priority_mode`, `priority_weights` and `last_decision`
 expose the choice; its existing `active_mode` continues to mean HVAC heat/cool mode.
 Renaming preserves the active selection through a saved name mapping; deleting the active mode
@@ -367,7 +408,7 @@ falls back to the first remaining mode. No built-in scheduler is added: ordinary
 call `select.select_option` (README includes time triggers). An override is another selection.
 
 Regression coverage checks v1/v2 migration and identical control commands, immediate select
-service effects on mean and both system errors with untouched learned state, Store and actual
+service effects on mean and joint allocation with untouched learned state, Store and actual
 entry reloads, mode CRUD and last-mode protection, active weight editing, sensor membership,
 legacy scalar fan loading, time-weighted error moments and reversed fan ranking under two
 room priorities.
@@ -386,7 +427,7 @@ learning eligibility checks. Corrections preserve the global hold rule (quiet ca
 interrupt it), send at most one changed setting per pass, and collect no invalid reward.
 Each paused return states its cause, including sensor IDs and missing outdoor readings;
 fan sensor diagnostics expose `wait_reason` and the active `window` with its dirty reason.
-Track in-flight temperature commands so PI adjustments do not masquerade as user changes.
+Track in-flight temperature commands so target adjustments do not masquerade as user changes.
 
 Regression coverage reuses the v0.2.2 minute replay every 40 minutes for four hours with
 a 0.5-weight member above `minor_weight_share`, completing eight fan windows despite
@@ -406,16 +447,16 @@ positive-weight member has confidence below `explore_threshold` (default 0.8), a
 not actually heated/cooled for `excite_after_minutes` (default 120), start one global excitation.
 The weighted house mean must be below setpoint in heat or above in cool. Set the target to the
 system's own `current_temperature` plus 1 °C in heat or minus 1 °C in cool, rounded to 0.5 °C
-and bounded by device limits and the existing house offset clamp. The excitation deliberately
-bypasses the normal PI slew limit to reach a target that can start the device; hold that target
-and freeze its integrator. Other systems continue normal control.
+and bounded by device limits. In v0.5.2 the margin follows `run_margin`, and house-relative
+clamps/slew no longer constrain any effort target. Hold the excitation target while other
+systems continue joint control.
 
 Hold until `excite_minutes` (default 30) of reported matching heating/cooling action have
 accumulated, or 60 wall-clock minutes pass. Action transitions between ticks count; idle,
 unknown and unavailable time do not. Abort on control off, mode change, unavailable system,
 missing house readings, or the house reaching/passing setpoint. A completed/aborted experiment
 waits another inactivity interval before retrying that system, allowing other systems a turn.
-Normal PI control then resumes with its usual slew limit. Names in `last_decision` read
+Normal joint allocation then resumes. Names in `last_decision` read
 “exploring: running <name> to learn which rooms it reaches”. All three tunables are in options;
 setting the threshold to zero disables thermal exploration, including dither.
 
@@ -611,3 +652,44 @@ unchanged. Returning the AC one week later reuses its saved model after 4 h.
 Tests also cover context/margin/coverage gates, eviction, old Store compatibility,
 reconciliation, independent rooms, real HA buttons/switch, deadline restoration,
 repair creation/clearing and sensor entity removal.
+
+
+## 0.5.2 regression evidence and test changes
+
+The shared-local-sensor replay starts living at 24.5 °C, downstairs at 19.4 °C and guest at
+18.7 °C, weighted 1:2:2, targeting a house average of 22.5 °C. True per-interval effects are
+A=[0.85,0.15,0.15] and B=[0.30,0.40,0.40]; both thermostats sense living. A has 200 effective
+samples per room; B has 80 in living and only one in each cold room, with cold-room raw b=0.03.
+Passive losses are chosen to admit a uniform 22.5 °C equilibrium with B at half duty, outdoors
+7 °C. Binary thermostats run in one-minute physical steps; RLS learns the observed fractions.
+These dynamics and weights are test fixtures, never controller configuration or assumptions.
+
+On the first pass A's target is 1.0 °C below its own sensor and B's 0.5 °C above. At 12 hours,
+weighted mean is **22.6295 °C** and weighted standard deviation **0.4381 °C**. With B unavailable,
+the same house reaches mean **15.2539 °C**, weighted standard deviation **7.2731 °C**, peak
+**7.3378 °C** at 12 hours. A alone cannot equalize or hold this house: its poor reach cannot
+justify indefinitely heating living. At seven days standard deviation is **8.3400 °C**, peak
+**8.3697 °C**, and the last day's range is **0.1316 °C**. Heat/cool grid searches separately
+verify the remaining actuator's J minimum for λ=0,1,4; a two-actuator grid verifies joint optimality.
+Tests also exercise outdoor loss, source, solar and drift contributions to the forecast.
+
+The existing seeded two-day physical house retains its response matrix, losses, noise seed,
+weather and cycling thermostat duty law. It now reports each thermostat's living-room sensor,
+supplies current solar to prediction and feeds measured runtime back into effort translation.
+The pre-change v0.5.1 final max−min spread was **0.152566 °C**; v0.5.2 is **0.151194 °C**
+(learning disabled: **7.736648 °C**). Day-two mean range is **20.9450–21.0796 °C**, target 21 °C.
+The original coefficient, convergence and exploration assertions remain, with an explicit
+no-regression bound against the recorded v0.5.1 final spread.
+
+Updated old assertions in `test_controller.py` replace independent PI/slew/house-relative target
+expectations with own-sensor crossings, mean integration, effort dwell and device limits.
+`test_learning.py` replaces independent-error/offset diagnostics and obsolete slew/clamp tests
+with joint allocation and bounded exploration checks. `test_excitation.py` mirrors own-sensor
+margins without the obsolete house clamp; its v0.4.1 comparison now freezes the historical PI
+law as well as its prior blend, so the comparison actually remains v0.4.1. The current late-sensor
+replay starts B at minute zero and ends at weighted standard deviation **0.8438 °C**, versus
+**2.4516 °C** for that historical controller. `test_homeassistant.py` allows unchanged saturated
+effort targets after warmer requests, changes the outside-change fixture to a value distinct from
+the new off-effort target, checks joint/mean diagnostics on priority changes, and allows adjacent
+rounding steps during the filtered transient replay. Sensor filtering/learning assertions remain.
+All results are deterministic simulations, not measured performance in the house.

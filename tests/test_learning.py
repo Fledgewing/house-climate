@@ -100,7 +100,7 @@ def test_neutral_weights_fallback_and_dither():
         0,
         learning=model,
     )
-    assert "error +0.00" in result.explanation
+    assert "x low (effort 0.00)" in result.explanation
     assert "exploring" not in result.explanation
 
 
@@ -138,10 +138,13 @@ def simulate(enabled=True):
     runtime = EffortTracker()
     runtime.finish(dict.fromkeys(SYSTEMS, "idle"), 0)
     losses = [(b[0] * 0.5 + b[1] * 0.25) / 16 for b in TRUE_B]
+    efforts = None
     for step in range(576):
         now = step * 300
         outdoor = 5 + 2 * math.sin(2 * math.pi * step / 288)
         solar = max(0, math.sin(2 * math.pi * (step % 288 - 72) / 288)) * 3
+        for device in devices.values():
+            device.current_temperature = temperatures[0]
         decision = control(
             config,
             state,
@@ -150,6 +153,8 @@ def simulate(enabled=True):
             now,
             outdoor,
             learning=model if enabled else None,
+            solar=solar,
+            measured_efforts=efforts,
         )
         for system, service, data in decision.commands:
             if service == "set_temperature":
@@ -211,6 +216,7 @@ def test_two_day_closed_loop():
         assert actual == pytest.approx(expected, abs=0.003)
     assert max(abs(t - 21) for t in means[288:]) <= 0.5
     assert spreads[-1] < baseline[-1]
+    assert spreads[-1] <= 0.152566  # v0.5.1 final spread, same seeded physical house.
     # Four hours: learned weights are already much closer than neutral priors.
     prior_error = sum(abs(b - PRIOR_B) for row in TRUE_B for b in row)
     early_error = sum(
@@ -260,20 +266,20 @@ def test_learned_error_uses_sensor_weights_and_preserves_safeguards():
         "systems": [{"entity_id": "one"}, {"entity_id": "two"}],
     }
     state = ControlState(mode="heat")
-    devices = {s: Device(mode="heat") for s in model.systems}
+    devices = {s: Device(mode="heat", current_temperature=21) for s in model.systems}
     readings = {"cold": Reading(19), "warm": Reading(23)}
     decision = control(config, state, readings, devices, 0, learning=model)
-    assert state.offsets == {"one": 0.5, "two": -0.5}
-    assert "driven by cold, warm" in decision.explanation
-    assert "driven by warm, cold" in decision.explanation
+    assert state.efforts["one"] > state.efforts["two"]
+    assert state.offsets["one"] > 0
+    assert state.offsets["two"] < 0
+    assert "lifts cold toward the average" in decision.explanation
+    assert "warm is" in decision.explanation
     for step in range(1, 30):
-        before = dict(state.offsets)
         control(config, state, readings, devices, step * 300, learning=model)
-        assert all(abs(state.offsets[s] - before[s]) <= 0.5 for s in devices)
-        assert all(abs(offset) <= 3 for offset in state.offsets.values())
+        assert all(20 <= 21 + offset <= 22 for offset in state.offsets.values())
 
 
-def test_exploration_obeys_clamp_slew_and_immediate_calls():
+def test_exploration_is_effort_bounded_and_observe_only():
     model = Learning(["room"], ["one", "two"])
     config = {
         "sensors": [{"entity_id": "room"}],
@@ -282,14 +288,14 @@ def test_exploration_obeys_clamp_slew_and_immediate_calls():
     }
     state = ControlState(mode="heat")
     readings = {"room": Reading(21)}
-    devices = {s: Device(mode="heat") for s in model.systems}
+    devices = {s: Device(mode="heat", current_temperature=21) for s in model.systems}
     decision = control(config, state, readings, devices, 0, learning=model)
     assert "exploring" in decision.explanation
-    assert state.offsets == {"one": 0.5, "two": -0.5}
+    assert state.offsets == {"one": -0.5, "two": -1}
     control(config, state, readings, devices, 1, learning=model)
-    assert state.offsets == {"one": 0.5, "two": -0.5}
+    assert state.offsets == {"one": -0.5, "two": -1}
     control(config, state, readings, devices, 3600, learning=model)
-    assert state.offsets == {"one": 0, "two": 0}
+    assert all(-1 <= offset <= 1 for offset in state.offsets.values())
     assert not control(
         config, state, readings, devices, 3900, enabled=False, learning=model
     ).commands
@@ -312,4 +318,4 @@ def test_missing_influential_room_reports_house_fallback():
         0,
         learning=model,
     )
-    assert "error +1.00 °C driven by a" in decision.explanation
+    assert "one low (effort 0.00)" in decision.explanation

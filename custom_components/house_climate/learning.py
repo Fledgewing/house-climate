@@ -481,6 +481,37 @@ class Learning:
         b = self.rows[sensor].theta[self.systems.index(system) + 1]
         return confidence * b + (1 - confidence) * self.system_prior(system)
 
+    def forecast(
+        self, sensor, temperature, systems, steps, outdoor=None, solar=0, sources=None
+    ):
+        """Affine horizon prediction for constant efforts and current context.
+
+        Uncertain effects retain the optimistic system-mean blend. Passive
+        losses are propagated each interval, rather than extrapolated linearly.
+        Missing outdoor context omits its term; missing solar/sources use zero.
+        """
+        row = self.rows[sensor]
+        a = row.theta[0] if outdoor is not None else 0
+        background = a * outdoor if outdoor is not None else 0
+        background += row.theta[-2] * (solar or 0) + row.theta[-1]
+        background += sum(
+            row.theta[1 + len(self.systems) + k] * (sources or {}).get(source, 0)
+            for k, source in enumerate(self.sources)
+        )
+        retention = 1 - a
+        gain = sum(retention**k for k in range(steps))
+        return (
+            retention**steps * temperature + gain * background,
+            [
+                gain
+                * max(
+                    0,
+                    self.blended(sensor, system) if system in self.systems else PRIOR_B,
+                )
+                for system in systems
+            ],
+        )
+
     def influences(self, system, sensors=None):
         positive = {
             s: max(0, self.blended(s, system))

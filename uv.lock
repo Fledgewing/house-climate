@@ -1276,7 +1276,7 @@ wheels = [
 
 [[package]]
 name = "house-climate"
-version = "0.3.1"
+version = "0.5.2"
 source = { virtual = "." }
 
 [package.dev-dependencies]

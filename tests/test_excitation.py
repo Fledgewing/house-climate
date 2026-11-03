@@ -2,7 +2,7 @@
 
 from copy import deepcopy
 from dataclasses import asdict
-from math import sqrt
+from math import floor, sqrt
 
 import pytest
 
@@ -138,9 +138,7 @@ def test_excitation_conditions(reason):
     assert not state.excitation
 
 
-@pytest.mark.parametrize(
-    "mode,local,expected", [("heat", 26, 25.5), ("cool", 18, 19.5)]
-)
+@pytest.mark.parametrize("mode,local,expected", [("heat", 26, 27), ("cool", 18, 17)])
 def test_excitation_clamp_cooling_and_device_limits(mode, local, expected):
     parts = setup(mode)
     _, state, _, devices, readings = parts
@@ -196,6 +194,47 @@ class LegacyLearning(Learning):
         )
 
 
+def legacy_control(config, state, readings, devices, now, outdoor=None, learning=None):
+    """Frozen v0.4.1 PI target law for the historical comparison only."""
+    from custom_components.house_climate.controller import Decision, clamp, mean
+
+    values = {r: reading.value for r, reading in readings.items()}
+    dt = int(state.last_update is None or now - state.last_update >= 300)
+    commands = []
+    for system in learning.systems:
+        influence = learning.influences(system)
+        members = [
+            {**m, "weight": m.get("weight", 1) * influence.get(m["entity_id"], 0)}
+            for m in config["sensors"]
+        ]
+        local = mean(values, members) or mean(values, config["sensors"])
+        error = state.setpoint - local
+        old = state.offsets.get(system, 0)
+        candidate = state.integrals.get(system, 0) + 0.1 * error * dt
+        raw = error + candidate + learning.dither(system, now, values.keys())
+        bounded = clamp(clamp(raw, -3, 3), old - 0.5 * dt, old + 0.5 * dt)
+        if (raw - bounded) * error <= 0:
+            state.integrals[system] = candidate
+        offset = clamp(floor(bounded * 2 + 0.5) / 2, -3, 3)
+        state.offsets[system] = offset
+        target = clamp(
+            floor((state.setpoint + offset) * 2 + 0.5) / 2,
+            devices[system].minimum,
+            devices[system].maximum,
+        )
+        if target != devices[system].temperature:
+            commands.append((system, "set_temperature", {"temperature": target}))
+    if dt:
+        state.last_update = now
+    return Decision(
+        mean(values, config["sensors"]),
+        max(values.values()) - min(values.values()),
+        values,
+        commands,
+        "",
+    )
+
+
 def simulate_late_sensors(legacy=False):
     rooms, systems = ["living", "living_other", "downstairs", "guest"], ["a", "b"]
     truth = [[0.50, 0.26], [0.50, 0.50], [0.005, 0.40], [0.004, 0.45]]
@@ -232,7 +271,7 @@ def simulate_late_sensors(legacy=False):
         # much stronger reach is unknown because these sensors just joined.
         devices["a"].current_temperature = temperatures[0] - 4.5
         devices["b"].current_temperature = temperatures[0]
-        result = control(
+        result = (legacy_control if legacy else control)(
             config,
             state,
             dict(zip(rooms, map(Reading, temperatures))),

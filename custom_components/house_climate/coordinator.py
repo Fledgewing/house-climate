@@ -505,6 +505,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                     hvac_action=entity.attributes.get("hvac_action"),
                     current_temperature=self.number(entity_id, "current_temperature"),
                     name=entity.name,
+                    step=self.number(entity_id, "target_temp_step") or 0.5,
                 )
             adoption = ""
             if not self.initialized:
@@ -607,7 +608,20 @@ class HouseCoordinator(DataUpdateCoordinator):
             if not fan_clean:
                 self.fans.invalidate("; ".join(fan_problems))
             decision = control(
-                {**self.config, "sensors": members(self.config, self.priority_mode)},
+                {
+                    **self.config,
+                    "sensors": [
+                        {
+                            **member,
+                            "name": getattr(
+                                self.hass.states.get(member["entity_id"]),
+                                "name",
+                                member["entity_id"],
+                            ),
+                        }
+                        for member in members(self.config, self.priority_mode)
+                    ],
+                },
                 self.state,
                 readings,
                 devices,
@@ -615,6 +629,12 @@ class HouseCoordinator(DataUpdateCoordinator):
                 outdoor,
                 self.enabled,
                 self.learning,
+                solar=solar,
+                measured_efforts=efforts if record else None,
+                sources={
+                    source["entity_id"]: float(self.source_action(source) == "heating")
+                    for source in self.config.get("extra_heat_sources", [])
+                },
             )
             decision.explanation = (
                 f"Priority mode {self.priority_mode}. " + decision.explanation
