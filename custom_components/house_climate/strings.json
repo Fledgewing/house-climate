@@ -24,7 +24,11 @@
         "description": "Set a hold preset for {entity}, such as manual, when required by the device. Room effects are learned automatically.",
         "data": {
           "preset": "Required preset (optional)",
-          "quiet_max_fan": "Quiet hours maximum fan (list order)"
+          "quiet_max_fan": "Quiet hours maximum fan (list order)",
+          "min_run_minutes": "Minimum reported run (minutes)",
+          "min_off_minutes": "Minimum reported off time (minutes)",
+          "max_starts_per_hour": "Maximum starts per hour",
+          "modulating": "Modulating target (default: target step below 0.5 \u00b0C)"
         }
       },
       "tunables": {
@@ -72,7 +76,13 @@
           "control_horizon_minutes": "Prediction horizon (minutes)",
           "effort_hysteresis": "Effort switching hysteresis",
           "effort_dwell_minutes": "Minimum effort on/off dwell (minutes)",
-          "mean_integral_gain": "House mean integral gain"
+          "mean_integral_gain": "House mean integral gain",
+          "min_run_minutes": "Minimum reported run (minutes)",
+          "min_off_minutes": "Minimum reported off time (minutes)",
+          "max_starts_per_hour": "Maximum starts per hour",
+          "switch_penalty": "Start/stop objective cost",
+          "effort_change_penalty": "Effort movement objective cost",
+          "comfort_band": "Total comfort band (\u00b0C)"
         }
       },
       "priority": {
@@ -127,7 +137,11 @@
         "description": "Set a hold preset for {entity}, such as manual, when required by the device. Room effects are learned automatically.",
         "data": {
           "preset": "Required preset (optional)",
-          "quiet_max_fan": "Quiet hours maximum fan (list order)"
+          "quiet_max_fan": "Quiet hours maximum fan (list order)",
+          "min_run_minutes": "Minimum reported run (minutes)",
+          "min_off_minutes": "Minimum reported off time (minutes)",
+          "max_starts_per_hour": "Maximum starts per hour",
+          "modulating": "Modulating target (default: target step below 0.5 \u00b0C)"
         }
       },
       "tunables": {
@@ -175,7 +189,13 @@
           "control_horizon_minutes": "Prediction horizon (minutes)",
           "effort_hysteresis": "Effort switching hysteresis",
           "effort_dwell_minutes": "Minimum effort on/off dwell (minutes)",
-          "mean_integral_gain": "House mean integral gain"
+          "mean_integral_gain": "House mean integral gain",
+          "min_run_minutes": "Minimum reported run (minutes)",
+          "min_off_minutes": "Minimum reported off time (minutes)",
+          "max_starts_per_hour": "Maximum starts per hour",
+          "switch_penalty": "Start/stop objective cost",
+          "effort_change_penalty": "Effort movement objective cost",
+          "comfort_band": "Total comfort band (\u00b0C)"
         }
       },
       "priority": {

@@ -8,6 +8,7 @@ from homeassistant.components.climate import (
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -69,6 +70,12 @@ class HouseClimate(CoordinatorEntity, ClimateEntity, RestoreEntity):
             "sensor_readings": data.readings if data else {},
             "priority_mode": self.coordinator.priority_mode,
             "priority_weights": self.coordinator.priority_weights,
+            "cycling": {
+                system["entity_id"]: self.coordinator.state.cycling_status(
+                    system["entity_id"], dt_util.utcnow().timestamp()
+                )
+                for system in self.coordinator.config["systems"]
+            },
             "active_mode": self.coordinator.state.active_mode,
         }
 

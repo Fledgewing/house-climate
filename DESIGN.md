@@ -48,10 +48,13 @@ by domain and, for temperature, power and occupancy sources, device class.
 - Tunables with defaults: control interval 5 min, mode-switch deadband 1.0 °C, minimum time in a
   mode 60 min, sensor stale after 720 min (12 h), frozen after 4 h, median window `filter_minutes` 15 min, maximum sensor rate
   `max_rate` 0.5 °C/min, prediction horizon 45 min, own-sensor `run_margin` 1 °C,
-  effort hysteresis 0.05 and effort on/off dwell 5 min. Legacy offset clamp, slew and PI
+  effort hysteresis 0.05 and effort on/off dwell 5 min, reported minimum run 10 min,
+  minimum off 5 min, maximum starts 3/hour, comfort band 1 °C total, switching cost 0.05
+  and effort movement cost 0.005. Cycling limits have optional per-system overrides;
+  `modulating` can override target-step-based capability inference. Legacy offset clamp, slew and PI
   gains remain readable for compatibility but no longer govern commands.
 
-## Control loop (v0.5.2)
+## Control loop (v0.5.3)
 
 Every control interval, and immediately when the house setpoint or mode changes:
 
@@ -108,7 +111,9 @@ Every control interval, and immediately when the house setpoint or mode changes:
 3. Joint allocation. The House setpoint S is the weighted house **average**. Minimize
    each room's deviation from that average and the average's error from S together:
 
-   `J(u) = Σ_i w_i (T_hat_i − T_hat_mean)² + λ (T_hat_mean − S)²`.
+   `J(u) = Σ_i w_i (T_hat_i − T_hat_mean)² + λ (T_hat_mean − S)²
+   + switch_penalty × Σ_j 1[on(u_j) ≠ reported_on_j]
+   + effort_change_penalty × Σ_j |u_j − previous_u_j|`.
 
    Normalize the active positive room weights to sum to one. Reuse `fan_reward_lambda`
    for λ (default 1). `learning.forecast` propagates each interval model
@@ -120,10 +125,24 @@ Every control interval, and immediately when the house setpoint or mode changes:
    each system's room effects. Without learning, use the same neutral b prior for every pair.
    No room mappings, individual room targets or overshoot ceilings enter the objective.
 
-   Solve this small convex box problem using up to 200 cyclic exact coordinate minimizations,
-   stopping when effort changes fall below 1e-9. Heat efforts are 0..1; cool efforts −1..0.
-   Unavailable systems have no variable. With no learned positive reach, an actuator gets
-   zero effort instead of inventing reach from a cold room's error.
+   Solve the small constrained problem using up to 200 cyclic coordinate minimizations,
+   stopping when effort changes fall below 1e-9. Each coordinate evaluates zero, feasible
+   endpoints, the previous effort and the quadratic stationary points on either side of
+   the absolute-movement kink. The switch cost makes the objective nonconvex; this is a
+   coordinate solution, not a claim of global mixed-discrete optimality. Heat efforts are
+   0..1; cool efforts −1..0. Without control state, `allocate` retains the original pure
+   convex thermal objective for independent forecasting and grid validation.
+
+   A reported running unit inside `min_run_minutes` has magnitude at least 0.001;
+   an idle unit inside `min_off_minutes` or at `max_starts_per_hour` has magnitude zero.
+   Starts expire from the rolling window exactly one hour later. If every used,
+   positive-weight filtered reading is inside setpoint ± `comfort_band/2`, retain the
+   reported on/off state as another allocation bound. Otherwise leave state changes to J,
+   even when the average itself is comfortable. This band never selects heat/cool mode.
+   A system with a fine target step (<0.5 °C by default) can modulate; otherwise evaluate
+   only full-on/off efforts. Per-system `modulating` overrides that heuristic.
+   Unavailable systems have no variable. With no learned positive reach, the thermal objective cannot justify a new start;
+   cycling/comfort holds and the state-change cost still apply to a running actuator.
 
    A single persisted mean-error integral biases S by at most ±1 °C. Its separate
    `mean_integral_gain` defaults to 0.001 per scheduled interval; immediate requests do not
@@ -132,13 +151,13 @@ Every control interval, and immediately when the house setpoint or mode changes:
    integrals remain loadable but are unused. This keeps upgrades from applying old PI
    gains or room errors to the joint objective.
 
-   Translate effort magnitude q to `own_current_temperature + direction × run_margin × (2q−1)`.
-   Thus full heat commands the system's own reading +1 °C and zero heat its own reading −1 °C;
-   cooling mirrors this. Intermediate efforts provide proportional targets for modulating
-   units. If the own sensor is missing, explicitly report using the house mean as a proxy.
-   Retain effort hysteresis and minimum on/off dwell (defaults 0.05 and 5 min). A scheduled
-   pass can cross the own sensor in either direction regardless of old house offsets or slew.
-   Round to the advertised target step (fallback 0.5 °C) and clamp to device min/max.
+   Translate positive effort magnitude q to `own_current_temperature + direction × run_margin × q`.
+   Zero effort requests `own_current_temperature − direction × run_margin`. Thus low continuous
+   output sits close to the local sensor. If the own sensor is missing, explicitly report
+   using the house mean as a proxy. Retain effort hysteresis and legacy demand dwell as
+   additional smoothing, with cycling and comfort bounds taking precedence. Round to the
+   advertised target step (fallback 0.5 °C), then enforce the chosen demand side of the own
+   reading so rounding/dither cannot reverse it. Device min/max still bound targets.
    Offsets remain diagnostics: actual commanded target minus the house setpoint.
 
    Cycling thermostats may deliver a different duty fraction from the proportional target.
@@ -161,8 +180,9 @@ Every control interval, and immediately when the house setpoint or mode changes:
    in `last_decision` only when the reported mode/target differs from that command and more
    than 2 minutes have passed since it, suppressing delayed device echoes. The next interval
    re-asserts (the House thermostat is the one control).
-6. Fallbacks: if no member sensor is available, every system gets the house setpoint with zero
-   offset. If a system is unavailable, skip it and keep controlling the others.
+6. Fallbacks: if no member sensor is available, every system gets the house setpoint, subject
+   to reported cycling holds. Without any local/house reference, retain an on-held target or
+   use HVAC off for an off hold. If target limits prevent an off hold, also use HVAC off. If a system is unavailable, skip it and keep controlling the others.
 
 State (setpoint, mode, integrator values, last mode switch) survives restarts via `RestoreEntity`
 / `Store`.
@@ -693,3 +713,70 @@ effort targets after warmer requests, changes the outside-change fixture to a va
 the new off-effort target, checks joint/mean diagnostics on priority changes, and allows adjacent
 rounding steps during the filtered transient replay. Sensor filtering/learning assertions remain.
 All results are deterministic simulations, not measured performance in the house.
+
+
+## Cycling protection (v0.5.3) and regression evidence
+
+`observe_action` maintains persisted per-system `last_start`, `last_stop` and `starts` (the
+rolling hour only), alongside the existing `last_run`. Only actual heating/cooling actions
+count as running; repeated reports do not move start/stop clocks. Initial known observations
+start conservative clocks when no earlier evidence exists. Recorder replays retained actions,
+including attribute-only changes, before the first control pass; Store and recorder clocks
+merge by latest evidence and start timestamps are deduplicated. Restarts retain the last
+action identity but reset its runtime-accounting endpoint to now: downtime earns no observed
+runtime and a still-running compressor does not acquire another start.
+
+Minimum run/off and start-cap constraints enter allocation and run again after drive feedback,
+dither, excitation and rounding. New excitation cannot start an off-held unit or break an
+all-rooms-comfortable hold; an active excitation cannot override the final bounds. Off/veto
+and unavailable/observe-only behavior retain their existing precedence. Physical compressor
+self-cycles are outside demand control; their reported transitions still update protection.
+`climate.house.cycling[entity]` exposes `starts_last_hour`, `run_minutes` and `off_minutes`.
+Decision notes explain held on/off for cycling protection. A fixed House direction never
+commands its opposite, including the no-room fallback; `heat_cool` alone selects a reversal.
+
+The [EA Technology/DECC cycling report](https://assets.publishing.service.gov.uk/media/5a78e0d9e5274a2acd18a7c6/7389-effects-cycling-heat-pump-performance.pdf)
+found approximately eight-minute ASHP runs near steady-state COP and an optimum around
+10–15 minutes for the tested GSHP. The generic ten-minute run default is conservative.
+[Trane](https://www.trane.com/residential/en/resources/glossary/hvac-short-cycling/) documents
+five-minute compressor off protection; [Mysa](https://getmysa.gorgias.help/en-US/understanding-heating-or-cooling-delays-3619484)
+documents a three-cycle/hour heat-pump setting. These support tunable defaults rather than
+an assertion that all manufacturers specify the same limits.
+
+The new four-hour noisy replay (`tests/test_cycling.py`) uses one-minute control, two equally
+weighted rooms initially 20/21.85 °C, a 21 °C setpoint, and alternating ±0.15 °C common sensor
+noise plus seeded ±0.005 °C jitter. Per-minute full heat effects are 0.013/0.011 °C with losses
+half those values; rooms remain outside the comfort band so balancing decisions stay eligible.
+The unprotected comparison disables cycling limits and movement/switch costs but uses the
+same controller, plant and readings. The replay serializes/restores state midway.
+
+| Four-hour metric | Unconstrained | Protected |
+|---|---:|---:|
+| State changes / starts | 240 / 120 | 18 / 9 |
+| Minimum completed run / off | 1 / 1 min | 11 / 13 min |
+| Maximum rolling-hour starts | 30 | 3 |
+| Mean absolute average error | 0.072000 °C | 0.074800 °C |
+| Mean max−min spread | 1.849500 °C | 1.849967 °C |
+
+The average-error cost is 0.0028 °C and spread cost 0.000467 °C. The initial left-censored off
+interval is excluded from duration minima. Tests separately exercise exact 10-/5-minute and
+one-hour boundaries, delayed reports versus commands, room-outlier starts with the average in
+band, all-room band holds for both reported states and both directions, modulation, objective
+penalties, device limits and missing-reference holds. HA tests seed an active run, a recent
+stop and three recent starts from recorder, then save/reload Store and verify constraints.
+Fourteen fixed-mode guard cases cover allocation, excitation, both cycling holds, fallback,
+rounding and an opposite reported action; a separate test permits reversal in `heat_cool`.
+
+Existing binary shared-sensor replay: 12-hour mean 22.6444 °C, weighted standard deviation
+0.4362 °C (v0.5.2: 22.6295/0.4381). Late-sensor B starts at minute 5 after the observed off hold;
+final weighted standard deviation is 0.8361 °C versus frozen v0.4.1's 2.4516 °C, with day-two
+mean standard deviation 0.8550 °C. The fractional-duty learning fixture still identifies every
+b within 0.003 °C/interval and holds day-two mean within ±0.5 °C (20.5269–21.2575 °C).
+Its final max−min spread rises to 0.6888 °C from 0.1512 °C as the new band intentionally holds
+comfortable units. Its old exact-spread assertion becomes a 0.75 °C bound, and the old
+all-exploration-ended assertion becomes >80% mean confidence (actual 84.03%); steadier output
+can leave individual room/system pairs exploring longer. Other historical fixture assertions
+remain. HA fixture updates choose an outside target distinct from the new protected-off target,
+allow new system options, establish old off evidence before testing excitation, and expect
+persisted action identities with fresh runtime endpoints on reload. These are deterministic
+simulations, not measured performance.

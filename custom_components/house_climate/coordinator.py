@@ -103,8 +103,9 @@ class HouseCoordinator(DataUpdateCoordinator):
                 self.priority_mode = selected
             self.state = ControlState(**saved["state"])
             # Retain inactivity/cooldown clocks, but never count downtime as runtime.
-            self.state.actions.clear()
-            self.state.action_times.clear()
+            self.state.action_times = {
+                key: dt_util.utcnow().timestamp() for key in self.state.actions
+            }
             if self.state.excitation:
                 self.state.last_excite[self.state.excitation["system"]] = (
                     dt_util.utcnow().timestamp()
@@ -868,6 +869,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 }
         for entity_id, states in activity.items():
             last_run = None
+            cycling = ControlState()
             for index, state in enumerate(states):
                 if state.state not in (
                     STATE_UNAVAILABLE,
@@ -893,6 +895,48 @@ class HouseCoordinator(DataUpdateCoordinator):
                         end.timestamp(),
                     )
 
+            # Replay action transitions, including attribute-only changes. Merge
+            # retained evidence without replacing newer Store/event observations.
+            for recorded in sorted(states, key=lambda s: s.last_updated):
+                action = (
+                    recorded.attributes.get("hvac_action")
+                    if recorded.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+                    else None
+                )
+                cycling.observe_action(
+                    entity_id, action, recorded.last_updated.timestamp()
+                )
+            saved_transition = max(
+                self.state.last_start.get(entity_id, float("-inf")),
+                self.state.last_stop.get(entity_id, float("-inf")),
+            )
+            recorded_transition = max(
+                cycling.last_start.get(entity_id, float("-inf")),
+                cycling.last_stop.get(entity_id, float("-inf")),
+            )
+            for name in ("last_start", "last_stop"):
+                evidence = getattr(cycling, name).get(entity_id)
+                clocks = getattr(self.state, name)
+                if evidence is not None:
+                    clocks[entity_id] = max(
+                        evidence, clocks.get(entity_id, float("-inf"))
+                    )
+            self.state.starts[entity_id] = sorted(
+                {
+                    t
+                    for t in self.state.starts.get(entity_id, [])
+                    + cycling.starts.get(entity_id, [])
+                    if now.timestamp() - 3600 < t <= now.timestamp()
+                }
+            )
+            # Seed the last known action so the first current observation does
+            # not invent a fresh start for a compressor already running.
+            if entity_id in cycling.actions and (
+                entity_id not in self.state.actions
+                or recorded_transition > saved_transition
+            ):
+                self.state.actions[entity_id] = cycling.actions[entity_id]
+                self.state.action_times[entity_id] = now.timestamp()
             if last_run is not None:
                 self.state.last_run.setdefault(entity_id, last_run)
 

@@ -1,7 +1,7 @@
 """Deterministic house control, with no Home Assistant dependencies."""
 
 from dataclasses import dataclass, field
-from math import floor, isfinite
+from math import ceil, floor, isfinite
 
 
 @dataclass
@@ -46,11 +46,45 @@ class ControlState:
     requested_efforts: dict[str, float] = field(default_factory=dict)
     effort_switches: dict[str, float] = field(default_factory=dict)
 
+    last_start: dict[str, float] = field(default_factory=dict)
+    last_stop: dict[str, float] = field(default_factory=dict)
+    starts: dict[str, list[float]] = field(default_factory=dict)
+
+    def cycling_status(self, system, now):
+        running = self.actions.get(system) in ("heating", "cooling")
+        since = (self.last_start if running else self.last_stop).get(system)
+        return {
+            "starts_last_hour": sum(
+                now - 3600 < t <= now for t in self.starts.get(system, [])
+            ),
+            "run_minutes": max(0, now - since) / 60
+            if running and since is not None
+            else 0,
+            "off_minutes": max(0, now - since) / 60
+            if not running and since is not None
+            else 0,
+        }
+
     def observe_action(self, system, action, now):
         """Account only observed runtime, including transitions between ticks."""
         previous = self.actions.get(system)
         elapsed = max(0, now - self.action_times.get(system, now))
         running = action in ("heating", "cooling")
+        was_running = previous in ("heating", "cooling")
+        known = action in ("heating", "cooling", "idle", "off", "fan", "drying")
+        if known:
+            if running and (not was_running or system not in self.last_start):
+                self.last_start[system] = now
+                self.starts.setdefault(system, []).append(now)
+            elif not running and (
+                was_running
+                or self.last_start.get(system, float("-inf"))
+                > self.last_stop.get(system, float("-inf"))
+            ):
+                self.last_stop[system] = now
+            elif not running:
+                self.last_stop.setdefault(system, now)
+        self.starts[system] = [t for t in self.starts.get(system, []) if t > now - 3600]
         if running or previous in ("heating", "cooling"):
             self.last_run[system] = now
         else:
@@ -61,6 +95,35 @@ class ControlState:
         }.get(self.excitation["mode"]):
             self.excitation["runtime"] += elapsed
         self.actions[system], self.action_times[system] = action, now
+
+
+def cycling_hold(config, state, key, now):
+    """Return a required on/off state from reported action evidence only."""
+    settings = {
+        **config,
+        **next((s for s in config["systems"] if s["entity_id"] == key), {}),
+    }
+    running = state.actions.get(key) in ("heating", "cooling")
+    if running:
+        if (
+            now - state.last_start.get(key, float("-inf"))
+            < settings.get("min_run_minutes", 10) * 60
+        ):
+            return True
+    elif now - state.last_stop.get(key, float("-inf")) < settings.get(
+        "min_off_minutes", 5
+    ) * 60 or sum(
+        now - 3600 < t <= now for t in state.starts.get(key, [])
+    ) >= settings.get("max_starts_per_hour", 3):
+        return False
+    return None
+
+
+def effort_limits(config, state, key, now, in_band):
+    hold = cycling_hold(config, state, key, now)
+    if hold is None and in_band:
+        hold = state.actions.get(key) in ("heating", "cooling")
+    return (0.001, 1) if hold is True else (0, 0) if hold is False else (0, 1)
 
 
 def excitation_target(config, state, devices, values, house, mode, now, learning):
@@ -97,6 +160,11 @@ def excitation_target(config, state, devices, values, house, mode, now, learning
             or not isfinite(device.current_temperature)
             or device.hvac_action in ("heating", "cooling")
             or not sensors
+            or cycling_hold(config, state, key, now) is False
+            or all(
+                abs(t - state.setpoint) <= config.get("comfort_band", 1) / 2
+                for t in values.values()
+            )
             or learning.system_confidence(key, sensors)
             >= config.get("explore_threshold", 0.8)
             or now - max(state.last_run[key], state.last_excite.get(key, float("-inf")))
@@ -164,11 +232,13 @@ def allocate(
     learning=None,
     solar=0,
     sources=None,
+    state=None,
+    now=0,
 ):
     """Bounded least squares for the joint horizon objective, without dependencies.
 
     Propagate the interval model as an affine function of constant signed effort.
-    Cyclic exact coordinate minimization solves the small convex box problem.
+    Coordinate candidates include discrete state changes and L1 movement kinks.
     Weights are normalized so lambda has the same meaning as the fan reward.
     """
     from .learning import PRIOR_B
@@ -208,20 +278,65 @@ def allocate(
         mean_effect
     ]
     objective_weights = weights + [penalty]
-    efforts = [0.0] * len(systems)
+    in_band = state is not None and all(
+        abs(t - state.setpoint) <= config.get("comfort_band", 1) / 2
+        for t in values.values()
+    )
+    bounds = [
+        effort_limits(config, state, key, now, in_band) if state else (0, 1)
+        for key in systems
+    ]
+    previous = [abs(state.efforts.get(key, 0)) if state else 0 for key in systems]
+    on = [
+        state.actions.get(key) in ("heating", "cooling") if state else False
+        for key in systems
+    ]
+    switch_cost = config.get("switch_penalty", 0.05) if state else 0
+    change_cost = config.get("effort_change_penalty", 0.005) if state else 0
+    efforts = [clamp(u, low, high) for u, (low, high) in zip(previous, bounds)]
+    residual = [
+        r + sum(v * u for v, u in zip(line, efforts))
+        for r, line in zip(residual, matrix)
+    ]
     for _ in range(200):
         change = 0
         for j in range(len(systems)):
             curvature = sum(
                 w * line[j] ** 2 for w, line in zip(objective_weights, matrix)
             )
-            if curvature < 1e-12:
-                continue
             gradient = sum(
                 w * line[j] * r
                 for w, line, r in zip(objective_weights, matrix, residual)
             )
-            updated = clamp(efforts[j] - gradient / curvature, 0, 1)
+            low, high = bounds[j]
+            # Exact coordinate candidates for quadratic + L1 effort movement +
+            # the discrete cost at zero. Evaluate both sides of the L1 kink.
+            candidates = [low, high, clamp(previous[j], low, high)]
+            if curvature > 1e-12:
+                for sign in (-1, 1):
+                    candidates.append(
+                        clamp(
+                            efforts[j]
+                            - (gradient + sign * change_cost / 2) / curvature,
+                            max(low, 0.001),
+                            max(high, max(low, 0.001)),
+                        )
+                    )
+            candidates = [u for u in candidates if low <= u <= high]
+            system = next(s for s in config["systems"] if s["entity_id"] == systems[j])
+            if state and not system.get("modulating", devices[systems[j]].step < 0.5):
+                candidates = [u for u in (0, 1) if low <= u <= high]
+
+            def cost(u):
+                delta = u - efforts[j]
+                return (
+                    curvature * delta * delta
+                    + 2 * gradient * delta
+                    + switch_cost * ((u > 0) != on[j])
+                    + change_cost * abs(u - previous[j])
+                )
+
+            updated = min(candidates, key=cost)
             delta = updated - efforts[j]
             efforts[j] = updated
             residual = [r + line[j] * delta for r, line in zip(residual, matrix)]
@@ -337,6 +452,8 @@ def control(
             learning,
             solar,
             sources,
+            state,
+            now,
         )
         error = state.setpoint - house
         # Integrate only when the model can reach the biased mean in this horizon.
@@ -386,23 +503,32 @@ def control(
             # Actual action runtime closes the actuator loop for cycling units.
             # Endpoints always remain full on/off relative to the local sensor.
             if 0 < effort < 1:
-                effort = clamp(effort + state.drive_bias.get(entity_id, 0), 0, 1)
+                effort = clamp(effort + state.drive_bias.get(entity_id, 0), 0.001, 1)
             margin = config.get("run_margin", 1)
             if dither:
-                effort = clamp(effort + direction * dither / (2 * margin), 0, 1)
+                if effort > 0:
+                    effort = clamp(effort + direction * dither / (2 * margin), 0.001, 1)
                 notes.append(f"{entity_id}: exploring ({dither:+.2f} °C dither).")
             previous = (
                 abs(state.efforts[entity_id]) if entity_id in state.efforts else None
             )
-            if previous is not None and (effort > 0.5) != (previous > 0.5):
+            if previous is not None and (effort > 0) != (previous > 0):
                 if (
-                    abs(effort - 0.5) < config.get("effort_hysteresis", 0.05)
+                    0 < effort < config.get("effort_hysteresis", 0.05)
                     or now - state.effort_switches.get(entity_id, float("-inf"))
                     < config.get("effort_dwell_minutes", 5) * 60
                 ):
                     effort = previous
-            if previous is None or (effort > 0.5) != (previous > 0.5):
+            if previous is None or (effort > 0) != (previous > 0):
                 state.effort_switches[entity_id] = now
+            in_band = all(
+                abs(t - state.setpoint) <= config.get("comfort_band", 1) / 2
+                for t in values.values()
+            )
+            low, high = effort_limits(config, state, entity_id, now, in_band)
+            if state.excitation.get("system") == entity_id:
+                effort = 1
+            effort = clamp(effort, low, high)
             state.efforts[entity_id] = direction * effort
             own = device.current_temperature
             if own is None or not isfinite(own):
@@ -410,8 +536,8 @@ def control(
                 notes.append(
                     f"{device.name or entity_id}: own sensor missing; using house mean as target reference."
                 )
-            target = own + direction * margin * (2 * effort - 1)
-            if state.excitation.get("system") == entity_id:
+            target = own + direction * margin * (effort if effort > 0 else -1)
+            if state.excitation.get("system") == entity_id and high > 0:
                 target = state.excitation["target"]
                 notes.append(
                     f"exploring: running {device.name or entity_id} to learn which rooms it reaches"
@@ -429,12 +555,12 @@ def control(
                 reverse=True,
             )
             above = max(values, key=lambda r: direction * (values[r] - house))
-            action = "on" if effort > 0.5 else "low"
+            action = "on" if effort > 0 else "low"
             notes.append(
                 f"{device.name or entity_id} {action} (effort {effort:.2f}): "
                 + (
                     f"{'lifts' if mode == 'heat' else 'cools'} {', '.join(room_names[r] for r in helped)} toward the average; "
-                    if helped and effort > 0.5
+                    if helped and effort > 0
                     else f"limits {'heat' if mode == 'heat' else 'cooling'} into {room_names[above]}; "
                 )
                 + f"{room_names[above]} is {abs(values[above] - house):.2f} °C {'above' if mode == 'heat' else 'below'} the average."
@@ -460,16 +586,70 @@ def control(
             state.rounding_errors[entity_id] = clamp(
                 adjusted - target, -device.step / 2, device.step / 2
             )
+        command_mode = mode
+        keep_target = False
+        if mode in ("heat", "cool"):
+            direction = 1 if mode == "heat" else -1
+            own = device.current_temperature
+            if own is None or not isfinite(own):
+                own = house
+            hold = cycling_hold(config, state, entity_id, now)
+            in_band = bool(values) and all(
+                abs(t - state.setpoint) <= config.get("comfort_band", 1) / 2
+                for t in values.values()
+            )
+            required = hold
+            if required is None and in_band:
+                required = state.actions.get(entity_id) in ("heating", "cooling")
+            if required is None and house is not None:
+                required = abs(state.efforts.get(entity_id, 0)) > 0
+            if own is not None and required is not None:
+                was_on = direction * (target - own) > 0
+                if required:
+                    edge = (
+                        (floor(own / device.step) + 1) * device.step
+                        if direction == 1
+                        else (ceil(own / device.step) - 1) * device.step
+                    )
+                    target = max(target, edge) if direction == 1 else min(target, edge)
+                else:
+                    edge = (
+                        (ceil(own / device.step) - 1) * device.step
+                        if direction == 1
+                        else (floor(own / device.step) + 1) * device.step
+                    )
+                    target = min(target, edge) if direction == 1 else max(target, edge)
+                target = clamp(target, device.minimum, device.maximum)
+                if hold is False and direction * (target - own) > 0:
+                    command_mode = "off"
+                if hold is not None and was_on != hold:
+                    notes.append(
+                        f"{device.name or entity_id}: held {'on' if hold else 'off'} for cycling protection."
+                    )
+                elif hold is not None:
+                    notes.append(
+                        f"{device.name or entity_id}: held {'on' if hold else 'off'} for cycling protection (reported action constraint)."
+                    )
+            elif hold is not None:
+                notes.append(
+                    f"{device.name or entity_id}: held {'on' if hold else 'off'} for cycling protection; no temperature reference."
+                )
+                if hold:
+                    keep_target = True
+                    if device.temperature is not None:
+                        target = device.temperature
+                else:
+                    command_mode = "off"
         offset = target - state.setpoint
         state.offsets[entity_id] = offset
-        if device.mode != mode:
-            notes.append(f"{entity_id}: mode differs; re-asserting {mode}.")
-            commands.append((entity_id, "set_hvac_mode", {"hvac_mode": mode}))
-        if mode != "off":
+        if device.mode != command_mode:
+            notes.append(f"{entity_id}: mode differs; re-asserting {command_mode}.")
+            commands.append((entity_id, "set_hvac_mode", {"hvac_mode": command_mode}))
+        if command_mode != "off":
             preset = system.get("preset")
             if preset and device.preset != preset:
                 commands.append((entity_id, "set_preset_mode", {"preset_mode": preset}))
-            if device.temperature != target:
+            if device.temperature != target and not keep_target:
                 notes.append(
                     f"{entity_id}: target differs; setting {target:.1f} °C (offset {offset:+.2f})."
                 )

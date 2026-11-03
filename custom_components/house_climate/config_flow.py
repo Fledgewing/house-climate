@@ -218,6 +218,14 @@ class HouseSteps:
     async def async_step_system(self, user_input=None):
         system = self.settings["systems"][self.index]
         if user_input is not None:
+            for key in (
+                "min_run_minutes",
+                "min_off_minutes",
+                "max_starts_per_hour",
+                "modulating",
+            ):
+                if key in user_input:
+                    system[key] = user_input[key]
             system["preset"] = user_input.get("preset", "").strip()
             if "quiet_max_fan" in user_input:
                 system["quiet_max_fan"] = user_input["quiet_max_fan"]
@@ -249,6 +257,23 @@ class HouseSteps:
                         "preset",
                         description={"suggested_value": system.get("preset", "")},
                     ): selector.TextSelector(),
+                    **{
+                        vol.Optional(
+                            key,
+                            description={
+                                "suggested_value": system.get(key, self.settings[key])
+                            },
+                        ): number(1 if key == "max_starts_per_hour" else 0, high, 1)
+                        for key, high in [
+                            ("min_run_minutes", 120),
+                            ("min_off_minutes", 120),
+                            ("max_starts_per_hour", 60),
+                        ]
+                    },
+                    vol.Optional(
+                        "modulating",
+                        description={"suggested_value": system.get("modulating")},
+                    ): selector.BooleanSelector(),
                     **fan_fields,
                 }
             ),
@@ -331,6 +356,12 @@ class HouseSteps:
             ("max_offset_change", 0.5, 5, 0.5),
             ("cool_outdoor_min", -40, 50, 0.5),
             ("heat_outdoor_max", -40, 50, 0.5),
+            ("min_run_minutes", 0, 120, 1),
+            ("min_off_minutes", 0, 120, 1),
+            ("max_starts_per_hour", 1, 60, 1),
+            ("switch_penalty", 0, 10, 0.01),
+            ("effort_change_penalty", 0, 1, 0.001),
+            ("comfort_band", 0, 5, 0.1),
             ("run_margin", 0.5, 5, 0.5),
             ("control_horizon_minutes", 5, 120, 5),
             ("effort_hysteresis", 0, 0.25, 0.01),

@@ -446,7 +446,7 @@ async def test_delayed_command_echo_is_not_an_outside_change(hass, installed, de
 @pytest.mark.parametrize(
     "service,data",
     [
-        ("set_temperature", {"temperature": 18}),
+        ("set_temperature", {"temperature": 17}),
         ("set_hvac_mode", {"hvac_mode": "cool"}),
     ],
 )
@@ -525,7 +525,13 @@ async def test_config_flow_empty_defaults_and_selector_filters(hass):
         result["flow_id"], {"weight": 1.0}
     )
     assert result["step_id"] == "system"
-    assert {field.schema for field in result["data_schema"].schema} == {"preset"}
+    assert {field.schema for field in result["data_schema"].schema} == {
+        "preset",
+        "min_run_minutes",
+        "min_off_minutes",
+        "max_starts_per_hour",
+        "modulating",
+    }
     result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
     assert result["step_id"] == "tunables"
     fields = {
@@ -1696,6 +1702,9 @@ async def test_excitation_dispatch_between_tick_runtime_and_restart(hass, instal
         system["entity_id"]: start.timestamp() - 3 * 3600
         for system in coordinator.config["systems"]
     }
+    coordinator.state.last_stop = {
+        key: start.timestamp() - 3 * 3600 for key in coordinator.state.last_run
+    }
     with patch(
         "custom_components.house_climate.coordinator.dt_util.utcnow", return_value=start
     ):
@@ -1735,8 +1744,10 @@ async def test_excitation_dispatch_between_tick_runtime_and_restart(hass, instal
     ):
         await restored.async_load()
     assert not restored.state.excitation
-    assert not restored.state.actions
-    assert not restored.state.action_times
+    assert restored.state.actions == coordinator.state.actions
+    assert set(restored.state.action_times.values()) == {
+        (start + timedelta(hours=3)).timestamp()
+    }
     assert restored.state.last_run == coordinator.state.last_run
     assert (
         restored.state.last_excite["climate.ducted"]
@@ -2264,3 +2275,160 @@ async def test_room_controls_follow_sensor_membership(hass, installed):
         )
         is None
     )
+
+
+@pytest.mark.parametrize("capped", [False, True])
+async def test_cycling_history_and_store_restart_keep_constraints(
+    hass, settings, capped
+):
+    from homeassistant.helpers.recorder import DATA_INSTANCE
+
+    from custom_components.house_climate.controller import cycling_hold
+    from custom_components.house_climate.coordinator import HouseCoordinator
+
+    entry = MockConfigEntry(domain=DOMAIN, data=settings)
+    entry.add_to_hass(hass)
+    c = HouseCoordinator(hass, entry)
+    now = dt_util.utcnow()
+    timestamp = now.timestamp()
+
+    def recorded(key, action, minutes):
+        return State(
+            key,
+            "heat",
+            {"hvac_action": action},
+            last_updated=now - timedelta(minutes=minutes),
+        )
+
+    activity = {
+        "climate.ducted": [
+            recorded("climate.ducted", "idle", 20),
+            recorded("climate.ducted", "heating", 4),
+            recorded("climate.ducted", "heating", 1),
+        ],
+        "climate.split": [
+            recorded("climate.split", "heating", 20),
+            recorded("climate.split", "idle", 2),
+        ],
+    }
+    if capped:
+        activity["climate.split"] = [
+            recorded("climate.split", action, minute)
+            for minute, action in [
+                (58, "heating"),
+                (48, "idle"),
+                (38, "heating"),
+                (28, "idle"),
+                (18, "heating"),
+                (8, "idle"),
+            ]
+        ]
+
+    class Recorder:
+        async def async_add_executor_job(self, job):
+            return job()
+
+    hass.data[DATA_INSTANCE] = Recorder()
+    try:
+        with patch(
+            "homeassistant.components.recorder.history.get_significant_states",
+            side_effect=[{}, activity],
+        ):
+            await c.async_seed_history(now)
+        assert c.state.last_start["climate.ducted"] == timestamp - 240
+        assert cycling_hold(c.config, c.state, "climate.ducted", timestamp) is True
+        assert cycling_hold(c.config, c.state, "climate.split", timestamp) is False
+        if capped:
+            assert (
+                c.state.cycling_status("climate.split", timestamp)["starts_last_hour"]
+                == 3
+            )
+        await c.store.async_save({"state": asdict(c.state)})
+        restored = HouseCoordinator(hass, entry)
+        with patch(
+            "custom_components.house_climate.coordinator.dt_util.utcnow",
+            return_value=now,
+        ):
+            await restored.async_load()
+        for key, action in [("climate.ducted", "heating"), ("climate.split", "idle")]:
+            restored.state.observe_action(key, action, timestamp + 60)
+            assert restored.state.last_start[key] == c.state.last_start[key]
+            assert restored.state.last_stop.get(key) == c.state.last_stop.get(key)
+            assert restored.state.starts[key] == c.state.starts[key]
+        assert (
+            cycling_hold(
+                restored.config, restored.state, "climate.ducted", timestamp + 60
+            )
+            is True
+        )
+        assert (
+            cycling_hold(
+                restored.config, restored.state, "climate.split", timestamp + 60
+            )
+            is False
+        )
+    finally:
+        hass.data.pop(DATA_INSTANCE)
+
+
+async def test_climate_cycling_attributes_follow_reported_actions(hass, installed):
+    entry, _ = installed
+    c = entry.runtime_data
+    now = dt_util.utcnow().timestamp()
+    c.state.observe_action("climate.ducted", "heating", now - 120)
+    c.state.observe_action("climate.split", "heating", now - 600)
+    c.state.observe_action("climate.split", "idle", now - 60)
+    c.async_update_listeners()
+    await hass.async_block_till_done()
+    cycling = hass.states.get("climate.house").attributes["cycling"]
+    assert cycling["climate.ducted"]["starts_last_hour"] == 1
+    assert cycling["climate.ducted"]["run_minutes"] == pytest.approx(2, abs=0.1)
+    assert cycling["climate.split"]["off_minutes"] == pytest.approx(1, abs=0.1)
+
+
+async def test_newer_recorder_stop_replaces_stale_store_action_without_retiming(
+    hass, settings
+):
+    from homeassistant.helpers.recorder import DATA_INSTANCE
+
+    from custom_components.house_climate.coordinator import HouseCoordinator
+
+    entry = MockConfigEntry(domain=DOMAIN, data=settings)
+    entry.add_to_hass(hass)
+    c = HouseCoordinator(hass, entry)
+    now = dt_util.utcnow()
+    key = "climate.ducted"
+    c.state.observe_action(key, "heating", now.timestamp() - 1200)
+    activity = {
+        key: [
+            State(
+                key,
+                "heat",
+                {"hvac_action": "heating"},
+                last_updated=now - timedelta(minutes=20),
+            ),
+            State(
+                key,
+                "heat",
+                {"hvac_action": "idle"},
+                last_updated=now - timedelta(minutes=2),
+            ),
+        ]
+    }
+
+    class Recorder:
+        async def async_add_executor_job(self, job):
+            return job()
+
+    hass.data[DATA_INSTANCE] = Recorder()
+    try:
+        with patch(
+            "homeassistant.components.recorder.history.get_significant_states",
+            side_effect=[{}, activity],
+        ):
+            await c.async_seed_history(now)
+        c.state.observe_action(key, "idle", now.timestamp())
+        assert c.state.last_stop[key] == now.timestamp() - 120
+        assert c.state.actions[key] == "idle"
+    finally:
+        hass.data.pop(DATA_INSTANCE)

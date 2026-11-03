@@ -1,10 +1,10 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.2 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.3 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
-The setpoint is the weighted **house average**. Each pass jointly chooses how much every available system should run to bring that average to the setpoint and reduce each room's deviation from it. A 45-minute prediction uses the learned room responses, outdoor losses, extra heat sources, solar gain and drift. There are no configured room mappings, individual room comfort rules or overshoot ceilings.
+The setpoint is the weighted **house average**. Each pass jointly chooses how much every available system should run to bring that average to the setpoint and reduce each room's deviation from it. A 45-minute prediction uses the learned room responses, outdoor losses, extra heat sources, solar gain and drift. There are no configured room mappings or individual room targets. A shared comfort band holds starts and stops only when every weighted room is comfortable.
 
-Each target is relative to that system's **own temperature sensor**: full heat requests its reading +1 °C and zero heat its reading −1 °C, mirrored for cooling. A warm living-room sensor therefore cannot silently disable the system best able to heat colder rooms. Intermediate efforts modulate the target; observed runtime and bounded rounding feedback help cycling thermostats deliver the requested effort. Device limits, target steps, effort hysteresis, dwell, shared mode selection and outdoor vetoes remain. Only changed commands are sent, including required hold presets. `last_decision` names which systems run or stay low and the rooms driving that choice.
+Each target is relative to that system's **own temperature sensor**: full heat requests its reading +1 °C and zero heat its reading −1 °C, mirrored for cooling. A warm living-room sensor therefore cannot silently disable the system best able to heat colder rooms. For modulating systems, positive effort q requests the own reading + q × run margin in heat, mirrored in cool: low output stays close to the own sensor instead of bursting on/off. Zero effort requests the opposite side of the own reading to stop demand. Coarse-target systems allocate on/off output; the per-system **Modulating target** option overrides the default inference (target step below 0.5 °C). Rounding cannot reverse the allocated on/off decision. Reported action, rather than requested targets, drives cycling protection. Device limits, target steps, effort hysteresis, dwell, shared mode selection and outdoor vetoes remain. Only changed commands are sent, including required hold presets. `last_decision` names which systems run or stay low and the rooms driving that choice.
 
 ## Install
 
@@ -23,7 +23,39 @@ Use the integration's **Configure** options to add or remove sensors and systems
 
 Defaults: 5-minute control interval, 45-minute prediction horizon, 1 °C own-sensor run margin, effort hysteresis 0.05 and 5-minute effort on/off dwell. The mean-error integral gain is 0.001 per interval, with anti-windup and a ±1 °C bias limit. The joint objective and fan learner share `fan_reward_lambda` (default 1), balancing weighted room variance against weighted mean error. Legacy PI gains, house offset clamps and slew settings are retained for compatibility and are unused by the new allocator; the new mean integral has its own setting so upgrades use its small default.
 
-Automatic mode retains its 1 °C deadband and 60-minute heat/cool dwell. Cooling is vetoed below 10 °C outdoors; heating above 24 °C. Explicit heat/cool requests take effect immediately, subject to the outdoor veto. Effort on/off dwell prevents chatter while a scheduled pass can turn a system on or off without waiting for house-relative offsets to slew.
+Automatic mode retains its 1 °C deadband and 60-minute heat/cool dwell. Cooling is vetoed below 10 °C outdoors; heating above 24 °C. Explicit heat/cool requests take effect immediately, subject to the outdoor veto. Starts and stops obey cycling protection on scheduled and immediate passes. Explicit House off and outdoor vetoes still stop operation.
+
+## Steady operation and cycling protection
+
+Defaults are `min_run_minutes=10`, `min_off_minutes=5` and `max_starts_per_hour=3`.
+Options expose global defaults and optional per-system overrides. The timers start from
+**reported `hvac_action` transitions**, including changes between control passes; sending
+a target never counts as a compressor start. Store retains start/stop clocks and the rolling
+hour of starts. Recorder history seeds them before control, and a reload keeps those clocks.
+Without evidence, the first known action begins a conservative observation period.
+
+The joint objective adds `switch_penalty=0.05` per start/stop and
+`effort_change_penalty=0.005` per absolute effort change. These tunables discourage
+switching unless the predicted spread/mean improvement justifies it. Exploration and
+rounding obey the same protection. Physical units can still stop themselves; the integration
+constrains its demand commands using the action evidence it receives.
+
+`comfort_band=1` means ±0.5 °C about the House setpoint. When **every available,
+positive-weight filtered room reading** lies inside that band, each unit keeps its reported
+on/off state and can only modulate. If even one room is outside, the objective may start or
+stop units to improve balance—even if the house average is already in band. This is
+separate from the heat/cool mode `deadband`.
+
+`climate.house` exposes `cycling[system_entity]` with `starts_last_hour`, `run_minutes`
+and `off_minutes`. `last_decision` explains “held on/off for cycling protection”. If an
+off hold cannot be achieved within the device's target limits, or there is no temperature
+reference, the unit is commanded off. An on hold with no reference keeps its existing target.
+Fixed House heat/cool modes always command that direction; only `heat_cool` selects between them.
+
+The ten-minute run default is conservative relative to the [EA Technology/DECC study](https://www.gov.uk/government/publications/heat-pump-performance-effects-of-cycling),
+which found rapid cycling harmed performance. [Trane documents a five-minute compressor off delay](https://www.trane.com/residential/en/resources/glossary/hvac-short-cycling/),
+and [Mysa documents three cycles/hour for heat pumps](https://getmysa.gorgias.help/en-US/understanding-heating-or-cooling-delays-3619484).
+These are configurable defaults, not universal compressor specifications.
 
 ## Room priority modes
 
@@ -95,7 +127,7 @@ and learning; their learning rows remain unchanged. Home Assistant Repairs names
 sensor and its last real change and asks you to check its battery. `climate.house` exposes
 `not_reporting` details and includes them in `last_decision`; repairs clear on recovery.
 
-Changes made directly on physical systems are noted in `last_decision` and re-asserted at the next interval. Sensors older than the configurable stale limit (default 720 minutes / 12 hours), unknown, unavailable, or nonnumeric are excluded. With no usable house sensors, targets fall back to the house setpoint with zero offsets; a system with no positive learned reach gets zero allocated effort. If a device lacks its own sensor reading, its target uses the house mean as a proxy and the decision explains this fallback. An unavailable system or failed service call does not block the others.
+Changes made directly on physical systems are noted in `last_decision` and re-asserted at the next interval. Sensors older than the configurable stale limit (default 720 minutes / 12 hours), unknown, unavailable, or nonnumeric are excluded. With no usable house sensors, targets fall back to the house setpoint, subject to cycling protection; a system with no positive learned reach receives no new start for thermal benefit. If a device lacks its own sensor reading, its target uses the house mean as a proxy and the decision explains this fallback. An unavailable system or failed service call does not block the others.
 
 ## Online learning and visibility
 
@@ -248,7 +280,7 @@ uv run ruff check custom_components tests
 uv run ruff format custom_components tests
 ```
 
-The dev group pins `pytest-homeassistant-custom-component==0.13.375`, which targets HA 2026.10.4. The controller, thermal learner and `fans.py` have no Home Assistant imports. Tests include a seeded two-day, six-room simulation with the real controller, nonuniform system effects, day/night weather, solar and cycling thermostats. Every learned b must be within 0.003 °C/interval of truth; the house mean must stay within 0.5 °C throughout day two, with lower final spread than learning disabled and exploration ended.
+The dev group pins `pytest-homeassistant-custom-component==0.13.375`, which targets HA 2026.10.4. The controller, thermal learner and `fans.py` have no Home Assistant imports. Tests include a seeded two-day, six-room simulation with the real controller, nonuniform system effects, day/night weather, solar and cycling thermostats. Every learned b must be within 0.003 °C/interval of truth; the house mean must stay within 0.5 °C throughout day two, with lower final spread than learning disabled and over 80% mean learning confidence. Steadier operation can leave some pairs exploring longer.
 
 Fan tests include a separate seeded physical-house simulation with three anonymous fan options,
 5-minute physical steps and 600 half-hour experiments. The bandit must discover the setting that
@@ -257,11 +289,28 @@ and keep the mean within 0.05 °C of target. HA tests verify commands, hold timi
 outside changes, skipped windows, options and Store reloads.
 
 
-The shared-sensor regression starts living at 24.5 °C, downstairs at 19.4 °C and guest at 18.7 °C, with both systems sensing living. A strongly heats living; B's stronger cold-room reach starts with low confidence. On pass one, B is commanded **0.5 °C above its own reading**, A **1 °C below**. At 12 simulated hours the weighted mean is **22.6295 °C** (target 22.5) and weighted room standard deviation **0.4381 °C**.
+The four-hour noisy cycling regression compares the same two-room plant and seeded readings,
+with one-minute passes and a restart midway. Unconstrained allocation toggles on every pass.
 
-The original seeded two-day learning simulation's final max−min spread improves from **0.152566 °C** in v0.5.1 to **0.151194 °C**. Day-two mean stays **20.9450–21.0796 °C**, targeting 21 °C; coefficient accuracy and exploration checks remain. With B unavailable in the shared-sensor house, A alone cannot maintain balance: the 12-hour mean is **15.2539 °C**, weighted standard deviation **7.2731 °C**. Grid searches verify A's objective-minimizing effort; a seven-day replay verifies bounded spread (peak **8.3697 °C**, last-day range **0.1316 °C**). The objective permits this tradeoff when the remaining system has poor reach. These are deterministic simulated results, not measured house performance.
+| Metric | Unconstrained | Protected |
+|---|---:|---:|
+| On/off changes | 240 | 18 |
+| Starts | 120 | 9 |
+| Shortest completed run | 1 min | 11 min |
+| Shortest completed off interval | 1 min | 13 min |
+| Maximum starts in a rolling hour | 30 | 3 |
+| Mean absolute house-average error | 0.0720 °C | 0.0748 °C |
+| Mean max−min room spread | 1.8495 °C | 1.8500 °C |
 
-The late-sensor regression also retains a frozen v0.4.1 controller comparison: B starts immediately under v0.5.2; the historical controller leaves it idle. Final weighted room standard deviation is **0.8438 °C** versus **2.4516 °C**. See `DESIGN.md` for fixture dynamics and explanations of existing test updates.
+The shared-sensor 12-hour replay now reaches mean **22.6444 °C** (target 22.5) and weighted
+standard deviation **0.4362 °C**. The late-sensor replay starts B after the initial five-minute
+off hold and ends at **0.8361 °C** weighted standard deviation, versus **2.4516 °C** for the
+frozen v0.4.1 comparison. The original fractional-duty two-day benchmark reaches final
+max−min spread **0.6888 °C** (v0.5.2: **0.1512 °C**), with day-two mean
+**20.5269–21.2575 °C**, target 21 °C. Its old exact-spread bound changes to 0.75 °C to reflect
+the intentional comfort swing; coefficient accuracy and the ±0.5 °C mean check remain.
+These are deterministic simulations, not measured house performance. `DESIGN.md` records
+historical v0.5.2 results and the current test changes.
 
 ## Lasting room changes
 
