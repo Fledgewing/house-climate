@@ -283,6 +283,18 @@ class HouseCoordinator(DataUpdateCoordinator):
             else None,
             dt_util.utcnow().timestamp(),
         )
+        if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            self.state.observe_report(
+                next(s for s in self.config["systems"] if s["entity_id"] == entity_id),
+                Device(
+                    hvac_action=new.attributes.get("hvac_action"),
+                    temperature=self.number(entity_id, "temperature"),
+                    current_temperature=self.number(entity_id, "current_temperature"),
+                    step=self.number(entity_id, "target_temp_step") or 0.5,
+                    name=new.name,
+                ),
+                self.config,
+            )
         self.reporting.activity(
             dt_util.utcnow().timestamp(),
             {

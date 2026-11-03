@@ -46,9 +46,46 @@ class ControlState:
     requested_efforts: dict[str, float] = field(default_factory=dict)
     effort_switches: dict[str, float] = field(default_factory=dict)
 
+    reported_actions: dict[str, str] = field(default_factory=dict)
+    reported_efforts: dict[str, float] = field(default_factory=dict)
+    reported_names: dict[str, str] = field(default_factory=dict)
+
     last_start: dict[str, float] = field(default_factory=dict)
     last_stop: dict[str, float] = field(default_factory=dict)
     starts: dict[str, list[float]] = field(default_factory=dict)
+
+    def observe_report(self, system, device, config):
+        """Retain reported actuator input separately from unknown runtime."""
+        action = device.hvac_action
+        if not device.available or action not in (
+            "heating",
+            "cooling",
+            "idle",
+            "off",
+            "fan",
+            "drying",
+        ):
+            return
+        key = system["entity_id"]
+        effort = 0.0
+        if action in ("heating", "cooling"):
+            direction = 1 if action == "heating" else -1
+            effort = 1.0
+            if system.get("modulating", device.step < 0.5) and all(
+                value is not None and isfinite(value)
+                for value in (device.temperature, device.current_temperature)
+            ):
+                effort = clamp(
+                    direction
+                    * (device.temperature - device.current_temperature)
+                    / config.get("run_margin", 1),
+                    0,
+                    1,
+                )
+            effort *= direction
+        self.reported_actions[key] = action
+        self.reported_efforts[key] = effort
+        self.reported_names[key] = device.name or key
 
     def cycling_status(self, system, now):
         running = self.actions.get(system) in ("heating", "cooling")
@@ -249,6 +286,12 @@ def allocate(
         for s in config["systems"]
         if devices.get(s["entity_id"], Device(available=False)).available
     ]
+    fixed = {
+        s["entity_id"]: state.reported_efforts.get(s["entity_id"], 0)
+        for s in config["systems"]
+        if state and s["entity_id"] not in systems
+    }
+    forecast_systems = systems + list(fixed)
     weights_by_room = {m["entity_id"]: m.get("weight", 1) for m in config["sensors"]}
     total = sum(weights_by_room[r] for r in rooms)
     weights = [weights_by_room[r] / total for r in rooms]
@@ -260,12 +303,18 @@ def allocate(
     for room in rooms:
         if learning and room in learning.rows:
             passive, coefficients = learning.forecast(
-                room, values[room], systems, steps, outdoor, solar, sources
+                room, values[room], forecast_systems, steps, outdoor, solar, sources
             )
         else:
-            passive, coefficients = values[room], [steps * PRIOR_B] * len(systems)
-        base.append(passive)
-        effects.append([direction * b for b in coefficients])
+            passive, coefficients = (
+                values[room],
+                [steps * PRIOR_B] * len(forecast_systems),
+            )
+        base.append(
+            passive
+            + sum(b * u for b, u in zip(coefficients[len(systems) :], fixed.values()))
+        )
+        effects.append([direction * b for b in coefficients[: len(systems)]])
     mean_base = sum(w * t for w, t in zip(weights, base))
     mean_effect = [
         sum(w * line[j] for w, line in zip(weights, effects))
@@ -418,6 +467,10 @@ def control(
     ):
         mode = "off"
         notes.append("Outdoor temperature vetoed operation.")
+    for system in config["systems"]:
+        state.observe_report(
+            system, devices.get(system["entity_id"], Device(available=False)), config
+        )
     if not enabled:
         if state.excitation:
             state.last_excite[state.excitation["system"]] = now
@@ -466,7 +519,13 @@ def control(
         entity_id = system["entity_id"]
         device = devices.get(entity_id, Device(available=False))
         if not device.available:
-            notes.append(f"{entity_id} unavailable; skipped.")
+            action = state.reported_actions.get(entity_id)
+            name = state.reported_names.get(entity_id, device.name or entity_id)
+            notes.append(
+                f"{name} unavailable; assuming it continues {action} as last reported."
+                if action is not None
+                else f"{name} unavailable; no reported action; assuming off."
+            )
             continue
         target = state.setpoint
         if house is None:

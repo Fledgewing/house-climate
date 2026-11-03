@@ -216,3 +216,62 @@ def test_joint_allocation_beats_every_two_system_grid_point():
     )
     assert efforts["Mitsubishi"] == 0
     assert efforts["Bryant"] > 0.5
+
+
+@pytest.mark.parametrize(
+    "mode,action,sign", [("heat", "heating", 1), ("cool", "cooling", -1)]
+)
+@pytest.mark.parametrize("modulating,fraction", [(False, 1), (True, 0.4)])
+def test_unavailable_reported_input_reduces_remaining_effort(
+    mode, action, sign, modulating, fraction
+):
+    config = {
+        "sensors": [{"entity_id": "room"}],
+        "systems": [
+            {"entity_id": "lost", "modulating": modulating},
+            {"entity_id": "live", "modulating": True},
+        ],
+        "switch_penalty": 0,
+        "effort_change_penalty": 0,
+        "comfort_band": 0,
+    }
+    model = Learning(["room"], ["lost", "live"])
+    model.rows["room"].theta[1:3] = [0.1, 0.2]
+    model.rows["room"].counts = [1e9, 1e9]
+    state = ControlState(mode=mode, active_mode=mode)
+    state.observe_report(
+        config["systems"][0],
+        Device(
+            hvac_action=action,
+            temperature=20 + sign * fraction,
+            current_temperature=20,
+            name="Home ZONE 1",
+        ),
+        config,
+    )
+    devices = {"lost": Device(available=False), "live": Device(current_temperature=20)}
+    values = {"room": 21 - sign}
+    off, _ = allocate(
+        config, values, devices, mode, 21, learning=model, state=ControlState()
+    )
+    running, predicted = allocate(
+        config, values, devices, mode, 21, learning=model, state=state
+    )
+    assert set(running) == {"live"}
+    assert abs(running["live"]) < abs(off["live"])
+    assert abs(off["live"] - running["live"]) == pytest.approx(fraction / 2)
+    assert predicted == pytest.approx(21)
+    decision = control(
+        config, state, {"room": Reading(values["room"])}, devices, 0, learning=model
+    )
+    assert all(key == "live" for key, _, _ in decision.commands)
+    assert (
+        f"Home ZONE 1 unavailable; assuming it continues {action} as last reported"
+        in decision.explanation
+    )
+    assert state.actions["lost"] is None
+    assert state.reported_actions["lost"] == action
+    # A known idle report replaces running evidence and contributes exactly zero.
+    state.observe_report(config["systems"][0], Device(hvac_action="idle"), config)
+    idle, _ = allocate(config, values, devices, mode, 21, learning=model, state=state)
+    assert idle == pytest.approx(off)

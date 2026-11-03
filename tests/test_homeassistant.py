@@ -2432,3 +2432,47 @@ async def test_newer_recorder_stop_replaces_stale_store_action_without_retiming(
         assert c.state.actions[key] == "idle"
     finally:
         hass.data.pop(DATA_INSTANCE)
+
+
+async def test_outage_report_survives_restart_without_commands_or_learning(
+    hass, installed
+):
+    from custom_components.house_climate.coordinator import HouseCoordinator
+
+    entry, calls = installed
+    c = entry.runtime_data
+    key = "climate.ducted"
+    c.enabled = True
+    c.state.mode = c.state.active_mode = "heat"
+    c.config["systems"][0]["modulating"] = True
+    hass.states.async_set(
+        key,
+        "heat",
+        {
+            "hvac_action": "heating",
+            "temperature": 20.4,
+            "current_temperature": 20,
+            "friendly_name": "Home ZONE 1",
+        },
+    )
+    await hass.async_block_till_done()
+    # Reports between control ticks must also be retained.
+    assert c.state.reported_efforts[key] == pytest.approx(0.4)
+    hass.states.async_set(key, "unavailable")
+    await hass.async_block_till_done()
+    calls.clear()
+    await c.async_tick()
+    assert not any(entity == key for entity, _, _ in calls)
+    assert c.samples[-1]["efforts"][key] is None
+    restored = HouseCoordinator(hass, entry)
+    await restored.async_load()
+    calls.clear()
+    await restored.async_tick()
+    assert restored.state.reported_actions[key] == "heating"
+    assert restored.state.reported_efforts[key] == pytest.approx(0.4)
+    assert (
+        "Home ZONE 1 unavailable; assuming it continues heating as last reported"
+        in restored.data.explanation
+    )
+    assert restored.samples[-1]["efforts"][key] is None
+    assert not any(entity == key for entity, _, _ in calls)

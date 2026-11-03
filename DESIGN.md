@@ -54,7 +54,7 @@ by domain and, for temperature, power and occupancy sources, device class.
   `modulating` can override target-step-based capability inference. Legacy offset clamp, slew and PI
   gains remain readable for compatibility but no longer govern commands.
 
-## Control loop (v0.5.3)
+## Control loop (v0.5.4)
 
 Every control interval, and immediately when the house setpoint or mode changes:
 
@@ -182,7 +182,7 @@ Every control interval, and immediately when the house setpoint or mode changes:
    re-asserts (the House thermostat is the one control).
 6. Fallbacks: if no member sensor is available, every system gets the house setpoint, subject
    to reported cycling holds. Without any local/house reference, retain an on-held target or
-   use HVAC off for an off hold. If target limits prevent an off hold, also use HVAC off. If a system is unavailable, skip it and keep controlling the others.
+   use HVAC off for an off hold. If target limits prevent an off hold, also use HVAC off. If a system is unavailable, issue it no commands and keep controlling the others. Include its last reported signed effort as a fixed input in every horizon step, with the normal objective weights unchanged.
 
 State (setpoint, mode, integrator values, last mode switch) survives restarts via `RestoreEntity`
 / `Store`.
@@ -780,3 +780,17 @@ remain. HA fixture updates choose an outside target distinct from the new protec
 allow new system options, establish old off evidence before testing excitation, and expect
 persisted action identities with fresh runtime endpoints on reload. These are deterministic
 simulations, not measured performance.
+
+
+## Unavailable systems (v0.5.4)
+
+Persist the last known reported HVAC action, signed effort and display name separately
+from current runtime observations. Heating/cooling contributes full signed effort for
+cycling units; modulating units use the last reported target relative to their own
+reading, divided by run margin and bounded to 0..1 in the reported action direction.
+Idle/off/fan/drying contributes zero. Missing target/own readings fall back to full
+reported running effort; with no known action, assume off. Unknown reports do not
+replace retained evidence. During an outage, fold each retained input through its
+system's forecast coefficient into the passive forecast, outside the decision variables.
+The retained assumption survives Store restore, and `last_decision` names the system
+and its assumed action. Current unknown runtime still skips learning intervals.
