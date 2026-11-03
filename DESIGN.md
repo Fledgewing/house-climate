@@ -30,7 +30,9 @@ by domain and, for temperature, power and occupancy sources, device class.
   (max − min of member sensors).
 - `sensor.house_learning` and `button.house_reset_learning`: model confidence, fitted room effects and reset.
 - `sensor.house_<system>_offset` per system: the current offset from the house setpoint.
-- `switch.house_climate_control`: when off, the integration observes and logs but sends no commands.
+- `switch.house_climate_control`: when off, the integration observes and logs but sends no commands, including fan/vane commands.
+- `switch.house_fan_control` (default on): when off, leave fan/vane settings alone.
+- `sensor.house_fan_learning`: confidence percent, per-context option rewards/counts and best fan/vane settings.
 - Attributes on `climate.house` explain the last decision in plain words (`last_decision`), plus
   the per-sensor readings used.
 
@@ -45,7 +47,7 @@ by domain and, for temperature, power and occupancy sources, device class.
   mode 60 min, sensor stale after 720 min (12 h), frozen after 4 h, median window `filter_minutes` 15 min, maximum sensor rate
   `max_rate` 0.5 °C/min, offset clamp ±3.0 °C, max offset change per interval 0.5 °C.
 
-## Control loop (v0.2.2)
+## Control loop (v0.3.0)
 
 Every control interval, and immediately when the house setpoint or mode changes:
 
@@ -108,7 +110,8 @@ Every control interval, and immediately when the house setpoint or mode changes:
    weighted contribution first. During initial learning, add the exploration offset described below.
    Keep conditional integration/anti-windup, ±offset clamp, interval slew limit, 0.5 °C rounding,
    and device min/max target limits.
-4. Write only what changed: `climate.set_hvac_mode`, then `climate.set_temperature`. For a system with a
+4. Run the fan/vane scheduler described below, adding at most one changed fan/vane command.
+   Write only what changed: `climate.set_hvac_mode`, then `climate.set_temperature`. For a system with a
    configured required preset, re-assert that preset if it has left it.
 5. Track each system's last successfully commanded mode and target. Report an outside change
    in `last_decision` only when the reported mode/target differs from that command and more
@@ -188,11 +191,68 @@ loop. It checks every learned coefficient within 0.003 °C/interval of truth, ho
 0.5 °C throughout day two, spread improvement against learning disabled, useful learning within
 hours, and exploration active early but absent at the end.
 
+## Fan/vane learning (v0.3.0)
+
+Pure `fans.py` implements a contextual UCB bandit per system and per action (`fan`, `swing`).
+Action options are read from each climate entity's `fan_modes` and `swing_modes` on every pass;
+missing/empty lists offer no action. No mode names or preferred speeds/positions are encoded.
+All options start with mean reward zero and sample count zero. Untried arms are selected with
+random tie breaks; thereafter select the largest `mean_reward + sqrt(2 ln(N+1)/n)`, with random
+score ties. Systems/actions take turns through one global experiment scheduler.
+
+Context keys encode heat/cool, `floor(outdoor/5)*5` (including negative bands), and whether that
+system is heating/cooling. Unknown outdoor temperature offers no context. On each observation,
+compute `r = −Σ w_i(T_i−mean)²/Σw_i − λ(mean−S)²` using filtered reporting temperatures and the
+configured sensor weights. `fan_reward_lambda` is λ, default 1 (options: 0–100). Hold the selected
+setting for at least `fan_hold_minutes` (default 30, options: 1–1440), then update that arm's mean
+with the time-weighted reward over the complete hold. Observation rewards are held until the
+next pass. Selecting an already-current option sends nothing but still starts a full experiment.
+Only one action of one system can be commanded in a hold window; other chosen settings remain
+fixed. The PI temperature controller continues tracking the house setpoint throughout.
+
+A sensor transient, missing/stale/not-reporting member, HVAC mode switch, user house/physical
+setpoint change or selected-context change dirties the complete experiment. Events between ticks
+latch dirtiness; recovery before a tick cannot make it train. Dirty windows retain their deadline
+but contribute no sample. Disabled house/fan control invalidates experiments and sends no fan/vane
+commands. Commands use `climate.set_fan_mode` / `climate.set_swing_mode` only when different.
+Failures discard the window. Re-assert outside changes to chosen settings, restarting a full
+hold; another action's re-assertion waits for the global deadline. Outside-change notices use the
+same two-minute echo grace as targets. The required preset path remains unchanged.
+
+Store retains option means/counts by context, chosen settings, scheduler cursor and active
+experiment identity, plus the fan-control switch. Restarts keep the fit but restart a full hold,
+never crediting unobserved downtime. Removed systems are pruned; new options start neutral.
+The existing reset-learning button resets this learner too. `sensor.house_fan_learning` attributes
+are `systems[entity][fan/swing][context]` with sampled `best` and `options[mode]` containing
+`mean_reward` and `samples`, plus `last_decision`. Unobserved contexts have no best. Confidence
+is mean `100*n/(n+10)` across discovered contexts, where n is the minimum option count in that
+context: an evidence-coverage indicator, not statistical certainty. The thermostat's `last_decision`
+also explains trying a setting to learn, the best so far with heat/cool and outdoor band, or an
+outside-change re-assertion. Human-readable device names are used for exploration/best notes.
+
+Quiet hours are **disabled by default** (`quiet_hours_enabled=false`), so no initial restrictions
+apply. Options provide `quiet_start=22:00`, `quiet_end=07:00`, and each system's optional
+`quiet_max_fan`, selected from its runtime `fan_modes`. Use HA local time, start inclusive/end
+exclusive, supporting midnight crossings; equal start/end means no quiet window. Inside the
+window only options up to the maximum's list index are eligible, plus `auto` (case insensitive)
+always. Outside it, when disabled, or without a matching maximum, all advertised options remain
+eligible. Quiet restrictions change candidate lists, never their reward priors; vanes are
+unrestricted. If a chosen fan becomes excluded, prioritize replacing it at the next global hold
+boundary, invalidating the interrupted experiment and retaining the one-action rule.
+
+Regression tests cover neutral/exploring arms, context buckets, weighted reward/λ, global holds,
+outside changes, quiet hours on/off and midnight crossings, skipped windows and persistence.
+A seeded three-fan physical simulation runs 600 half-hour experiments with five-minute physical
+steps: it learns the option whose equilibrium spread is 0.6 °C rather than 4.0 °C, selects it for
+100% of the final 100 windows, and keeps mean error below 0.008 °C. HA tests exercise actual service
+dispatch, both switches, options selectors, between-pass contamination and Store reloads.
+
 ## Code layout
 
 - `custom_components/house_climate/controller.py`: pure Python, no Home Assistant imports. Takes
-  readings + config + state, returns the commands and the explanation. All the logic above lives
+  readings + config + state, returns the commands and the explanation. Temperature control logic lives
   here and is unit-tested directly.
+- `fans.py`: pure contextual bandit, global fan/vane holds and quiet-hour eligibility.
 - `learning.py`: pure online RLS, confidence blending, runtime integration and model persistence.
 - `reporting.py`: pure persisted value-change and HVAC activity tracking for frozen sensors.
 - `filtering.py`: pure bounded time-weighted median and generic transient rejection.

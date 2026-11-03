@@ -5,7 +5,12 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
-    async_add_entities([HouseSwitch(entry.runtime_data, entry.entry_id)])
+    async_add_entities(
+        [
+            HouseSwitch(entry.runtime_data, entry.entry_id),
+            FanSwitch(entry.runtime_data, entry.entry_id),
+        ]
+    )
 
 
 class HouseSwitch(CoordinatorEntity, SwitchEntity):
@@ -25,3 +30,22 @@ class HouseSwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs):
         await self.coordinator.async_change(enabled=False)
+
+
+class FanSwitch(HouseSwitch):
+    _attr_name = "House fan control"
+    _attr_icon = "mdi:fan"
+
+    def __init__(self, coordinator, entry_id):
+        super().__init__(coordinator, entry_id)
+        self._attr_unique_id = f"{entry_id}_fan_control"
+
+    @property
+    def is_on(self):
+        return self.coordinator.fan_enabled
+
+    async def async_turn_on(self, **kwargs):
+        await self.coordinator.async_change(fan_enabled=True)
+
+    async def async_turn_off(self, **kwargs):
+        await self.coordinator.async_change(fan_enabled=False)

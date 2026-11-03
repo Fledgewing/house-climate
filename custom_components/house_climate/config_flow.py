@@ -101,10 +101,24 @@ class HouseSteps:
         system = self.settings["systems"][self.index]
         if user_input is not None:
             system["preset"] = user_input.get("preset", "").strip()
+            if "quiet_max_fan" in user_input:
+                system["quiet_max_fan"] = user_input["quiet_max_fan"]
             self.index += 1
             if self.index == len(self.settings["systems"]):
                 return await self.async_step_tunables()
             return await self.async_step_system()
+        entity = self.hass.states.get(system["entity_id"])
+        modes = entity.attributes.get("fan_modes") if entity else None
+        fan_fields = {}
+        if modes:
+            fan_fields[
+                vol.Optional(
+                    "quiet_max_fan",
+                    description={"suggested_value": system.get("quiet_max_fan")},
+                )
+            ] = selector.SelectSelector(
+                selector.SelectSelectorConfig(options=list(modes))
+            )
         return self.async_show_form(
             step_id="system",
             description_placeholders={"entity": system["entity_id"]},
@@ -114,6 +128,7 @@ class HouseSteps:
                         "preset",
                         description={"suggested_value": system.get("preset", "")},
                     ): selector.TextSelector(),
+                    **fan_fields,
                 }
             ),
         )
@@ -148,6 +163,8 @@ class HouseSteps:
             ] = entities(domain, device_class=device_class)
         for key, low, high, step in [
             ("interval", 1, 60, 1),
+            ("fan_hold_minutes", 1, 1440, 1),
+            ("fan_reward_lambda", 0, 100, 0.1),
             ("filter_minutes", 1, 120, 1),
             ("max_rate", 0.01, 10, 0.01),
             ("stale_after", 1, 10080, 1),
@@ -165,6 +182,15 @@ class HouseSteps:
         ]:
             fields[vol.Required(key, default=self.settings[key])] = number(
                 low, high, step
+            )
+        fields[
+            vol.Required(
+                "quiet_hours_enabled", default=self.settings["quiet_hours_enabled"]
+            )
+        ] = selector.BooleanSelector()
+        for key in ("quiet_start", "quiet_end"):
+            fields[vol.Required(key, default=self.settings[key])] = (
+                selector.TimeSelector()
             )
         return self.async_show_form(step_id="tunables", data_schema=vol.Schema(fields))
 

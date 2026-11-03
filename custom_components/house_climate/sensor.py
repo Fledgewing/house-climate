@@ -14,6 +14,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
     async_add_entities(
         [
             LearningSensor(coordinator, entry.entry_id),
+            FanLearningSensor(coordinator, entry.entry_id),
             HouseSensor(coordinator, entry.entry_id, "temperature"),
             HouseSensor(coordinator, entry.entry_id, "temperature_spread"),
             *[
@@ -68,3 +69,19 @@ class LearningSensor(CoordinatorEntity, SensorEntity):
     @property
     def extra_state_attributes(self):
         return self.coordinator.learning.diagnostics()
+
+
+class FanLearningSensor(LearningSensor):
+    _attr_name = "House fan learning"
+
+    def __init__(self, coordinator, entry_id):
+        super().__init__(coordinator, entry_id)
+        self._attr_unique_id = f"{entry_id}_fan_learning"
+
+    @property
+    def native_value(self):
+        return self.coordinator.fans.confidence_percent
+
+    @property
+    def extra_state_attributes(self):
+        return self.coordinator.fans.diagnostics()

@@ -84,6 +84,18 @@ class MockSystem(ClimateEntity):
         self._attr_preset_mode = preset_mode
         self.async_write_ha_state()
 
+    async def async_set_fan_mode(self, fan_mode):
+        self.calls.append((self.entity_id, "set_fan_mode", {"fan_mode": fan_mode}))
+        self._attr_fan_mode = fan_mode
+        self.async_write_ha_state()
+
+    async def async_set_swing_mode(self, swing_mode):
+        self.calls.append(
+            (self.entity_id, "set_swing_mode", {"swing_mode": swing_mode})
+        )
+        self._attr_swing_mode = swing_mode
+        self.async_write_ha_state()
+
 
 @pytest.fixture
 async def installed(hass, settings, request):
@@ -946,3 +958,184 @@ async def test_completed_transient_between_ticks_skips_learning(hass, installed)
     restored = entry.runtime_data.filters["sensor.room"]
     assert restored.rejected == saved["rejected"]
     assert restored.value((start + timedelta(minutes=6)).timestamp()) == 19
+
+
+async def prepare_fans(hass, installed):
+    from random import Random
+
+    entry, calls = installed
+    c = entry.runtime_data
+    c.fans.rng = Random(1)
+    c.config["outdoor_sensor"] = "sensor.outdoor"
+    hass.states.async_set("sensor.outdoor", "3")
+    system = hass.data[DATA_COMPONENT].get_entity("climate.ducted")
+    system._attr_supported_features |= (
+        ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.SWING_MODE
+    )
+    system._attr_fan_modes = ["gentle", "strong", "auto"]
+    system._attr_fan_mode = "strong"
+    system._attr_swing_modes = ["fixed", "moving"]
+    system._attr_swing_mode = "moving"
+    system.async_write_ha_state()
+    await hass.async_block_till_done()
+    await c.async_change(mode="heat")
+    return c, system, calls
+
+
+async def test_fan_vane_commands_hold_and_switches(hass, installed):
+    c, system, calls = await prepare_fans(hass, installed)
+    assert hass.states.get("switch.house_fan_control").state == "on"
+    assert hass.states.get("sensor.house_fan_learning").state == "0.0"
+    assert any(service == "set_fan_mode" for _, service, _ in calls)
+    assert system.fan_mode == "gentle"
+    assert system.preset_mode == "manual"
+    assert "trying ducted fan gentle to learn" in c.data.explanation
+    calls.clear()
+    await c.async_tick()
+    assert not any(
+        service in ("set_fan_mode", "set_swing_mode") for _, service, _ in calls
+    )
+    now = dt_util.utc_from_timestamp(c.fans.window["start"] + 1800)
+    # The next action is the same system's vane, only after the full hold.
+    c.fans.rng.seed(1)
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow", return_value=now
+    ):
+        await c.async_tick()
+    assert any(service == "set_swing_mode" for _, service, _ in calls)
+    for switch in ("switch.house_fan_control", "switch.house_climate_control"):
+        await hass.services.async_call(
+            "switch", "turn_off", {"entity_id": switch}, blocking=True
+        )
+        system._attr_fan_mode = "strong"
+        system._attr_swing_mode = "moving"
+        system.async_write_ha_state()
+        await hass.async_block_till_done()
+        calls.clear()
+        with patch(
+            "custom_components.house_climate.coordinator.dt_util.utcnow",
+            return_value=now + timedelta(hours=1),
+        ):
+            await c.async_tick()
+        assert not any(
+            service in ("set_fan_mode", "set_swing_mode") for _, service, _ in calls
+        )
+        if switch.endswith("climate_control"):
+            assert not calls
+        else:
+            await hass.services.async_call(
+                "switch", "turn_on", {"entity_id": switch}, blocking=True
+            )
+
+
+@pytest.mark.parametrize("delay", [10, 121])
+async def test_external_fan_change_grace_and_reassert(hass, installed, delay):
+    c, system, calls = await prepare_fans(hass, installed)
+    choice, sent_at = c.last_fan_commands[("climate.ducted", "fan")]
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=sent_at + timedelta(seconds=delay),
+    ):
+        await system.async_set_fan_mode("strong")
+        await hass.async_block_till_done()
+        assert ("fan changed outside house control" in c.data.explanation) is (
+            delay > 120
+        )
+        calls.clear()
+        await c.async_tick()
+    assert ("climate.ducted", "set_fan_mode", {"fan_mode": choice}) in calls
+
+
+async def test_fans_store_restart_and_contaminated_event(hass, installed):
+    c, _, _ = await prepare_fans(hass, installed)
+    start = dt_util.utc_from_timestamp(c.fans.window["start"])
+    for minute, value in [(1, "unavailable"), (2, "19")]:
+        with patch(
+            "custom_components.house_climate.coordinator.dt_util.utcnow",
+            return_value=start + timedelta(minutes=minute),
+        ):
+            hass.states.async_set("sensor.room", value)
+            await hass.async_block_till_done()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(minutes=30),
+    ):
+        await c.async_tick()
+    assert all(
+        v["samples"] == 0
+        for actions in c.fans.arms.values()
+        for buckets in actions.values()
+        for arms in buckets.values()
+        for v in arms.values()
+    )
+    saved = (await c.store.async_load())["fans"]
+    await c.async_change(fan_enabled=False)
+    entry, _ = installed
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    assert entry.runtime_data.fans.arms == saved["arms"]
+    assert entry.runtime_data.fans.chosen == saved["chosen"]
+    assert not entry.runtime_data.fan_enabled
+
+
+async def test_options_quiet_limit_from_runtime_modes(hass, settings):
+    hass.states.async_set(
+        "climate.ducted", "heat", {"fan_modes": ["slowish", "faster", "auto"]}
+    )
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=DOMAIN, data=settings)
+    entry.add_to_hass(hass)
+    flow = hass.config_entries.options
+    result = await flow.async_init(entry.entry_id)
+    result = await flow.async_configure(
+        result["flow_id"], {"sensors": ["sensor.room"], "systems": ["climate.ducted"]}
+    )
+    result = await flow.async_configure(result["flow_id"], {"weight": 1})
+    fields = {k.schema: v for k, v in result["data_schema"].schema.items()}
+    assert fields["quiet_max_fan"].config["options"] == ["slowish", "faster", "auto"]
+    result = await flow.async_configure(result["flow_id"], {"quiet_max_fan": "slowish"})
+    fields = {k.schema: k for k in result["data_schema"].schema}
+    assert fields["quiet_hours_enabled"].default() is False
+    assert fields["quiet_start"].default() == "22:00"
+    assert fields["quiet_end"].default() == "07:00"
+    inputs = {
+        k: v for k, v in DEFAULTS.items() if k not in ("sensors", "systems") and v != ""
+    }
+    inputs["quiet_hours_enabled"] = True
+    result = await flow.async_configure(result["flow_id"], inputs)
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert entry.options["systems"][0]["quiet_max_fan"] == "slowish"
+
+
+@pytest.mark.parametrize("reason", ["transient", "not_reporting", "mode", "setpoint"])
+async def test_fan_windows_skip_real_contamination(hass, installed, reason):
+    c, system, _ = await prepare_fans(hass, installed)
+    start = dt_util.utc_from_timestamp(c.fans.window["start"])
+    for minute in (1, 3):
+        with patch(
+            "custom_components.house_climate.coordinator.dt_util.utcnow",
+            return_value=start + timedelta(minutes=minute),
+        ):
+            if reason == "transient":
+                hass.states.async_set("sensor.room", "15" if minute == 1 else "19")
+            elif reason == "not_reporting":
+                if minute == 1:
+                    c.reporting.sensors["sensor.room"]["frozen"] = True
+                    await c.async_tick()
+                else:
+                    hass.states.async_set("sensor.room", "19.1")
+            elif reason == "mode":
+                await system.async_set_hvac_mode("cool" if minute == 1 else "heat")
+            else:
+                await c.async_change(setpoint=20 if minute == 1 else 19)
+            await hass.async_block_till_done()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(minutes=30),
+    ):
+        await c.async_tick()
+    assert all(
+        v["samples"] == 0
+        for actions in c.fans.arms.values()
+        for buckets in actions.values()
+        for arms in buckets.values()
+        for v in arms.values()
+    )

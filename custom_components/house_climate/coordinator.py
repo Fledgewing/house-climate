@@ -23,6 +23,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .controller import ControlState, Device, Reading, control
+from .fans import FanLearning, quiet_modes
 from .filtering import SensorFilter
 from .learning import EffortTracker, Learning
 from .reporting import Reporting
@@ -38,6 +39,11 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.config = dict(entry.options or entry.data)
         self.state = ControlState()
         self.enabled = True
+        self.fan_enabled = True
+        self.fans = FanLearning(
+            self.config.get("fan_hold_minutes", 30),
+            self.config.get("fan_reward_lambda", 1),
+        )
         self.restored = False
         self.initialized = False
         self.awaiting_mode = False
@@ -45,6 +51,7 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
         self.lock = asyncio.Lock()
         self.last_commands = {}
+        self.last_fan_commands = {}
         self.learning = self.new_learning()
         self.effort = EffortTracker()
         self.learning_baseline = None
@@ -71,6 +78,13 @@ class HouseCoordinator(DataUpdateCoordinator):
         if saved := await self.store.async_load():
             self.state = ControlState(**saved["state"])
             self.enabled = saved.get("enabled", True)
+            self.fan_enabled = saved.get("fan_enabled", True)
+            self.fans = FanLearning(
+                self.config.get("fan_hold_minutes", 30),
+                self.config.get("fan_reward_lambda", 1),
+                saved.get("fans"),
+            )
+            self.fans.reconcile([s["entity_id"] for s in self.config["systems"]])
             self.samples = saved.get("samples", [])
             self.restored = True
             self.reporting = Reporting(saved.get("reporting"))
@@ -136,6 +150,8 @@ class HouseCoordinator(DataUpdateCoordinator):
             value if value is not None and isfinite(value) else None,
             dt_util.utcnow().timestamp(),
         )
+        if value is None or not isfinite(value) or self.filters[entity_id].blocked:
+            self.fans.invalidate()
         # Recover control and repairs on the first numeric change, even between ticks.
         if entity_id in self.not_reporting:
             self.hass.async_create_task(self.async_tick(record=False))
@@ -163,8 +179,39 @@ class HouseCoordinator(DataUpdateCoordinator):
             else None,
             dt_util.utcnow().timestamp(),
         )
+        if old and new:
+            commanded_target = self.last_commands.get(entity_id)
+            if old.attributes.get("temperature") != new.attributes.get(
+                "temperature"
+            ) and (
+                not commanded_target
+                or new.attributes.get("temperature") != commanded_target[1]
+            ):
+                self.fans.invalidate()
+            if old.state != new.state or any(
+                old.attributes.get(f"{action}_mode")
+                != new.attributes.get(f"{action}_mode")
+                and new.attributes.get(f"{action}_mode")
+                != self.fans.chosen.get(entity_id, {}).get(action)
+                for action in ("fan", "swing")
+            ):
+                self.fans.invalidate()
         if self.lock.locked() or self.data is None or old is None or new is None:
             return
+        for action in ("fan", "swing"):
+            commanded = self.last_fan_commands.get((entity_id, action))
+            if commanded and old.attributes.get(f"{action}_mode") != new.attributes.get(
+                f"{action}_mode"
+            ):
+                choice, sent_at = commanded
+                if (
+                    new.attributes.get(f"{action}_mode") != choice
+                    and (dt_util.utcnow() - sent_at).total_seconds() > 120
+                ):
+                    note = f" {entity_id} {action} changed outside house control; next interval will re-assert."
+                    self.async_set_updated_data(
+                        replace(self.data, explanation=self.data.explanation + note)
+                    )
         if old.state != new.state or old.attributes.get(
             "temperature"
         ) != new.attributes.get("temperature"):
@@ -323,6 +370,15 @@ class HouseCoordinator(DataUpdateCoordinator):
             if outdoor is None:
                 outdoor = self.number(self.config.get("weather_entity"), "temperature")
             solar = self.solar_kw()
+            fan_clean = all(
+                not self.filters[key].blocked
+                and reading.reporting
+                and reading.value is not None
+                and reading.age <= self.config.get("stale_after", 720) * 60
+                for key, reading in readings.items()
+            )
+            if not fan_clean:
+                self.fans.invalidate()
             if record:
                 efforts, duration = self.effort.finish(
                     {
@@ -378,6 +434,45 @@ class HouseCoordinator(DataUpdateCoordinator):
                 )
             if adoption:
                 decision.explanation = f"{adoption} {decision.explanation}"
+            fan_systems = {}
+            for entity_id, device in devices.items():
+                entity = self.hass.states.get(entity_id)
+                attrs = entity.attributes if entity else {}
+                fan_systems[entity_id] = {
+                    "available": device.available,
+                    "name": entity.name if entity else entity_id,
+                    "running": device.hvac_action in ("heating", "cooling"),
+                    "fan_mode": attrs.get("fan_mode"),
+                    "swing_mode": attrs.get("swing_mode"),
+                    "fan_modes": quiet_modes(
+                        attrs.get("fan_modes") or [],
+                        next(
+                            s
+                            for s in self.config["systems"]
+                            if s["entity_id"] == entity_id
+                        ).get("quiet_max_fan"),
+                        self.config.get("quiet_hours_enabled", False),
+                        dt_util.as_local(now).strftime("%H:%M"),
+                        self.config.get("quiet_start", "22:00")[:5],
+                        self.config.get("quiet_end", "07:00")[:5],
+                    ),
+                    "swing_modes": attrs.get("swing_modes") or [],
+                }
+            fan_command = self.fans.tick(
+                now.timestamp(),
+                self.state.active_mode,
+                outdoor,
+                fan_systems,
+                decision.readings,
+                {m["entity_id"]: m.get("weight", 1) for m in self.config["sensors"]},
+                self.state.setpoint,
+                valid=fan_clean,
+                enabled=self.enabled and self.fan_enabled and self.state.mode != "off",
+            )
+            if fan_command:
+                decision.commands.append(fan_command)
+            if self.enabled and self.fan_enabled:
+                decision.explanation += " " + self.fans.last_decision
             failures = set()
             for entity_id, service, data in decision.commands:
                 if entity_id in failures:
@@ -389,6 +484,12 @@ class HouseCoordinator(DataUpdateCoordinator):
                         {"entity_id": entity_id, **data},
                         blocking=True,
                     )
+                    if service in ("set_fan_mode", "set_swing_mode"):
+                        action = "fan" if service == "set_fan_mode" else "swing"
+                        self.last_fan_commands[(entity_id, action)] = (
+                            data[f"{action}_mode"],
+                            dt_util.utcnow(),
+                        )
                     if service in ("set_hvac_mode", "set_temperature"):
                         device = devices[entity_id]
                         mode, target, _ = self.last_commands.get(
@@ -401,6 +502,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                         )
                 except HomeAssistantError as err:
                     failures.add(entity_id)
+                    self.fans.invalidate()
                     decision.explanation += f" {entity_id}: command failed ({err})."
                     _LOGGER.warning("Command to %s failed: %s", entity_id, err)
             _LOGGER.debug("%s", decision.explanation)
@@ -431,6 +533,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                 {
                     "state": asdict(self.state),
                     "enabled": self.enabled,
+                    "fan_enabled": self.fan_enabled,
+                    "fans": self.fans.to_dict(),
                     "samples": self.samples,
                     "learning": self.learning.to_dict(),
                     "reporting": self.reporting.to_dict(),
@@ -559,6 +663,10 @@ class HouseCoordinator(DataUpdateCoordinator):
     async def async_reset_learning(self):
         async with self.lock:
             self.learning = self.new_learning()
+            self.fans = FanLearning(
+                self.config.get("fan_hold_minutes", 30),
+                self.config.get("fan_reward_lambda", 1),
+            )
             self.learning_baseline = None
             self.effort = EffortTracker()
         await self.async_tick(record=False)
@@ -585,9 +693,17 @@ class HouseCoordinator(DataUpdateCoordinator):
             )
         return f"{note} Starting House target is {self.state.setpoint:.1f} °C."
 
-    async def async_change(self, *, setpoint=None, delta=None, mode=None, enabled=None):
+    async def async_change(
+        self, *, setpoint=None, delta=None, mode=None, enabled=None, fan_enabled=None
+    ):
         # Mutations share the lock with in-flight commands.
         async with self.lock:
+            if any(
+                v is not None for v in (delta, setpoint, mode, enabled, fan_enabled)
+            ):
+                self.fans.invalidate()
+            if fan_enabled is not None:
+                self.fan_enabled = fan_enabled
             if delta is not None:
                 setpoint = self.state.setpoint + delta
             if setpoint is not None:
