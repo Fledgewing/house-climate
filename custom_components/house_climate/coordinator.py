@@ -43,6 +43,7 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.fans = FanLearning(
             self.config.get("fan_hold_minutes", 30),
             self.config.get("fan_reward_lambda", 1),
+            learn_exclude_modes=self.config.get("learn_exclude_modes", "auto"),
         )
         self.restored = False
         self.initialized = False
@@ -83,7 +84,8 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.fans = FanLearning(
                 self.config.get("fan_hold_minutes", 30),
                 self.config.get("fan_reward_lambda", 1),
-                saved.get("fans"),
+                learn_exclude_modes=self.config.get("learn_exclude_modes", "auto"),
+                saved=saved.get("fans"),
             )
             self.fans.reconcile([s["entity_id"] for s in self.config["systems"]])
             self.samples = saved.get("samples", [])
@@ -710,6 +712,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.fans = FanLearning(
                 self.config.get("fan_hold_minutes", 30),
                 self.config.get("fan_reward_lambda", 1),
+                learn_exclude_modes=self.config.get("learn_exclude_modes", "auto"),
             )
             self.learning_baseline = None
             self.effort = EffortTracker()

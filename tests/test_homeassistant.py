@@ -1098,13 +1098,16 @@ async def test_options_quiet_limit_from_runtime_modes(hass, settings):
     assert fields["quiet_hours_enabled"].default() is False
     assert fields["quiet_start"].default() == "22:00"
     assert fields["quiet_end"].default() == "07:00"
+    assert fields["learn_exclude_modes"].default() == "auto"
     inputs = {
         k: v for k, v in DEFAULTS.items() if k not in ("sensors", "systems") and v != ""
     }
     inputs["quiet_hours_enabled"] = True
+    inputs["learn_exclude_modes"] = "auto, strong"
     result = await flow.async_configure(result["flow_id"], inputs)
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert entry.options["systems"][0]["quiet_max_fan"] == "slowish"
+    assert entry.options["learn_exclude_modes"] == "auto, strong"
 
 
 @pytest.mark.parametrize("reason", ["transient", "not_reporting", "mode", "setpoint"])
@@ -1184,9 +1187,13 @@ async def test_startup_waits_and_restores_pi_without_restart_excursion(hass, ins
 
 
 @pytest.mark.parametrize("problem", ["transient", "missing", "not_reporting"])
-async def test_minor_sensor_does_not_block_fan_samples(hass, installed, problem):
+async def test_minor_sensor_does_not_block_fan_samples(
+    hass, installed, problem, freezer
+):
     from custom_components.house_climate.filtering import SensorFilter
 
+    # Keep this sensor test within one thermal exploration phase.
+    freezer.move_to("2026-11-02 12:05:00+00:00")
     c, _, _ = await prepare_fans(hass, installed)
     c.fans.window["dirty"] = False  # Initial HVAC mode change is already observed.
     c.config["sensors"].append({"entity_id": "sensor.minor", "weight": 0.01})
@@ -1298,3 +1305,40 @@ async def test_quiet_window_caps_fan_on_first_pass(hass, installed):
     assert fan_calls == [("set_fan_mode", {"fan_mode": "gentle"})]
     assert system.fan_mode == "gentle"
     assert c.fans.window["start"] == (before + timedelta(minutes=1)).timestamp()
+
+
+@pytest.mark.parametrize("action", ["fan", "swing"])
+async def test_current_auto_moves_to_learnable_mode(hass, installed, action):
+    c, system, calls = await prepare_fans(hass, installed)
+    await c.async_reset_learning()
+    setattr(system, f"_attr_{action}_modes", ["low", "Auto"])
+    setattr(system, f"_attr_{action}_mode", "Auto")
+    system.async_write_ha_state()
+    await hass.async_block_till_done()
+    c.fans.window = None
+    c.fans.chosen = {}
+    calls.clear()
+    await c.async_tick()
+    fan_calls = [
+        (service, data)
+        for _, service, data in calls
+        if service in ("set_fan_mode", "set_swing_mode")
+    ]
+    assert fan_calls == [(f"set_{action}_mode", {f"{action}_mode": "low"})]
+    assert "Auto" not in c.fans.arms["climate.ducted"][action][c.fans.window["bucket"]]
+
+
+async def test_load_reconciles_configured_fan_exclusions(hass, installed):
+    c, _, _ = await prepare_fans(hass, installed)
+    saved = await c.store.async_load()
+    bucket = c.fans.window["bucket"]
+    saved["fans"]["arms"]["climate.ducted"]["fan"][bucket]["auto"] = {
+        "samples": 10,
+        "mean_reward": 1,
+    }
+    await c.store.async_save(saved)
+    await c.async_load()
+    assert "auto" not in c.fans.arms["climate.ducted"]["fan"][bucket]
+    c.config["learn_exclude_modes"] = "auto, STRONG"
+    await c.async_reset_learning()
+    assert "strong" not in c.fans.arms["climate.ducted"]["fan"][bucket]

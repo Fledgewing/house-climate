@@ -12,6 +12,7 @@ DEFAULTS = {
     "interval": 5,
     "fan_hold_minutes": 30,
     "fan_reward_lambda": 1.0,
+    "learn_exclude_modes": "auto",
     "quiet_hours_enabled": False,
     "quiet_start": "22:00",
     "quiet_end": "07:00",

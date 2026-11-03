@@ -69,7 +69,13 @@ Learning requires outdoor temperature, known HVAC actions, and both temperature 
 House Climate also learns which fan and vane/swing settings reduce weighted room temperature
 variance while keeping the weighted house mean on your setpoint. It reads each climate entity's
 own `fan_modes` and `swing_modes` at runtime. Systems without either list have no corresponding
-action. Every option starts equally; no speed or vane position is assumed to be better.
+action. In v0.3.2, `learn_exclude_modes` in Configure is comma-separated text, default **auto**,
+matched case-insensitively with whitespace trimmed. It excludes modes from both fan and swing
+learning: auto lets the unit choose its own setting, mixing rewards the bandit cannot attribute.
+Other advertised modes, including `swing`, remain learnable. An action with every mode excluded
+is left alone. A system on an excluded mode moves to a learnable arm at the next scheduler
+decision, using that window's one change. Excluded saved arms and choices are dropped on load.
+Every learnable option starts equally; no speed or vane position is assumed to be better.
 
 A contextual UCB bandit learns separately for each system and action type, heat/cool mode,
 5 °C outdoor band, and running/idle status. It explores untried options, then balances measured
@@ -101,10 +107,11 @@ Quiet hours are optional and **OFF by default**: no fan limits apply unless you 
 `quiet_hours_enabled` in Configure. `quiet_start` defaults to **22:00**, `quiet_end` to **07:00**,
 using Home Assistant local time and supporting midnight crossings (end exclusive; equal times
 mean no quiet window). Each system's optional `quiet_max_fan` selector comes from its advertised
-fan modes. During quiet hours, options after that maximum in list order are excluded; `auto`
-is always allowed. Outside quiet hours all modes are eligible. With no maximum selected the
-system is unrestricted. A restriction takes effect at the next global hold boundary, preserving
-one-action experiments; vanes have no quiet restriction.
+fan modes. During quiet hours, options after that maximum in list order are excluded, with no
+exception for `auto`. Outside quiet hours all learnable modes are eligible. With no maximum
+selected there is no quiet cap. A quiet cap takes effect on the first pass inside the window,
+interrupting the current experiment and discarding its sample, with at most one action changed
+per pass; vanes have no quiet restriction.
 
 ## State and recording
 

@@ -192,11 +192,18 @@ loop. It checks every learned coefficient within 0.003 °C/interval of truth, ho
 0.5 °C throughout day two, spread improvement against learning disabled, useful learning within
 hours, and exploration active early but absent at the end.
 
-## Fan/vane learning (v0.3.1)
+## Fan/vane learning (v0.3.2)
 
 Pure `fans.py` implements a contextual UCB bandit per system and per action (`fan`, `swing`).
 Action options are read from each climate entity's `fan_modes` and `swing_modes` on every pass;
-missing/empty lists offer no action. No mode names or preferred speeds/positions are encoded.
+missing/empty lists offer no action. The comma-separated options field `learn_exclude_modes`
+(default `auto`) excludes matching names case-insensitively from both actions, trimming whitespace
+and ignoring empty entries. Auto lets the unit choose its speed/position, so its mixed reward
+cannot teach the bandit a specific setting. All other options come from the entity; no preferred
+speeds/positions are encoded. An action with every mode excluded is left alone and has no arms.
+A current excluded mode is moved to a learnable arm at the next scheduler decision, counting as
+that hold window's one change. Loading persisted learning drops excluded arms, choices and active
+experiment identities, retaining other experience.
 All options start with mean reward zero and sample count zero. Untried arms are selected with
 random tie breaks; thereafter select the largest `mean_reward + sqrt(2 ln(N+1)/n)`, with random
 score ties. Systems/actions take turns through one global experiment scheduler.
@@ -238,8 +245,8 @@ Quiet hours are **disabled by default** (`quiet_hours_enabled=false`), so no ini
 apply. Options provide `quiet_start=22:00`, `quiet_end=07:00`, and each system's optional
 `quiet_max_fan`, selected from its runtime `fan_modes`. Use HA local time, start inclusive/end
 exclusive, supporting midnight crossings; equal start/end means no quiet window. Inside the
-window only options up to the maximum's list index are eligible, plus `auto` (case insensitive)
-always. Outside it, when disabled, or without a matching maximum, all advertised options remain
+window only options up to the maximum's list index are eligible, with no exception for `auto`.
+Outside it, when disabled, or without a matching maximum, all learnable advertised options remain
 eligible. Quiet restrictions change candidate lists, never their reward priors; vanes are
 unrestricted. If the current fan becomes excluded, cap it on the first pass inside the quiet
 window, interrupting the global hold and discarding its sample. Start a fresh full hold

@@ -186,6 +186,11 @@ class HouseSteps:
             )
         fields[
             vol.Required(
+                "learn_exclude_modes", default=self.settings["learn_exclude_modes"]
+            )
+        ] = selector.TextSelector()
+        fields[
+            vol.Required(
                 "quiet_hours_enabled", default=self.settings["quiet_hours_enabled"]
             )
         ] = selector.BooleanSelector()

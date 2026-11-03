@@ -15,15 +15,11 @@ def context(mode, outdoor, running):
 def quiet_modes(
     modes, maximum, enabled=False, clock="12:00", start="22:00", end="07:00"
 ):
-    """List order defines the limit; auto remains allowed. End is exclusive."""
+    """List order defines the limit. End is exclusive."""
     inside = start <= clock < end if start < end else clock >= start or clock < end
     if not enabled or start == end or not inside or maximum not in modes:
         return list(modes)
-    return [
-        m
-        for i, m in enumerate(modes)
-        if i <= modes.index(maximum) or m.casefold() == "auto"
-    ]
+    return list(modes[: modes.index(maximum) + 1])
 
 
 def reward(values, weights, setpoint, penalty=1):
@@ -46,9 +42,21 @@ class FanLearning:
     and choices, then begin a fresh full hold without crediting downtime.
     """
 
-    def __init__(self, hold_minutes=30, penalty=1, saved=None, rng=None):
+    def __init__(
+        self,
+        hold_minutes=30,
+        penalty=1,
+        saved=None,
+        rng=None,
+        learn_exclude_modes="auto",
+    ):
         if hold_minutes <= 0 or penalty < 0:
             raise ValueError("Invalid fan learning parameters")
+        self.excluded = {
+            mode.strip().casefold()
+            for mode in learn_exclude_modes.split(",")
+            if mode.strip()
+        }
         self.hold = hold_minutes * 60
         self.penalty = penalty
         self.rng = rng or Random()
@@ -59,14 +67,36 @@ class FanLearning:
         self.window = None
         self.resume = saved.get("window")
         self.last_decision = "Waiting for fan learning context."
+        self.reconcile(self.arms.keys() | self.chosen.keys())
+
+    def learnable_modes(self, modes):
+        return [mode for mode in modes if mode.casefold() not in self.excluded]
 
     def reconcile(self, systems):
-        """Drop removed systems while retaining all matching experience."""
+        """Drop removed systems and excluded modes from persisted experience."""
         self.arms = {s: a for s, a in self.arms.items() if s in systems}
         self.chosen = {s: a for s, a in self.chosen.items() if s in systems}
-        if self.resume and self.resume["system"] not in systems:
+        for actions in self.arms.values():
+            for buckets in actions.values():
+                for bucket, arms in buckets.items():
+                    buckets[bucket] = {
+                        m: a
+                        for m, a in arms.items()
+                        if m.casefold() not in self.excluded
+                    }
+        for system, actions in self.chosen.items():
+            self.chosen[system] = {
+                a: m for a, m in actions.items() if m.casefold() not in self.excluded
+            }
+        if self.resume and (
+            self.resume["system"] not in systems
+            or self.resume["choice"].casefold() in self.excluded
+        ):
             self.resume = None
-        if self.window and self.window["system"] not in systems:
+        if self.window and (
+            self.window["system"] not in systems
+            or self.window["choice"].casefold() in self.excluded
+        ):
             self.window = None
 
     def invalidate(self):
@@ -79,6 +109,7 @@ class FanLearning:
             .setdefault(action, {})
             .setdefault(bucket, {})
         )
+        modes = self.learnable_modes(modes)
         for mode in modes:
             arms.setdefault(mode, {"mean_reward": 0.0, "samples": 0})
         return {m: arms[m] for m in modes}
@@ -114,6 +145,18 @@ class FanLearning:
         Caller supplies already restricted option lists and clean filtered rooms.
         Returns at most one (system, service, data) command, only if different.
         """
+        systems = {
+            system: {
+                **device,
+                **{
+                    f"{action}_modes": self.learnable_modes(
+                        device.get(f"{action}_modes", [])
+                    )
+                    for action in ("fan", "swing")
+                },
+            }
+            for system, device in systems.items()
+        }
         candidates = []
         for system, device in systems.items():
             bucket = context(mode, outdoor, device.get("running", False))
@@ -216,8 +259,11 @@ class FanLearning:
         restricted = [
             c
             for c in candidates
-            if self.chosen.get(c[0], {}).get(c[1]) is not None
-            and self.chosen[c[0]][c[1]] not in c[3]
+            if (
+                self.chosen.get(c[0], {}).get(c[1]) is not None
+                and self.chosen[c[0]][c[1]] not in c[3]
+            )
+            or str(systems[c[0]].get(f"{c[1]}_mode", "")).casefold() in self.excluded
         ]
         system, action, bucket, modes = (
             restricted[0] if restricted else candidates[self.cursor % len(candidates)]

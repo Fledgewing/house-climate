@@ -156,7 +156,7 @@ def test_quiet_off_restricts_nothing(clock):
 def test_quiet_cross_midnight(clock, limited):
     modes = ["unusual", "mediumish", "powerful", "auto"]
     assert quiet_modes(modes, "mediumish", True, clock) == (
-        modes[:2] + ["auto"] if limited else modes
+        modes[:2] if limited else modes
     )
 
 
@@ -249,3 +249,112 @@ def test_quiet_cap_without_experiment_or_outdoor_context(valid):
         {"fan_mode": "a"},
     )
     assert model.window is None
+
+
+@pytest.mark.parametrize(
+    "action,modes,expected",
+    [
+        ("fan", ["low", "med", "high", "auto"], ["low", "med", "high"]),
+        (
+            "fan",
+            ["superQuiet", "quiet", "low", "powerful", "superPowerful", "auto"],
+            ["superQuiet", "quiet", "low", "powerful", "superPowerful"],
+        ),
+        (
+            "swing",
+            [
+                "horizontal",
+                "midhorizontal",
+                "midpoint",
+                "midvertical",
+                "vertical",
+                "auto",
+                "swing",
+            ],
+            [
+                "horizontal",
+                "midhorizontal",
+                "midpoint",
+                "midvertical",
+                "vertical",
+                "swing",
+            ],
+        ),
+    ],
+)
+def test_default_excludes_auto_from_runtime_arms(action, modes, expected):
+    assert DEFAULTS["learn_exclude_modes"] == "auto"
+    model = FanLearning()
+    systems = {"unit": {f"{action}_modes": modes, f"{action}_mode": "auto"}}
+    command = tick(model, systems, 0)
+    assert list(model.arms["unit"][action]["heat|0|0"]) == expected
+    assert command[1] == f"set_{action}_mode"
+    assert systems["unit"][f"{action}_mode"] in expected
+    assert tick(model, systems, 1) is None
+
+
+@pytest.mark.parametrize(
+    "excluded,expected",
+    [
+        ("auto", ["low", "HIGH", "swing"]),
+        (" AUTO, high, , SWING ", ["low"]),
+        ("", ["low", "HIGH", "Auto", "swing"]),
+    ],
+)
+def test_case_insensitive_custom_exclusions(excluded, expected):
+    model = FanLearning(learn_exclude_modes=excluded)
+    for action in ("fan", "swing"):
+        arms = model.options(
+            "unit", action, "heat|0|1", ["low", "HIGH", "Auto", "swing"]
+        )
+        assert list(arms) == expected
+
+
+def test_excluded_current_mode_gets_next_window_before_other_actions():
+    model = FanLearning(rng=Random(1))
+    systems = devices()
+    systems["unit"].update(swing_modes=["vertical", "auto"], swing_mode="auto")
+    assert tick(model, systems, 0) == (
+        "unit",
+        "set_swing_mode",
+        {"swing_mode": "vertical"},
+    )
+    # A second excluded action waits for the global hold deadline.
+    systems["unit"]["fan_mode"] = "auto"
+    assert tick(model, systems, 1) is None
+    assert tick(model, systems, 1800)[1] == "set_fan_mode"
+    assert tick(model, systems, 1801) is None
+
+
+@pytest.mark.parametrize("action", ["fan", "swing"])
+def test_all_modes_excluded_leaves_action_alone(action):
+    model = FanLearning(learn_exclude_modes="auto, low")
+    systems = {"unit": {f"{action}_modes": ["Auto", "low"], f"{action}_mode": "Auto"}}
+    assert tick(model, systems, 0) is None
+    assert model.arms == {}
+    assert model.window is None
+    assert systems["unit"][f"{action}_mode"] == "Auto"
+
+
+def test_saved_excluded_arms_choices_and_window_are_dropped_on_load():
+    model = FanLearning(learn_exclude_modes="")
+    for action in ("fan", "swing"):
+        arms = model.options("unit", action, "heat|0|1", ["low", "AUTO"])
+        arms["AUTO"].update(samples=10, mean_reward=1)
+        arms["low"].update(samples=2, mean_reward=-1)
+    model.chosen = {"unit": {"fan": "AUTO", "swing": "low"}}
+    model._start(0, "unit", "fan", "heat|0|1", "AUTO", 21, -1)
+    saved = json.loads(json.dumps(model.to_dict()))
+    restored = FanLearning(saved=saved)
+    for action in ("fan", "swing"):
+        assert restored.arms["unit"][action]["heat|0|1"] == {
+            "low": {"samples": 2, "mean_reward": -1}
+        }
+    assert restored.chosen == {"unit": {"swing": "low"}}
+    assert restored.resume is None
+    assert "AUTO" in saved["arms"]["unit"]["fan"]["heat|0|1"]
+
+
+def test_quiet_cap_uses_only_list_order_for_auto():
+    assert quiet_modes(["low", "Auto", "high"], "low", True, "23:00") == ["low"]
+    assert quiet_modes(["Auto", "low", "high"], "low", True, "23:00") == ["Auto", "low"]

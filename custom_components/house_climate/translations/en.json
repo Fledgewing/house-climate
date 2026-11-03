@@ -52,6 +52,7 @@
           "minor_weight_share": "Minimum sensor weight share that blocks fan learning",
           "fan_hold_minutes": "Fan/vane hold window (minutes)",
           "fan_reward_lambda": "Fan learning mean error penalty",
+          "learn_exclude_modes": "Modes excluded from fan/vane learning (comma-separated)",
           "quiet_hours_enabled": "Enable quiet hours (off by default)",
           "quiet_start": "Quiet hours start",
           "quiet_end": "Quiet hours end"
@@ -118,6 +119,7 @@
           "minor_weight_share": "Minimum sensor weight share that blocks fan learning",
           "fan_hold_minutes": "Fan/vane hold window (minutes)",
           "fan_reward_lambda": "Fan learning mean error penalty",
+          "learn_exclude_modes": "Modes excluded from fan/vane learning (comma-separated)",
           "quiet_hours_enabled": "Enable quiet hours (off by default)",
           "quiet_start": "Quiet hours start",
           "quiet_end": "Quiet hours end"
