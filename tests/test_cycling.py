@@ -99,7 +99,7 @@ def test_all_weighted_rooms_in_band_hold_state_despite_forecast_and_excitation(
     mode, action, running
 ):
     config, state, devices = setup(mode, modulating=True)
-    config.update(explore_threshold=0.8, excite_after_minutes=1)
+    config.update(explore_threshold=0, excite_after_minutes=1)
     devices["unit"].hvac_action = action if running else "idle"
     state.observe_action("unit", devices["unit"].hvac_action, -7200)
     state.last_run["unit"] = -7200

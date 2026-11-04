@@ -33,8 +33,8 @@ def outage(request):
         "comfort_band": 0,
     }
     model = Learning(["room", "lost"], ["lost", "live"])
-    model.rows["room"].theta = [0, 0.2, 0.2, 0, 0, 0, 0]
-    model.rows["lost"].theta = [0, 1, 0, 0, 0, 0, 0]
+    model.rows["room"].theta = [0, 0.2, 0.2, 0, 0, 0, 0, 0, 0]
+    model.rows["lost"].theta = [0, 1, 0, 0, 0, 0, 0, 0, 0]
     for row in model.rows.values():
         row.counts = [1e30, 1e30]
     state = ControlState(mode=mode, active_mode=mode, setpoint=20 + sign)
@@ -152,6 +152,9 @@ def test_own_model_uses_joint_efforts_outdoor_solar_and_sources(outage, interact
         0.01 if interactions else 0,
         0.02 if interactions else 0,
         0.03 if interactions else 0,
+        0,
+        0,
+        0,
         0.6,
         0.7,
     ]

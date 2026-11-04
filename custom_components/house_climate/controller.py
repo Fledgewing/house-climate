@@ -1,5 +1,6 @@
 """Deterministic house control, with no Home Assistant dependencies."""
 
+from copy import copy
 from dataclasses import dataclass, field
 from math import ceil, floor, isfinite
 
@@ -36,6 +37,11 @@ class ControlState:
     last_update: float | None = None
     last_run: dict[str, float] = field(default_factory=dict)
     last_excite: dict[str, float] = field(default_factory=dict)
+    last_steady_test: dict[str, float] = field(default_factory=dict)
+    steady_runs: dict[str, dict] = field(default_factory=dict)
+    completed_runs: dict[str, dict] = field(default_factory=dict)
+    test_observed_since: dict[str, float] = field(default_factory=dict)
+    experiment_info: dict[str, dict] = field(default_factory=dict)
     action_times: dict[str, float] = field(default_factory=dict)
     actions: dict[str, str | None] = field(default_factory=dict)
     excitation: dict = field(default_factory=dict)
@@ -154,6 +160,28 @@ class ControlState:
 
     def observe_action(self, system, action, now):
         """Account only observed runtime, including transitions between ticks."""
+        self.test_observed_since.setdefault(system, self.last_run.get(system, now))
+        effort = self.reported_efforts.get(
+            system, 1 if action == "heating" else -1 if action == "cooling" else 0
+        )
+        run = self.steady_runs.get(system)
+        changed = run and (
+            run["action"] != action or abs(run["effort"] - effort) > 0.05
+        )
+        if changed:
+            self.completed_runs.setdefault(system, []).append(
+                {"seconds": max(0, now - run["since"]), "ended": now}
+            )
+            self.completed_runs[system] = self.completed_runs[system][-64:]
+        if action in ("heating", "cooling"):
+            if not run or changed:
+                self.steady_runs[system] = {
+                    "action": action,
+                    "effort": effort,
+                    "since": now,
+                }
+        else:
+            self.steady_runs.pop(system, None)
         previous = self.actions.get(system)
         elapsed = max(0, now - self.action_times.get(system, now))
         running = action in ("heating", "cooling")
@@ -181,6 +209,12 @@ class ControlState:
             "cool": "cooling",
         }.get(self.excitation["mode"]):
             self.excitation["runtime"] += elapsed
+        if self.excitation.get("system") == system and (
+            changed
+            or action
+            != {"heat": "heating", "cool": "cooling"}.get(self.excitation["mode"])
+        ):
+            self.excitation["runtime"] = 0
         self.actions[system], self.action_times[system] = action, now
 
 
@@ -213,83 +247,192 @@ def effort_limits(config, state, key, now, in_band):
     return (0.001, 1) if hold is True else (0, 0) if hold is False else (0, 1)
 
 
+def excitation_scores(config, state, values, learning, outdoor=None):
+    weights = {m["entity_id"]: m.get("weight", 1) for m in config["sensors"]}
+    total = sum(weights.get(r, 0) for r in values)
+    rooms = [
+        r
+        for r in values
+        if r in learning.rows
+        and total > 0
+        and weights.get(r, 0) / total >= config.get("minor_weight_share", 0.05)
+    ]
+    scores = {}
+    for key in learning.systems:
+        ranked = sorted(
+            rooms,
+            key=lambda r: weights[r] * learning.steady_std(r, key, outdoor, values[r]),
+            reverse=True,
+        )
+        scores[key] = (
+            sum(
+                weights[r] * learning.steady_std(r, key, outdoor, values[r])
+                for r in rooms
+            ),
+            ranked,
+        )
+    return scores
+
+
 def excitation_target(
-    config, state, devices, values, house, mode, now, learning, outdoor=None
+    config,
+    state,
+    devices,
+    values,
+    house,
+    mode,
+    now,
+    learning,
+    outdoor=None,
+    solar=0,
+    sources=None,
+    allocation=None,
 ):
-    """Select one bounded, held experiment; never infer runtime from a target."""
+    """Select one steady, informative run within forecast comfort limits."""
+    minutes = config.get("excite_minutes", 60)
+    for key, runs in state.completed_runs.items():
+        for run in runs:
+            if run["seconds"] >= minutes * 60:
+                state.last_steady_test[key] = max(
+                    state.last_steady_test.get(key, float("-inf")), run["ended"]
+                )
+    state.completed_runs.clear()
+    for key, run in state.steady_runs.items():
+        if now - run["since"] >= minutes * 60:
+            state.last_steady_test[key] = now
+    if learning is None:
+        state.excitation = {}
+        return
+    scores = excitation_scores(config, state, values, learning, outdoor)
+    wait = config.get("excite_after_minutes", 120) * 60
+    for key, (score, _) in scores.items():
+        last = state.last_steady_test.get(key)
+        eligible = (
+            max(
+                last if last is not None else state.test_observed_since.get(key, now),
+                state.last_excite.get(key, float("-inf")),
+            )
+            + wait
+        )
+        state.experiment_info[key] = {
+            "uncertainty_score": score,
+            "last_steady_test": last,
+            "next_eligible": eligible,
+        }
     helps = house is not None and (
-        (mode == "heat" and house < state.setpoint)
-        or (mode == "cool" and house > state.setpoint)
+        (mode == "heat" and house <= state.setpoint)
+        or (mode == "cool" and house >= state.setpoint)
     )
+    direction = 1 if mode == "heat" else -1
+
+    def safe(key, remaining):
+        efforts = dict(
+            state.excitation.get(
+                "others", allocation if allocation is not None else state.efforts
+            )
+        )
+        for other, device in devices.items():
+            if not device.available:
+                efforts[other] = state.reported_efforts.get(other, 0)
+        efforts[key] = direction
+        rooms = scores.get(key, (0, []))[1]
+        if any(
+            direction * (values[room] - state.setpoint)
+            > config.get("comfort_band", 1) / 2
+            for room in rooms
+        ):
+            return False
+        steps = max(1, ceil(remaining / config.get("interval", 5)))
+        for step in range(1, steps + 1):
+            for room in rooms:
+                base, effects = learning.forecast(
+                    room, values[room], list(efforts), step, outdoor, solar, sources
+                )
+                predicted = base + sum(b * u for b, u in zip(effects, efforts.values()))
+                if (
+                    direction * (predicted - state.setpoint)
+                    > config.get("comfort_band", 1) / 2
+                ):
+                    return False
+        return bool(rooms)
+
     active = state.excitation
     if active:
-        device = devices.get(active["system"])
+        key = active["system"]
+        device = devices.get(key)
+        remaining = max(
+            config.get("interval", 5), minutes - (now - active["started"]) / 60
+        )
         finished = (
             not helps
             or mode != active["mode"]
             or not device
             or not device.available
-            or learning is None
-            or not any(
-                learning.blended(r, active["system"], outdoor, values[r]) > 0
-                for r in values.keys() & learning.rows.keys()
-            )
-            or active["runtime"] >= config.get("excite_minutes", 30) * 60
-            or now - active["started"] >= 3600
+            or cycling_hold(config, state, key, now) is False
+            or active["runtime"] >= minutes * 60
+            or state.last_steady_test.get(key, float("-inf")) >= active["started"]
+            or now - active["started"] >= 2 * minutes * 60
+            or not safe(key, remaining)
         )
         if finished:
-            state.last_excite[active["system"]] = now
+            # Aborts get a retry delay, but never masquerade as successful tests.
+            state.last_excite[key] = now
+            state.experiment_info[key]["next_eligible"] = now + wait
             state.excitation = {}
         return
-    if not helps or learning is None:
+    if not helps or config.get("explore_threshold", 0.8) <= 0:
         return
-    sensors = values.keys() & learning.rows.keys()
-    for system in config["systems"]:
-        key = system["entity_id"]
+    threshold = (1 - config.get("explore_threshold", 0.8)) * 0.03
+    highest = max(
+        (
+            score
+            for key, (score, _) in scores.items()
+            if (device := devices.get(key))
+            and device.available
+            and device.current_temperature is not None
+            and isfinite(device.current_temperature)
+        ),
+        default=0,
+    )
+    for key in sorted(scores, key=lambda k: scores[k][0], reverse=True):
+        if scores[key][0] < highest - 1e-12:
+            break
         device = devices.get(key)
         if (
             not device
             or not device.available
             or device.current_temperature is None
             or not isfinite(device.current_temperature)
-            or device.hvac_action in ("heating", "cooling")
-            or not sensors
-            or not any(
-                learning.blended(r, key, outdoor, values[r]) > 0 for r in sensors
-            )
+            or key not in state.experiment_info
+            or scores[key][0] <= threshold
+            or now < state.experiment_info[key]["next_eligible"]
             or cycling_hold(config, state, key, now) is False
-            or all(
-                abs(t - state.setpoint) <= config.get("comfort_band", 1) / 2
-                for t in values.values()
-            )
-            or learning.system_confidence(key, sensors)
-            >= config.get("explore_threshold", 0.8)
-            or now - max(state.last_run[key], state.last_excite.get(key, float("-inf")))
-            < config.get("excite_after_minutes", 120) * 60
         ):
             continue
-        low, high = device.minimum, device.maximum
-        if low > high:
-            continue
+        if not safe(key, minutes):
+            return
         target = clamp(
             floor(
-                (
-                    device.current_temperature
-                    + config.get("run_margin", 1) * (1 if mode == "heat" else -1)
-                )
+                (device.current_temperature + direction * config.get("run_margin", 1))
                 / device.step
                 + 0.5
             )
             * device.step,
-            low,
-            high,
+            device.minimum,
+            device.maximum,
         )
+        if direction * (target - device.current_temperature) <= 0:
+            continue
         state.excitation = {
             "system": key,
             "mode": mode,
             "started": now,
             "runtime": 0,
             "target": target,
+            "rooms": scores[key][1][:2],
+            "others": {
+                k: v for k, v in (allocation or state.efforts).items() if k != key
+            },
         }
         break
 
@@ -389,6 +532,9 @@ def observe_thermostats(
             unavailable[key] = thermostat
     if not unavailable:
         return
+    if learning:
+        learning = copy(learning)
+        learning.effort_history = list(learning.effort_history)
     interval = config.get("interval", 5) * 60
     # Different last observations are possible after restore or event reports.
     remaining = {
@@ -398,7 +544,7 @@ def observe_thermostats(
     while any(v > 1e-9 for v in remaining.values()):
         fraction = min(1, max(remaining.values()))
         before = {key: t["own"] for key, t in unavailable.items()}
-        outage_step(
+        joint = outage_step(
             config,
             state,
             unavailable,
@@ -409,6 +555,13 @@ def observe_thermostats(
             sources,
             fraction,
         )
+        if learning:
+            learning.record_efforts(
+                joint,
+                sources or {},
+                learning.effort_clock,
+                learning.effort_clock + fraction * interval,
+            )
         for key, thermostat in unavailable.items():
             share = min(fraction, remaining[key]) / fraction
             thermostat["own"] = before[key] + share * (thermostat["own"] - before[key])
@@ -576,21 +729,31 @@ def allocate(
             thermostats = {key: dict(t) for key, t in outages.items()}
             temperatures = dict(values)
             inputs = {**fixed, **dict(zip(systems, (direction * u for u in candidate)))}
+            rollout = copy(learning) if learning else None
+            if rollout:
+                rollout.effort_history = list(learning.effort_history)
             for _ in range(steps):
                 joint = outage_step(
                     config,
                     state,
                     thermostats,
                     inputs,
-                    learning,
+                    rollout,
                     outdoor,
                     solar,
                     sources,
                 )
                 temperatures = {
-                    room: model_step(learning, room, t, joint, outdoor, solar, sources)
+                    room: model_step(rollout, room, t, joint, outdoor, solar, sources)
                     for room, t in temperatures.items()
                 }
+                if rollout:
+                    rollout.record_efforts(
+                        joint,
+                        sources or {},
+                        rollout.effort_clock,
+                        rollout.effort_clock + rollout.interval_minutes * 60,
+                    )
             average = sum(w * temperatures[r] for w, r in zip(weights, rooms))
             objective = sum(
                 w * (temperatures[r] - average) ** 2 for w, r in zip(weights, rooms)
@@ -737,9 +900,6 @@ def control(
         state.target_adjustments.clear()
     for key, device in devices.items():
         state.observe_action(key, device.hvac_action if device.available else None, now)
-    excitation_target(
-        config, state, devices, values, house, mode, now, learning, outdoor
-    )
     commands = []
     allocation = {}
     if values and mode in ("heat", "cool"):
@@ -773,6 +933,23 @@ def control(
                 -1,
                 1,
             )
+    excitation_target(
+        config,
+        state,
+        devices,
+        values,
+        house,
+        mode,
+        now,
+        learning,
+        outdoor,
+        solar,
+        sources,
+        allocation,
+    )
+    if state.excitation:
+        for key, effort in state.excitation.get("others", {}).items():
+            allocation[key] = effort
     for system in config["systems"]:
         entity_id = system["entity_id"]
         device = devices.get(entity_id, Device(available=False))
@@ -812,7 +989,7 @@ def control(
                     values.keys() & learning.rows.keys(),
                     config.get("explore_threshold", 0.8),
                 )
-                if learning and entity_id in learning.systems
+                if learning and entity_id in learning.systems and not state.excitation
                 else 0
             )
             if dt and measured_efforts is not None:
@@ -843,7 +1020,11 @@ def control(
             previous = (
                 abs(state.efforts[entity_id]) if entity_id in state.efforts else None
             )
-            if previous is not None and (effort > 0) != (previous > 0):
+            if (
+                not state.excitation
+                and previous is not None
+                and (effort > 0) != (previous > 0)
+            ):
                 if (
                     0 < effort < config.get("effort_hysteresis", 0.05)
                     or now - state.effort_switches.get(entity_id, float("-inf"))
@@ -856,11 +1037,15 @@ def control(
                 abs(t - state.setpoint) <= config.get("comfort_band", 1) / 2
                 for t in values.values()
             )
-            low, high = effort_limits(config, state, entity_id, now, in_band)
+            low, high = effort_limits(
+                config, state, entity_id, now, in_band and not state.excitation
+            )
             if state.excitation.get("system") == entity_id:
                 effort = 1
             effort = clamp(effort, low, high)
             state.efforts[entity_id] = direction * effort
+            if state.excitation:
+                state.requested_efforts[entity_id] = effort
             own = device.current_temperature
             if own is None or not isfinite(own):
                 own = house
@@ -869,9 +1054,16 @@ def control(
                 )
             target = own + direction * margin * (effort if effort > 0 else -1)
             if state.excitation.get("system") == entity_id and high > 0:
-                target = state.excitation["target"]
+                target = (
+                    max(state.excitation["target"], target)
+                    if direction > 0
+                    else min(state.excitation["target"], target)
+                )
                 notes.append(
-                    f"exploring: running {device.name or entity_id} to learn which rooms it reaches"
+                    f"testing {device.name or entity_id} for {config.get('excite_minutes', 60):g} min to learn its effect on "
+                    + ", ".join(
+                        room_names.get(r, r) for r in state.excitation.get("rooms", [])
+                    )
                 )
             # Explain room-level tradeoffs with learned reach, never room mappings.
             reach = {
@@ -947,7 +1139,7 @@ def control(
                 for t in values.values()
             )
             required = hold
-            if required is None and in_band:
+            if required is None and in_band and not state.excitation:
                 required = state.actions.get(entity_id) in ("heating", "cooling")
             if required is None and house is not None:
                 required = abs(state.efforts.get(entity_id, 0)) > 0

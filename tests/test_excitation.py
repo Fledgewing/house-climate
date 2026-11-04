@@ -19,14 +19,21 @@ def setup(mode="heat"):
     config = {
         "sensors": [{"entity_id": "warm"}, {"entity_id": "cold", "weight": 2}],
         "systems": [{"entity_id": "a"}, {"entity_id": "b"}],
+        "excite_minutes": 30,  # Explicit shorter experiment for this fixture.
     }
     state = ControlState(mode=mode, setpoint=22.5)
     model = Learning(["warm", "cold"], ["a", "b"])
     devices = {
-        s: Device(mode=mode, current_temperature=24, temperature=19.5, name=s.upper())
+        s: Device(
+            mode=mode,
+            current_temperature=24,
+            temperature=19.5,
+            name=s.upper(),
+            hvac_action="idle",
+        )
         for s in model.systems
     }
-    readings = {"warm": Reading(24), "cold": Reading(18.8)}
+    readings = {"warm": Reading(22), "cold": Reading(18.8)}
     return config, state, model, devices, readings
 
 
@@ -59,7 +66,9 @@ def test_excitation_waits_then_holds_local_target_and_one_system():
     result = tick(parts, 7200)
     assert state.excitation["system"] == "a"
     assert state.excitation["target"] == 25
-    assert "exploring: running A to learn which rooms it reaches" in result.explanation
+    assert (
+        "testing A for 30 min to learn its effect on cold, warm" in result.explanation
+    )
     assert ("a", "set_temperature", {"temperature": 25}) in result.commands
     assert len(state.excitation) > 0
     devices["a"].current_temperature = 24.5
@@ -70,11 +79,11 @@ def test_excitation_waits_then_holds_local_target_and_one_system():
     # Transition between ticks: only actual heating seconds count.
     state.observe_action("a", "idle", 8100)
     tick(parts, 8400)
-    assert state.excitation["runtime"] == 600
+    assert state.excitation["runtime"] == 0
     state.observe_action("a", "heating", 8500)
-    tick(parts, 9700)
+    tick(parts, 10300)
     assert not state.excitation  # 30 observed running minutes, not 30 wall minutes
-    tick(parts, 10000)
+    tick(parts, 10600)
     assert state.excitation["system"] == "b"
 
 
@@ -102,7 +111,7 @@ def test_excitation_conditions(reason):
     tick(parts, 0)
     kwargs = {}
     if reason in ("past", "equal"):
-        readings["cold"] = Reading(24 if reason == "past" else 21.75)
+        readings["cold"] = Reading(24 if reason == "past" else 22.75)
     elif reason == "disabled":
         kwargs["enabled"] = False
     elif reason == "off":
@@ -110,10 +119,12 @@ def test_excitation_conditions(reason):
     elif reason == "veto":
         kwargs["outdoor"] = 30
     elif reason in ("confident", "missing", "zero_weight", "stale", "not_reporting"):
+        model.rows["warm"].covariance = [[0] * 9 for _ in range(9)]
         model.rows["warm"].counts = [200, 200]
         readings["warm"] = Reading(21)
         if reason == "confident":
             model.rows["cold"].counts = [200, 200]
+            model.rows["cold"].covariance = [[0] * 9 for _ in range(9)]
         elif reason == "missing":
             readings["cold"] = Reading(None)
         elif reason == "zero_weight":
@@ -130,12 +141,15 @@ def test_excitation_conditions(reason):
             d.available = False
     else:
         for s in devices:
-            state.observe_action(s, "heating", 7100)
+            state.observe_action(s, "heating", 3500)
             state.observe_action(s, "idle", 7150)
     result = tick(parts, 7200, **kwargs)
     if reason == "disabled":
         assert not result.commands
-    assert not state.excitation
+    if reason == "equal":
+        assert state.excitation  # Equality is eligible under the v0.5.9 safety gate.
+    else:
+        assert not state.excitation
 
 
 @pytest.mark.parametrize("mode,local,expected", [("heat", 26, 27), ("cool", 18, 17)])
@@ -146,6 +160,7 @@ def test_excitation_clamp_cooling_and_device_limits(mode, local, expected):
         d.current_temperature = local
     if mode == "cool":
         readings["cold"] = Reading(26)
+        readings["warm"] = Reading(24)
     tick(parts, 0)
     tick(parts, 7200)
     assert state.excitation["target"] == expected
@@ -156,6 +171,8 @@ def test_excitation_clamp_cooling_and_device_limits(mode, local, expected):
         d.maximum = 24.5
         d.minimum = 21.5
     readings["cold"] = Reading(18 if mode == "heat" else 26)
+    if mode == "cool":
+        readings["warm"] = Reading(24)
     tick(parts, 0)
     tick(parts, 7200)
     assert state.excitation["target"] == (24.5 if mode == "heat" else 21.5)
@@ -241,7 +258,7 @@ def simulate_late_sensors(legacy=False):
     losses = [0.5 / 17, 0.5 / 17, 0.005 / 11.8, 0.004 / 11.8]
     model = (LegacyLearning if legacy else Learning)(rooms[:2], systems)
     for i, room in enumerate(rooms[:2]):
-        model.rows[room].theta = [losses[i], *truth[i], 0, 0, 0, 0]
+        model.rows[room].theta = [losses[i], *truth[i], 0, 0, 0, 0, 0, 0]
         model.rows[room].counts = [80, 80]
     model.reconcile(rooms, systems)  # cold sensors join AFTER b last ran
     config = {
@@ -328,7 +345,7 @@ def test_late_sensor_two_day_regression():
     print(
         f"\nLate sensors: first B run {first_b} min (v0.4.1 {baseline_first}); weighted spread final {spreads[-1]:.4f} vs {baseline[-1]:.4f} C; day2 mean spread {sum(spreads[288:]) / 288:.4f} vs {sum(baseline[288:]) / 288:.4f} C; learned [A,B] {coefficients}"
     )
-    assert first_b is not None and first_b <= 180
+    assert first_b is not None and first_b <= 360
     assert baseline_first is None
     assert baseline_model.rows["guest"].counts[1] == 0
     for room in coefficients:

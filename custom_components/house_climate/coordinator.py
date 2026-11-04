@@ -120,6 +120,8 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.config.get("regime_return_hours", 4),
             self.config.get("interval", 5),
             self.config.get("interaction_prior", 0.0001),
+            self.config.get("lag_minutes", 60),
+            self.config.get("lag_prior", 0.01),
         )
 
     async def async_load(self):
@@ -130,6 +132,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             if selected in modes(self.config):
                 self.priority_mode = selected
             self.state = ControlState(**saved["state"])
+            self.state.steady_runs.clear()
             # Retain inactivity/cooldown clocks, but never count downtime as runtime.
             self.state.action_times = {
                 key: dt_util.utcnow().timestamp() for key in self.state.actions
@@ -191,6 +194,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                 self.learning = Learning.from_dict(
                     {
                         **saved["learning"],
+                        "lag_minutes": self.config.get("lag_minutes", 60),
+                        "lag_prior": self.config.get("lag_prior", 0.01),
                         "interaction_prior": self.config.get(
                             "interaction_prior", 0.0001
                         ),
@@ -364,13 +369,6 @@ class HouseCoordinator(DataUpdateCoordinator):
         old, new = event.data.get("old_state"), event.data.get("new_state")
         # Runtime changes must be captured even during service calls under lock.
         entity_id = event.data["entity_id"]
-        self.state.observe_action(
-            entity_id,
-            new.attributes.get("hvac_action")
-            if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
-            else None,
-            dt_util.utcnow().timestamp(),
-        )
         if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             self.state.observe_report(
                 next(s for s in self.config["systems"] if s["entity_id"] == entity_id),
@@ -384,6 +382,13 @@ class HouseCoordinator(DataUpdateCoordinator):
                 ),
                 self.config,
             )
+        self.state.observe_action(
+            entity_id,
+            new.attributes.get("hvac_action")
+            if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+            else None,
+            dt_util.utcnow().timestamp(),
+        )
         if (
             new
             and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
@@ -675,6 +680,18 @@ class HouseCoordinator(DataUpdateCoordinator):
                     },
                     now.timestamp(),
                 )
+                observed_history = {
+                    **{
+                        f"system:{key}": self.effort.finished_segments.get(key, [])
+                        for key in efforts
+                    },
+                    **{
+                        f"source:{key}": self.source_effort.finished_segments.get(
+                            key, []
+                        )
+                        for key in source_fractions
+                    },
+                }
                 learning_values = {
                     key: value
                     for key, value in clean_values.items()
@@ -703,10 +720,19 @@ class HouseCoordinator(DataUpdateCoordinator):
                         previous_solar,
                         duration / (self.config.get("interval", 5) * 60),
                         sources=source_fractions,
+                        observed_history=observed_history,
                         now=now.timestamp(),
                         local_hour=dt_util.as_local(now).hour
                         + dt_util.as_local(now).minute / 60
                         + dt_util.as_local(now).second / 3600,
+                    )
+                else:
+                    self.learning.record_efforts(
+                        efforts,
+                        source_fractions,
+                        now.timestamp() - duration,
+                        now.timestamp(),
+                        observed_history,
                     )
                 self.learning_baseline = (
                     (learning_values, outdoor, solar) if self.learning_enabled else None

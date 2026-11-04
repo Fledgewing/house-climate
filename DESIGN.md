@@ -226,9 +226,9 @@ invalidate that interval. Sampling only the action at a pass would miss short cy
 The forgetting factor defaults to 0.998 per valid row sample. Effective activity counts follow
 `n_ij ← 0.998 n_ij + 1[u_j ≠ 0]`. Confidence is `n/(n+N0)` with `N0 = 24` by default (about two
 hours of active 5-minute samples to give learned and prior coefficients equal weight).
-Control uses `max(0, confidence × learned_b + (1 − confidence) × system_prior + g × Δ_i)`.
+Control uses `max(0, confidence × learned_b + (1 − confidence) × system_prior + g × Δ_i + h)`.
 Only the fixed part is confidence blended; the combined heating effect is clipped to zero.
-Sources use signed `e + g × Δ_i` without blending or clipping. Joint prediction uses those physical coefficients directly; normalized per-system influences remain diagnostic. `system_prior` is the confidence-weighted mean raw learned b
+Sources use signed `e + g × Δ_i + h` without blending or clipping. Joint prediction uses those physical coefficients directly; normalized per-system influences remain diagnostic. `system_prior` is the confidence-weighted mean raw learned b
 over that system's sensors with nonzero runtime confidence, falling back to 0.03 only when
 none has evidence. Unexplored pairs therefore inherit measured system reach rather than
 being mistaken for weak influence. Learning starts affecting control from the first valid sample;
@@ -259,7 +259,7 @@ retaining the other settings and existing Store. Pre-learning Store files start 
 
 `sensor.house_learning` reports the mean confidence across all system/room pairs, as a percentage.
 Its `systems[system_entity][sensor_entity]` attributes expose raw fixed `b`, interaction `g`,
-`blended_b` (blended fixed part plus g × current Δ), clamped `effective_effect`, normalized
+`h` (delayed effect), `blended_b` (blended fixed part plus g × current Δ plus h), clamped `effective_effect`, normalized
 `influence`, confidence percent and `effective_samples`. Its `sensors[sensor_entity]` attributes
 expose `a` (heat loss), `c` (sun gain), `d`, `fit_error` (forgetting-weighted RMS prediction error
 in °C), and `samples` (valid updates). Press `button.house_reset_learning` to reset the model and
@@ -934,3 +934,84 @@ columns. Migration tests check every retained covariance entry in all three row 
 a saved regime. Additional tests cover duration/signed cooling regressors, reordered inputs,
 source response resets, diagnostics, affine forecasts, outage thermostat predictions and the
 nonnegative combined system heat clamp.
+
+
+## Delayed effects and informative experiments (v0.5.9)
+
+This section supersedes the historical v0.4.2 excitation policy above. The interval model is
+
+`ΔT_i = a_i Δ_i + Σ_j [(b_ij + g_ij Δ_i) u_j + h_ij L_j]
+ + Σ_k [(e_ik + g_ik Δ_i) s_k + h_ik L_k] + c_i solar + d_i`.
+
+`L` is the time-weighted mean signed effort in the `lag_minutes` preceding the interval start,
+excluding the current interval. The default window is 60 minutes, adjustable in options
+(5–1440 minutes). All columns, including L, scale with elapsed/configured interval duration.
+Binary and proportional source efforts use exactly the same history and regressors.
+Keep bounded observed action/effort segments, timestamps and missing markers in Store, with one
+preceding interval for boundary coverage. Runtime trackers retain transitions within each pass,
+so partial-window overlap uses actual time weights, including proportional sources. Direct
+model callers that only supply interval averages retain those averages as held segments. Unknown actions and restart gaps never acquire
+invented effort. Incomplete lag coverage gives a zero feature, with no coefficient or variance
+update credit for that lag column. A zero-gain covariance update adjusts cross terms to keep
+the joint posterior positive while retaining the missing coefficient and its variance. Other observed features can still train. Paused thermal
+learning and withheld room samples retain effort observations for subsequent predictions.
+Runtime confidence counts keep their existing nonzero-current-effort meaning.
+
+Each input gets a zero-mean h with diagonal `lag_prior` covariance, default 0.01, and initially
+zero cross covariance. This is 10,000 times tighter than the broad fixed-effect prior (100),
+while permitting a 0.1 °C/interval standard deviation (1.2 °C/h at five minutes).
+Unlike g, h is not multiplied by an outdoor difference typically of order 10 °C: its default
+standard deviation is therefore ten times g's 0.01, giving comparable prior temperature scales.
+The prior discourages attributing ordinary drift to delayed heat without suppressing a remote
+room response of 0.025 °C/interval (0.3 °C/h). Both priors are tunable.
+
+Column order is `[delta, inputs, inputs*delta, lagged_inputs, solar, 1]`. Loading a v0.5.8
+row inserts h priors before solar/drift and preserves every old coefficient, cross covariance,
+count, error and sample. Apply the same mapping to challengers and saved regimes; v0.5.7
+stores gain both missing groups in one migration. Reconciliation matches all three input groups
+by kind/entity ID. A source response change removes/reintroduces all three columns and its
+history, including challenger and library rows, with neutral priors and no learning reset.
+
+Steady effects include h everywhere: blended/effective diagnostics, normalized influences,
+excitation covariance and allocator/outage forecasts. Only b is confidence blended, and systems'
+combined steady heating effect is still clamped nonnegative; sources remain signed. Forecasts
+must not apply the full steady h immediately. At horizon step k (time t from horizon start),
+`L_hat(t) = integral[past effort from now+t-window to now]/window
+ + min(t/window, 1)*candidate_effort` for t below the window; afterward it is candidate effort.
+Hold the outdoor interaction delta at the horizon start, propagate passive retention each step,
+and add known lag as an intercept and future lag as an effort coefficient. This remains affine.
+Outage rollouts append the local thermostat's predicted joint efforts to private history each
+step, allowing its delayed response to continue after it stops; they never train real history.
+
+The information score for system j is `Σ_i active_weight_i × std(b_ij + g_ij Δ_i + h_ij)`.
+Use the full posterior covariance, including cross terms, and omit rooms below
+`minor_weight_share`. Consider the highest available-system score (breaking equal-score ties by eligibility) above
+`(1 - explore_threshold) × PRIOR_B`; the default threshold is 0.006 °C/interval.
+If the most informative test cannot run safely or is still in cooldown, wait rather than
+starting a less informative test. Thus increasing the existing exploration setting tolerates less remaining uncertainty;
+zero disables exploration. Whole-system runtime confidence does not gate tests.
+Rank named rooms by their contribution to this score and name the top two in `last_decision`.
+`sensor.house_learning.experiments` exposes each score, last qualifying steady test time,
+and next eligible time. A qualifying allocator or experimental run is continuously observed
+matching HVAC action with effort stable within 0.05 for at least `excite_minutes` (default 60).
+Short runs never reset the test clock. With no prior test, the initial observation starts the
+eligibility wait. Store retains qualifying times; restarts clear open run endpoints.
+
+Tests require the house mean at or below setpoint in heat (at or above in cool), including
+inside the comfort band. Forecast every interval of the proposed run against the unmodified
+baseline allocation, holding other systems' allocated effort for the run. Every non-minor room
+must stay within setpoint + comfort_band/2 in heat (mirror for cool). Recheck each pass over
+the remaining run; skip/abort on breach, missing house data, mode change or unavailable unit.
+Cycling constraints retain precedence. One global test runs at full steady effort, with no
+dither on any system and no mode selection caused by a test. Targets track the own sensor as
+needed to retain full effort. Complete after the configured observed steady duration; interrupted
+runtime does not accumulate across stops. A two-duration wall timeout bounds failed attempts.
+Aborts get a retry delay but do not become successful steady tests.
+
+The seeded delayed-house regression uses independent on/off efforts, a pure eight-interval
+(40-minute) transport delay, and true steady response 0.300 °C/h. After 12,000 five-minute
+samples, v0.5.8 same-interval RLS learns 0.01531 °C/h; v0.5.9 learns 0.29402 °C/h. Its
+120-minute forecast makes the allocator use A for D. Separate controller tests create repeated
+five-minute runs that never qualify, then verify a 60-minute constant experiment, increased D
+confidence, room safety in heat/cool, early forecast aborts, cycling, mode guards, source history,
+missing/restart coverage, horizon affinity and lossless main/challenger/library migration.

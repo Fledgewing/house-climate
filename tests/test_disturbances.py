@@ -93,10 +93,10 @@ def test_simulated_evening_source():
 def calibrated():
     model = Learning(["one", "two"], ["system"])
     for row in model.rows.values():
-        row.theta = [0, 0.1, 0, 0, 0]
+        row.theta = [0, 0.1, 0, 0, 0, 0]
         row.counts = [100]
         row.samples = 100
-        row.covariance = [[0.01 if i == j else 0 for j in range(5)] for i in range(5)]
+        row.covariance = [[0.01 if i == j else 0 for j in range(6)] for i in range(6)]
     return model
 
 
@@ -165,7 +165,7 @@ def test_source_membership_preserves_full_existing_covariance_and_counts():
         before.pop(key)
     model = Learning.from_dict(before)
     model.reconcile(["one", "two", "new"], ["system"], ["x", "y"])
-    assert model.rows["one"].theta == [0, 0.1, 0, 0, 0, 0, 0, 0, 0]
+    assert model.rows["one"].theta == [0, 0.1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     assert model.rows["one"].counts == [100, 0, 0]
     assert model.rows["one"].covariance[2][2] == 100
     assert model.rows["new"].samples == 0

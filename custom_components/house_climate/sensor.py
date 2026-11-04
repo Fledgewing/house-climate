@@ -7,6 +7,10 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import UnitOfTemperature
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
+
+from .controller import excitation_scores
+from .priority import members
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -81,6 +85,34 @@ class LearningSensor(CoordinatorEntity, SensorEntity):
                 response=source.get("response", "on_off"),
                 effort=self.coordinator.source_value(source),
             )
+        coordinator = self.coordinator
+        config = {
+            **coordinator.config,
+            "sensors": members(coordinator.config, coordinator.priority_mode),
+        }
+        scores = excitation_scores(
+            config,
+            coordinator.state,
+            coordinator.current_temperatures,
+            coordinator.learning,
+            outdoor,
+        )
+        now = dt_util.utcnow().timestamp()
+        state = coordinator.state
+        diagnostics["experiments"] = {
+            key: {
+                "uncertainty_score": score,
+                "last_steady_test": state.last_steady_test.get(key),
+                "next_eligible": max(
+                    state.last_steady_test.get(
+                        key, state.test_observed_since.get(key, now)
+                    ),
+                    state.last_excite.get(key, float("-inf")),
+                )
+                + config.get("excite_after_minutes", 120) * 60,
+            }
+            for key, (score, _) in scores.items()
+        }
         return diagnostics
 
 

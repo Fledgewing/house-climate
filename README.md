@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.6 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.9 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 The setpoint is the weighted **house average**. Each pass jointly chooses how much every available system should run to bring that average to the setpoint and reduce each room's deviation from it. A 45-minute prediction uses the learned room responses, outdoor losses, extra heat sources, solar gain and drift. There are no configured room mappings or individual room targets. A shared comfort band holds starts and stops only when every weighted room is comfortable.
 
@@ -131,26 +131,37 @@ Changes made directly on physical systems are noted in `last_decision` and re-as
 
 ## Online learning and visibility
 
-Each room learns `ΔT = a × Δ + Σ (b + g × Δ) × signed_runtime_fraction + Σ (e + g × Δ) × source_effort + c × solar_kW + d` (Δ = outdoor minus room temperature at interval start) using recursive least squares. HVAC action changes are tracked between passes: heating contributes positive running effort, cooling negative. Every `b` starts at 0.03 °C per interval, with zero prior heat-loss, sun-gain and drift means and broad covariance. Default forgetting is 0.998 per sample. Each room/system confidence is `n/(n+24)`, where n is the forgetting-weighted number of intervals with nonzero effort. In v0.4.2, low-confidence pairs blend toward that system's confidence-weighted mean learned b across rooms with runtime evidence, falling back to 0.03 only when none has been explored. A new sensor therefore inherits measured system reach while its own effect is learned; no room mappings are assumed. Forgetting and prior sample count are available in options.
+Each room learns `ΔT = a × Δ + Σ [(b + g × Δ) × signed_runtime_fraction + h × lagged_runtime] + Σ [(e + g × Δ) × source_effort + h × lagged_source] + c × solar_kW + d` (Δ = outdoor minus room temperature at interval start) using recursive least squares. HVAC action changes are tracked between passes: heating contributes positive running effort, cooling negative. Every `b` starts at 0.03 °C per interval, with zero prior heat-loss, sun-gain and drift means and broad covariance. Default forgetting is 0.998 per sample. Each room/system confidence is `n/(n+24)`, where n is the forgetting-weighted number of intervals with nonzero effort. In v0.4.2, low-confidence pairs blend toward that system's confidence-weighted mean learned b across rooms with runtime evidence, falling back to 0.03 only when none has been explored. A new sensor therefore inherits measured system reach while its own effect is learned; no room mappings are assumed. Forgetting and prior sample count are available in options.
 
 While a system's least-confident active, weighted room is below `explore_threshold` (default 0.8), it gets a ±0.5 °C two-hour square-wave exploration offset, with different phases per system. The amplitude fades to zero at that threshold and perturbs bounded effort. `last_decision` says **exploring** and explains room-level allocation tradeoffs.
 
-If a system has unexplored active rooms but has not actually heated/cooled for
-`excite_after_minutes` (default **120**), v0.4.2 commands a learning run when the weighted
-house mean still needs heat/cooling. Only one system explores this way at a time. Its target
-is its own current temperature **+1 °C in heat / −1 °C in cool**, rounded and bounded by device
-limits, using `run_margin` for the own-sensor margin. A warm
-local sensor therefore cannot prevent learning about cold rooms. It ends after `excite_minutes` (default
-**30**) of reported running action or **60** elapsed minutes, then normal joint allocation resumes.
-Control off, mode changes, unavailable systems or reaching/passing the house setpoint cancel
-the run. A system waits another inactivity interval before retrying. Restart retains inactivity
-clocks but cancels an active run without counting downtime. Options expose both durations and
-the confidence threshold; threshold zero disables thermal exploration. `last_decision` explains
-“exploring: running <name> to learn which rooms it reaches”.
+Steady learning runs are selected by **room-level posterior uncertainty**, weighted by the
+active priority mode. Short allocator runs do not postpone them. After `excite_after_minutes`
+(default **120**) without a steady test, the most uncertain eligible system can run at full,
+constant effort for `excite_minutes` (default **60**). The other systems retain their allocated
+efforts for the experiment; dither is suspended. Only one test runs at a time, with the normal
+cycling and House mode guards. The house must be at/below setpoint in heat (at/above in cool).
+Tests are allowed inside the comfort band, but every forecast step must keep every non-minor
+room below setpoint + half the band in heat, mirrored for cooling. A forecast breach stops
+the test early, subject to minimum-run protection. Interrupted runs do not count as steady tests.
+A failed attempt waits the retry interval; a restart cancels a test and never credits downtime.
+A test times out after twice its configured duration if observed steady runtime never completes.
+`explore_threshold=0` disables exploration. The decision explains
+“testing <unit> for <n> min to learn its effect on <rooms>”.
+
+Every system and binary/proportional extra source also has a learned delayed effect `h`.
+Its input is the time-weighted mean effort over the preceding `lag_minutes` (default **60**),
+excluding the current interval. `lag_prior` defaults to **0.01** covariance with zero mean.
+Forecasts include the known past and the candidate effort entering that window, including
+outage thermostat predictions. The steady effect is `b + g × Δ + h` (or `e + g × Δ + h`
+for sources); system heating effects retain the nonnegative clamp. Bounded effort history
+survives restarts; gaps contribute zero lag feature and no lag learning credit. Upgrades
+preserve all learned rows, their covariance, counts and saved regimes.
 
 Read `sensor.house_learning` for overall confidence percent (the mean across room/system pairs). Under its attributes:
 
-- `systems` → system entity → room sensor: `b` is the fixed effect in °C per full-running interval; `g` is its learned temperature slope; `blended_b` includes the fixed-part prior blend and current temperature interaction; `effective_effect` also applies the nonnegative heat clamp; `influence` is the nonnegative normalized control weight; `confidence` is percent; `effective_samples` is the activity count.
+- `systems` → system entity → room sensor: `b` is the fixed effect in °C per full-running interval; `g` is its learned temperature slope; `h` is its delayed effect; `steady_std` is posterior uncertainty in the steady effect; `blended_b` includes the fixed-part prior blend, temperature interaction and delayed effect; `effective_effect` also applies the nonnegative heat clamp; `influence` is the nonnegative normalized control weight; `confidence` is percent; `effective_samples` is the activity count.
+- `experiments` → system entity: `uncertainty_score`, `last_steady_test` and `next_eligible` (Unix timestamps for the latter two).
 - `sensors` → room sensor: `a` is heat loss, `c` sun gain in °C/interval/kW, `d` background drift, `fit_error` is the forgetting-weighted RMS prediction error in °C, and `samples` counts valid updates.
 
 Press `button.house_reset_learning` to clear the model and confidence back to neutral priors. It retains the house target, mode and control state and starts learning again. Adding a sensor can restart exploration while that room learns. Confidence measures runtime evidence; learning needs distinct system operation to identify separate effects.
@@ -391,3 +402,11 @@ learns **g=0.01992620** (truth 0.02), with fixed effect **−0.00093106** (truth
 With constant temperature difference, **g=−0.0000027515** and allocated effort differs
 from the old model by less than **1e−9**. These are deterministic simulations; see
 [DESIGN.md](DESIGN.md) for conditions and migration details.
+
+## Delayed-response regression (0.5.9)
+
+A seeded plant with a pure 40-minute delay and true steady response **0.300 °C/hour**
+learns **0.294 °C/hour** with the lag model, versus **0.015 °C/hour** with the v0.5.8
+same-interval model. The learned forecast makes the allocator use the unit for the cold room.
+Tests also cover a full 60-minute steady experiment after repeated five-minute allocator runs,
+confidence growth, forecast safety, short-run eligibility, migration and source response changes.

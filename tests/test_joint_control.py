@@ -35,6 +35,8 @@ def replay(available=True, hours=12):
             0,
             0,
             0,
+            0,
+            0,
         ]
         model.rows[room].counts = [200, 80 if i == 0 else 1]
     state = ControlState(mode="heat", setpoint=22.5, offsets={"Mitsubishi": 1.5})
@@ -170,7 +172,7 @@ def test_one_available_system_is_objective_minimum(mode, sign, penalty):
 )
 def test_forecast_uses_losses_sources_solar_and_drift(mode, target, expected):
     model = Learning(["room"], ["system"], sources=["source"])
-    model.rows["room"].theta = [0.01, 0.8, 0.1, 0, 0, 0.05, 0.1]
+    model.rows["room"].theta = [0.01, 0.8, 0.1, 0, 0, 0, 0, 0.05, 0.1]
     model.rows["room"].counts = [80, 80]
     config = {
         "sensors": [{"entity_id": "room"}],
@@ -302,7 +304,7 @@ def balance_replay(average_weight, integral_gain=0.001):
     losses = [0.01, 0.02 * 0.5 / 13.2, 0.09 * 0.5 / 13.2]
     model = Learning(ROOMS, SYSTEMS)
     for room, bs, loss in zip(ROOMS, truth, losses):
-        model.rows[room].theta = [loss, *bs, *([0] * len(bs)), 0, 0]
+        model.rows[room].theta = [loss, *bs, *([0] * (2 * len(bs))), 0, 0]
         model.rows[room].counts = [1e12, 1e12]
     state = ControlState(mode="heat", setpoint=22.5)
     temperatures = [25, 20.2, 20.2]

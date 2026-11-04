@@ -6,6 +6,7 @@ from math import ceil, exp, isfinite, sqrt
 
 PRIOR_B = 0.03
 INTERACTION_PRIOR = 0.0001
+LAG_PRIOR = 0.01
 
 
 @dataclass
@@ -18,7 +19,7 @@ class Row:
 
 
 class Learning:
-    """RLS on [delta, efforts/sources..., effort/source * delta..., solar, 1].
+    """RLS on [delta, inputs..., inputs * delta..., lagged inputs..., solar, 1].
 
     Coefficients describe one configured control interval. Covariance 100 gives
     weak regularization for fixed effects; interactions have a tighter zero prior.
@@ -40,11 +41,19 @@ class Learning:
         regime_return_hours=4,
         interval_minutes=5,
         interaction_prior=INTERACTION_PRIOR,
+        lag_minutes=60,
+        lag_prior=LAG_PRIOR,
     ):
         if not 0 < forgetting <= 1 or n0 <= 0:
             raise ValueError("Invalid learning parameters")
         if not isfinite(interaction_prior) or interaction_prior <= 0:
             raise ValueError("Invalid interaction prior")
+        if not isfinite(lag_prior) or lag_prior <= 0 or lag_minutes <= 0:
+            raise ValueError("Invalid lag parameters")
+        self.lag_minutes = lag_minutes
+        self.lag_prior = lag_prior
+        self.effort_history = []
+        self.effort_clock = 0
         self.interaction_prior = interaction_prior
         self.regime_margin = regime_margin
         self.regime_hours = regime_hours
@@ -80,9 +89,18 @@ class Learning:
                 len(previous) + previous.index(s) + 1 if s in previous else None
                 for s in inputs
             ],
-            2 * len(previous) + 1,
-            2 * len(previous) + 2,
+            *[
+                2 * len(previous) + previous.index(s) + 1 if s in previous else None
+                for s in inputs
+            ],
+            3 * len(previous) + 1,
+            3 * len(previous) + 2,
         ]
+        if previous != inputs:
+            removed = set(previous) - set(inputs)
+            for _, _, values in self.effort_history:
+                for kind, key in removed:
+                    values.pop(f"{kind}:{key}", None)
         rows = {}
 
         def remap(old=None):
@@ -139,6 +157,7 @@ class Learning:
         sources=None,
         now=None,
         local_hour=None,
+        observed_history=None,
     ):
         """Fit available rows; duration is elapsed/configured interval.
 
@@ -146,12 +165,21 @@ class Learning:
         invalidate their row. Scaling regressors supports slightly delayed ticks.
         """
         timestamp = (
-            self.clock + duration * self.interval_minutes * 60 if now is None else now
+            self.effort_clock + duration * self.interval_minutes * 60
+            if now is None
+            else now
         )
         sources = sources or {}
         activity = [efforts.get(s) for s in self.systems] + [
             sources.get(s) for s in self.sources
         ]
+        start_time = timestamp - duration * self.interval_minutes * 60
+        lagged = [
+            self.past_effort(kind, key, start_time)
+            for kind, keys in (("system", self.systems), ("source", self.sources))
+            for key in keys
+        ]
+        self.record_efforts(efforts, sources, start_time, timestamp, observed_history)
         context = [outdoor, solar, duration, *activity]
         if any(v is None or not isfinite(v) for v in context) or duration <= 0:
             self.streaks.clear()
@@ -178,9 +206,13 @@ class Learning:
                     outdoor - start,
                     *activity,
                     *[value * (outdoor - start) for value in activity],
+                    *[value or 0 for value in lagged],
                     solar,
                     1,
                 ]
+            ]
+            frozen = [
+                self.lag_index(k) for k, value in enumerate(lagged) if value is None
             ]
             error = end - start - sum(a * b for a, b in zip(row.theta, x))
             self.score_regimes(sensor, x, end - start, activity, duration, local_hour)
@@ -201,6 +233,7 @@ class Learning:
                 activity,
                 duration,
                 exp(-duration * self.interval_minutes / 1440),
+                frozen,
             )
             if self.choose_regime(sensor):
                 continue
@@ -245,18 +278,28 @@ class Learning:
                     continue
                 state["disturbed_since"] = None
                 error = max(-limit * duration, min(limit * duration, error))
-            self.fit_row(row, x, error, activity, duration, self.forgetting)
+            self.fit_row(row, x, error, activity, duration, self.forgetting, frozen)
 
     @staticmethod
-    def fit_row(row, x, error, activity, duration, forgetting):
+    def fit_row(row, x, error, activity, duration, forgetting, frozen=()):
         p = row.covariance
-        px = [sum(a * b for a, b in zip(line, x)) for line in p]
+        raw_px = [sum(a * b for a, b in zip(line, x)) for line in p]
+        px = [0 if i in frozen else v for i, v in enumerate(raw_px)]
         denominator = forgetting + sum(a * b for a, b in zip(x, px))
         gain = [v / denominator for v in px]
         row.theta = [v + g * error for v, g in zip(row.theta, gain)]
-        # Symmetric rank-one update preserves covariance symmetry.
+
+        def covariance(i, j, value):
+            if i in frozen and j in frozen:
+                return value
+            if i in frozen or j in frozen:
+                # A zero-gain (Joseph) update keeps the missing coefficient's
+                # mean/variance intact, while preserving a positive covariance.
+                return (value - raw_px[i] * raw_px[j] / denominator) / sqrt(forgetting)
+            return (value - px[i] * px[j] / denominator) / forgetting
+
         row.covariance = [
-            [(v - px[i] * px[j] / denominator) / forgetting for j, v in enumerate(line)]
+            [covariance(i, j, v) for j, v in enumerate(line)]
             for i, line in enumerate(p)
         ]
         row.counts = [
@@ -359,19 +402,25 @@ class Learning:
         systems = self.systems if systems is None else systems
         sources = self.sources if sources is None else sources
         count = len(systems) + len(sources)
-        size = 2 * count + 3
+        size = 3 * count + 3
         return Row(
             [
                 0,
                 *([PRIOR_B] * len(systems)),
                 *([0.0] * len(sources)),
-                *([0.0] * count),
+                *([0.0] * (2 * count)),
                 0,
                 0,
             ],
             [
                 [
-                    (self.interaction_prior if count < i <= 2 * count else 100.0)
+                    (
+                        self.lag_prior
+                        if 2 * count < i <= 3 * count
+                        else self.interaction_prior
+                        if count < i <= 2 * count
+                        else 100.0
+                    )
                     if i == j
                     else 0.0
                     for j in range(size)
@@ -385,6 +434,82 @@ class Learning:
         """Column for the interaction of a zero-based system/source input."""
         return 1 + len(self.systems) + len(self.sources) + index
 
+    def lag_index(self, index):
+        return 1 + 2 * (len(self.systems) + len(self.sources)) + index
+
+    def record_efforts(self, efforts, sources, start, end, observed_history=None):
+        """Retain bounded observed intervals, never fill gaps across restarts."""
+        self.effort_clock = max(self.effort_clock, end)
+        if end <= start:
+            return
+        values = {f"system:{k}": efforts.get(k) for k in self.systems}
+        values.update({f"source:{k}": sources.get(k) for k in self.sources})
+        if observed_history is None:
+            self.effort_history.append([start, end, values])
+        else:
+            # Retain transition boundaries: a lag window can cut through a pass.
+            boundaries = sorted(
+                {start, end}
+                | {
+                    max(start, min(end, t))
+                    for segments in observed_history.values()
+                    for left, right, _ in segments
+                    for t in (left, right)
+                }
+            )
+            for left, right in zip(boundaries, boundaries[1:]):
+                segment_values = {
+                    key: next(
+                        (
+                            value
+                            for a, b, value in observed_history.get(key, [])
+                            if a <= left and b >= right
+                        ),
+                        None,
+                    )
+                    for key in values
+                }
+                self.effort_history.append([left, right, segment_values])
+        self.effort_history = [
+            item
+            for item in self.effort_history
+            if item[1] > end - self.lag_minutes * 60 - (end - start)
+        ]
+        self.effort_clock = max(self.effort_clock, end)
+
+    def past_effort(self, kind, key, end, start=None):
+        start = end - self.lag_minutes * 60 if start is None else start
+        covered, total = 0, 0
+        cursor = start
+        for left, right, values in self.effort_history:
+            left, right = max(left, start), min(right, end)
+            if right <= left:
+                continue
+            value = values.get(f"{kind}:{key}")
+            if left > cursor + 1e-6 or value is None or not isfinite(value):
+                return None
+            left = max(left, cursor)
+            total += (right - left) * value
+            covered += right - left
+            cursor = right
+        return (
+            total / (end - start)
+            if covered >= end - start - 1e-6 and end > start
+            else None
+        )
+
+    def steady_std(self, sensor, system, outdoor=None, temperature=None):
+        """Posterior standard deviation of raw b + g*delta + h."""
+        k = self.systems.index(system)
+        delta = (
+            outdoor - temperature
+            if outdoor is not None and temperature is not None
+            else 0
+        )
+        terms = [(1 + k, 1), (self.interaction_index(k), delta), (self.lag_index(k), 1)]
+        p = self.rows[sensor].covariance
+        return sqrt(max(0, sum(a * b * p[i][j] for i, a in terms for j, b in terms)))
+
     def source_effect(self, sensor, source, outdoor=None, temperature=None):
         index = len(self.systems) + self.sources.index(source)
         row = self.rows[sensor]
@@ -393,7 +518,11 @@ class Learning:
             if outdoor is not None and temperature is not None
             else 0
         )
-        return row.theta[1 + index] + row.theta[self.interaction_index(index)] * delta
+        return (
+            row.theta[1 + index]
+            + row.theta[self.interaction_index(index)] * delta
+            + row.theta[self.lag_index(index)]
+        )
 
     def clear_regime_evidence(self, sensor):
         state = self.regimes[sensor]
@@ -522,7 +651,12 @@ class Learning:
             else 0
         )
         g = self.rows[sensor].theta[self.interaction_index(self.systems.index(system))]
-        return confidence * b + (1 - confidence) * self.system_prior(system) + g * delta
+        return (
+            confidence * b
+            + (1 - confidence) * self.system_prior(system)
+            + g * delta
+            + self.rows[sensor].theta[self.lag_index(self.systems.index(system))]
+        )
 
     def forecast(
         self, sensor, temperature, systems, steps, outdoor=None, solar=0, sources=None
@@ -537,26 +671,51 @@ class Learning:
         a = row.theta[0] if outdoor is not None else 0
         background = a * outdoor if outdoor is not None else 0
         background += row.theta[-2] * (solar or 0) + row.theta[-1]
-        background += sum(
-            self.source_effect(sensor, source, outdoor, temperature)
-            * (sources or {}).get(source, 0)
-            for source in self.sources
-        )
         retention = 1 - a
         gain = sum(retention**k for k in range(steps))
-        return (
-            retention**steps * temperature + gain * background,
-            [
-                gain
-                * max(
-                    0,
-                    self.blended(sensor, system, outdoor, temperature)
-                    if system in self.systems
-                    else PRIOR_B,
-                )
-                for system in systems
-            ],
+        background += sum(
+            (
+                self.source_effect(sensor, key, outdoor, temperature)
+                - row.theta[self.lag_index(len(self.systems) + k)]
+            )
+            * (sources or {}).get(key, 0)
+            for k, key in enumerate(self.sources)
         )
+        base = retention**steps * temperature + gain * background
+        coefficients = [
+            gain
+            * (
+                max(0, self.blended(sensor, key, outdoor, temperature))
+                - row.theta[self.lag_index(self.systems.index(key))]
+            )
+            if key in self.systems
+            else gain * PRIOR_B
+            for key in systems
+        ]
+        window = self.lag_minutes * 60
+        for step in range(steps):
+            t = step * self.interval_minutes * 60
+            fraction = min(1, t / window)
+            weight = retention ** (steps - 1 - step)
+            for k, (kind, key) in enumerate(
+                [("system", key) for key in self.systems]
+                + [("source", key) for key in self.sources]
+            ):
+                h = row.theta[self.lag_index(k)]
+                if h == 0:
+                    continue
+                known = 0
+                if fraction < 1:
+                    value = self.past_effort(
+                        kind, key, self.effort_clock, self.effort_clock + t - window
+                    )
+                    known = (value or 0) * (1 - fraction)
+                base += weight * h * known
+                if kind == "source":
+                    base += weight * h * fraction * (sources or {}).get(key, 0)
+                elif key in systems:
+                    coefficients[systems.index(key)] += weight * h * fraction
+        return base, coefficients
 
     def influences(self, system, sensors=None, outdoor=None, temperatures=None):
         positive = {
@@ -580,6 +739,10 @@ class Learning:
                     s: {
                         "b": row.theta[k + 1],
                         "g": row.theta[self.interaction_index(k)],
+                        "h": row.theta[self.lag_index(k)],
+                        "steady_std": self.steady_std(
+                            s, j, outdoor, (temperatures or {}).get(s)
+                        ),
                         "blended_b": self.blended(
                             s, j, outdoor, (temperatures or {}).get(s)
                         ),
@@ -600,6 +763,7 @@ class Learning:
                 source: {
                     sensor: {
                         "e": row.theta[1 + len(self.systems) + k],
+                        "h": row.theta[self.lag_index(len(self.systems) + k)],
                         "g": row.theta[self.interaction_index(len(self.systems) + k)],
                         "effective_effect": self.source_effect(
                             sensor, source, outdoor, (temperatures or {}).get(sensor)
@@ -633,6 +797,10 @@ class Learning:
     def to_dict(self):
         return {
             "interaction_prior": self.interaction_prior,
+            "lag_prior": self.lag_prior,
+            "lag_minutes": self.lag_minutes,
+            "effort_history": deepcopy(self.effort_history),
+            "effort_clock": self.effort_clock,
             "regime_margin": self.regime_margin,
             "regime_hours": self.regime_hours,
             "regime_return_hours": self.regime_return_hours,
@@ -671,16 +839,23 @@ class Learning:
             saved.get("disturbance_intervals", 2),
             saved.get("disturbance_clear_intervals", 3),
             interaction_prior=saved.get("interaction_prior", INTERACTION_PRIOR),
+            lag_prior=saved.get("lag_prior", LAG_PRIOR),
+            lag_minutes=saved.get("lag_minutes", 60),
         )
 
         def load_row(data):
             row = Row(**deepcopy(data))
             count = len(model.systems) + len(model.sources)
-            if len(row.theta) == count + 3 and count:
-                # v0.5.7: insert zero interactions before solar/drift. Preserve
-                # every old coefficient and covariance, including cross terms.
+            if len(row.theta) != 3 * count + 3:
+                # Insert missing interaction/lag columns, preserving all old covariance.
+                old_groups = (len(row.theta) - 3) // count if count else 3
                 prior = model.neutral_row()
-                mapping = [*range(count + 1), *([None] * count), count + 1, count + 2]
+                mapping = [
+                    *range(old_groups * count + 1),
+                    *([None] * ((3 - old_groups) * count)),
+                    old_groups * count + 1,
+                    old_groups * count + 2,
+                ]
                 for i, old_i in enumerate(mapping):
                     if old_i is not None:
                         prior.theta[i] = row.theta[old_i]
@@ -692,6 +867,8 @@ class Learning:
                 row = prior
             return row
 
+        model.effort_history = deepcopy(saved.get("effort_history", []))
+        model.effort_clock = saved.get("effort_clock", saved.get("clock", 0))
         model.rows = {s: load_row(row) for s, row in saved["rows"].items()}
         for key in (
             "regime_margin",
@@ -723,11 +900,17 @@ class EffortTracker:
         self.totals = {}
         self.missing = set()
         self.started = None
+        self.segments = {}
+        self.finished_segments = {}
 
     def change(self, system, action, now):
         if system in self.times:
             elapsed = max(0, now - self.times[system])
             previous = self.actions[system]
+            if elapsed > 0:
+                self.segments.setdefault(system, []).append(
+                    [self.times[system], now, previous]
+                )
             if previous is None and elapsed > 0:
                 self.missing.add(system)
             self.totals[system] = self.totals.get(system, 0) + (previous or 0) * elapsed
@@ -756,6 +939,8 @@ class EffortTracker:
             for s in actions
         }
         self.started = now
+        self.finished_segments = self.segments
+        self.segments = {}
         self.totals = {}
         self.missing.clear()
         return result, duration

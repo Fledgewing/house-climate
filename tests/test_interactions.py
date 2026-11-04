@@ -55,7 +55,7 @@ def test_v057_migration_preserves_all_rows_covariances_and_predictions():
     original = deepcopy(old)
     model = Learning.from_dict(old)
     assert old == original  # Loading does not mutate Store data.
-    mapping = [0, 1, 2, 5, 6]
+    mapping = [0, 1, 2, 7, 8]
     for row in [
         model.rows["room"],
         model.regimes["room"]["challenger"],
@@ -86,8 +86,8 @@ def test_interaction_reconcile_and_response_change_reset():
         ["room"], ["a", "b"], sources=["fan", "heater"], interaction_prior=0.002
     )
     row = model.rows["room"]
-    row.theta = list(range(11))
-    row.covariance = [[i * 11 + j for j in range(11)] for i in range(11)]
+    row.theta = list(range(15))
+    row.covariance = [[i * 15 + j for j in range(15)] for i in range(15)]
     model.regimes["room"]["challenger"] = deepcopy(row)
     model.promote("room")
     model.rows["room"] = deepcopy(row)
@@ -95,8 +95,8 @@ def test_interaction_reconcile_and_response_change_reset():
     model.reconcile(["room"], ["b", "a"], ["heater"])
     model.reconcile(["room"], ["b", "a"], ["heater", "fan"])
     for row in [model.rows["room"], model.regimes["room"]["saved"][0]["row"]]:
-        assert row.theta == [0, 2, 1, 4, 0, 6, 5, 8, 0, 9, 10]
-        assert row.covariance[2][6] == 1 * 11 + 5
+        assert row.theta == [0, 2, 1, 4, 0, 6, 5, 8, 0, 10, 9, 12, 0, 13, 14]
+        assert row.covariance[2][6] == 1 * 15 + 5
         assert row.covariance[4][4] == 100
         assert row.covariance[8][8] == 0.002
         assert row.covariance[8][6] == 0
@@ -114,13 +114,23 @@ def test_duration_scaled_interaction_update(sign):
         duration=2,
         sources={"fan": 0.25},
     )
-    x = [-30, sign, 0.5, -15 * sign, -7.5, 0, 2]
-    variance = [100, 100, 100, INTERACTION_PRIOR, INTERACTION_PRIOR, 100, 100]
+    x = [-30, sign, 0.5, -15 * sign, -7.5, 0, 0, 0, 2]
+    variance = [
+        100,
+        100,
+        100,
+        INTERACTION_PRIOR,
+        INTERACTION_PRIOR,
+        0.01,
+        0.01,
+        100,
+        100,
+    ]
     error = 0.1 - 0.03 * sign
     denominator = 1 + sum(p * v * v for p, v in zip(variance, x))
     expected = [
         prior + p * v * error / denominator
-        for prior, p, v in zip([0, 0.03, 0, 0, 0, 0, 0], variance, x)
+        for prior, p, v in zip([0, 0.03, 0, 0, 0, 0, 0, 0, 0], variance, x)
     ]
     assert model.rows["room"].theta == pytest.approx(expected)
 
@@ -246,7 +256,7 @@ def test_whole_house_fan_learns_signed_temperature_effect():
 def test_current_effects_forecast_affinity_diagnostics_outage_and_heat_clamp():
     model = Learning(["room", "other"], ["pump"], sources=["fan"])
     row = model.rows["room"]
-    row.theta = [0.01, 0.3, 0.02, 0.01, 0.02, 0, 0]
+    row.theta = [0.01, 0.3, 0.02, 0.01, 0.02, 0, 0, 0, 0]
     row.counts = [100, 100]
     model.rows["other"].theta = list(row.theta)
     model.rows["other"].counts = [100, 100]

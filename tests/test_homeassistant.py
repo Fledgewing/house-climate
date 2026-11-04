@@ -555,7 +555,9 @@ async def test_config_flow_empty_defaults_and_selector_filters(hass):
         "average_weight": 1.0,
         "explore_threshold": 0.8,
         "excite_after_minutes": 120,
-        "excite_minutes": 30,
+        "excite_minutes": 60,
+        "lag_minutes": 60,
+        "lag_prior": 0.01,
     }.items():
         field, value = fields[key]
         assert field.default() == default
@@ -997,7 +999,13 @@ async def test_completed_transient_between_ticks_skips_learning(hass, installed)
         return_value=start + timedelta(minutes=5),
     ):
         await c.async_tick()
-    assert c.learning.to_dict() == before
+    assert {
+        k: v
+        for k, v in c.learning.to_dict().items()
+        if k not in ("effort_history", "effort_clock")
+    } == {
+        k: v for k, v in before.items() if k not in ("effort_history", "effort_clock")
+    }
     assert c.data.readings == {"sensor.room": 19}
     assert "sensor transient ignored" in c.data.explanation
     # The median window and rejected interval survive an actual integration reload.
@@ -1436,7 +1444,13 @@ async def test_priority_select_immediate_errors_learning_and_restart(hass, insta
     )
     assert c.data.temperature == 22
     assert "House 22.00" in c.data.explanation
-    assert c.learning.to_dict() == before
+    assert {
+        k: v
+        for k, v in c.learning.to_dict().items()
+        if k not in ("effort_history", "effort_clock")
+    } == {
+        k: v for k, v in before.items() if k not in ("effort_history", "effort_clock")
+    }
     assert c.sensor_blocks_fans("sensor.other")
     c.config["minor_weight_share"] = 0.5
     assert c.sensor_blocks_fans("sensor.other")
@@ -1470,7 +1484,13 @@ async def test_priority_select_immediate_errors_learning_and_restart(hass, insta
     assert result["type"] == FlowResultType.CREATE_ENTRY
     await hass.async_block_till_done()
     assert hass.states.get("select.house_priority_mode").state == "day"
-    assert entry.runtime_data.learning.to_dict() == before
+    assert {
+        k: v
+        for k, v in entry.runtime_data.learning.to_dict().items()
+        if k not in ("effort_history", "effort_clock")
+    } == {
+        k: v for k, v in before.items() if k not in ("effort_history", "effort_clock")
+    }
     result = await flow.async_init(entry.entry_id)
     result = await flow.async_configure(
         result["flow_id"],
@@ -1483,7 +1503,13 @@ async def test_priority_select_immediate_errors_learning_and_restart(hass, insta
     await flow.async_configure(result["flow_id"], {"mode": "day"})
     await hass.async_block_till_done()
     assert hass.states.get("select.house_priority_mode").state == "balance"
-    assert entry.runtime_data.learning.to_dict() == before
+    assert {
+        k: v
+        for k, v in entry.runtime_data.learning.to_dict().items()
+        if k not in ("effort_history", "effort_clock")
+    } == {
+        k: v for k, v in before.items() if k not in ("effort_history", "effort_clock")
+    }
 
 
 @pytest.mark.parametrize("options", [False, True])
@@ -1728,6 +1754,7 @@ async def test_excitation_dispatch_between_tick_runtime_and_restart(hass, instal
     coordinator.state.last_stop = {
         key: start.timestamp() - 3 * 3600 for key in coordinator.state.last_run
     }
+    coordinator.state.test_observed_since = dict(coordinator.state.last_run)
     with patch(
         "custom_components.house_climate.coordinator.dt_util.utcnow", return_value=start
     ):
@@ -1740,7 +1767,7 @@ async def test_excitation_dispatch_between_tick_runtime_and_restart(hass, instal
         for key, service, data in calls
     )
     assert (
-        "exploring: running ducted to learn which rooms it reaches"
+        "testing ducted for 60 min to learn its effect on"
         in coordinator.data.explanation
     )
     # Changes during commands under the coordinator lock still count accurately.
@@ -1754,11 +1781,14 @@ async def test_excitation_dispatch_between_tick_runtime_and_restart(hass, instal
                 entity._attr_hvac_action = action
                 entity.async_write_ha_state()
                 await hass.async_block_till_done()
-    assert coordinator.state.excitation["runtime"] == 600
+    assert coordinator.state.excitation["runtime"] == 0
     with patch(
         "custom_components.house_climate.coordinator.dt_util.utcnow",
         return_value=start + timedelta(minutes=12),
     ):
+        entity._attr_hvac_action = HVACAction.HEATING
+        entity.async_write_ha_state()
+        await hass.async_block_till_done()
         await coordinator.async_tick(record=False)
     restored = HouseCoordinator(hass, entry)
     with patch(
@@ -1896,19 +1926,31 @@ async def test_source_events_model_reload_and_missing(hass, installed):
         return_value=start + timedelta(minutes=10),
     ):
         await c.async_tick()
-    assert c.learning.to_dict() == before
+    assert {
+        k: v
+        for k, v in c.learning.to_dict().items()
+        if k not in ("effort_history", "effort_clock")
+    } == {
+        k: v for k, v in before.items() if k not in ("effort_history", "effort_clock")
+    }
     with patch(
         "custom_components.house_climate.coordinator.dt_util.utcnow",
         return_value=start + timedelta(minutes=10),
     ):
         assert await hass.config_entries.async_reload(entry.entry_id)
-    assert entry.runtime_data.learning.to_dict() == before
+    assert {
+        k: v
+        for k, v in entry.runtime_data.learning.to_dict().items()
+        if k not in ("effort_history", "effort_clock")
+    } == {
+        k: v for k, v in before.items() if k not in ("effort_history", "effort_clock")
+    }
     settings = deepcopy(settings)
     settings["extra_heat_sources"] = []
     hass.config_entries.async_update_entry(entry, options=settings)
     await hass.async_block_till_done()
     assert entry.runtime_data.learning.rows["sensor.room"].samples == 1
-    assert len(entry.runtime_data.learning.rows["sensor.room"].theta) == 7
+    assert len(entry.runtime_data.learning.rows["sensor.room"].theta) == 9
 
 
 @pytest.mark.parametrize("hours", [0, 1])
@@ -1938,7 +1980,13 @@ async def test_learning_pause_switch_freezes_resumes_and_persists(
         await c.async_change(setpoint=23, enabled=True)
         await c.async_tick()
     assert any(service == "set_temperature" for _, service, _ in calls)
-    assert c.learning.to_dict() == before
+    assert {
+        k: v
+        for k, v in c.learning.to_dict().items()
+        if k not in ("effort_history", "effort_clock")
+    } == {
+        k: v for k, v in before.items() if k not in ("effort_history", "effort_clock")
+    }
     assert c.fans.arms == arms
     with patch(
         "custom_components.house_climate.coordinator.dt_util.utcnow",
@@ -1966,7 +2014,13 @@ async def test_learning_pause_switch_freezes_resumes_and_persists(
     assert c.learning_enabled
     assert c.learning_resume_at is None
     # Auto-resume establishes a fresh baseline; no paused interval can train.
-    assert c.learning.to_dict() == before
+    assert {
+        k: v
+        for k, v in c.learning.to_dict().items()
+        if k not in ("effort_history", "effort_clock")
+    } == {
+        k: v for k, v in before.items() if k not in ("effort_history", "effort_clock")
+    }
     with patch(
         "custom_components.house_climate.coordinator.dt_util.utcnow",
         return_value=start + timedelta(minutes=65),
@@ -1990,8 +2044,8 @@ async def test_disturbance_skips_room_learning_and_weight_gates_fans(
     c.learning.reconcile(["sensor.room", "sensor.other"], c.learning.systems)
     for row in c.learning.rows.values():
         row.counts = [100, 100]
-        row.theta = [0] * 7
-        row.covariance = [[0.001 if i == j else 0 for j in range(7)] for i in range(7)]
+        row.theta = [0] * 9
+        row.covariance = [[0.001 if i == j else 0 for j in range(9)] for i in range(9)]
     start = dt_util.utcnow()
     c.learning_baseline = ({"sensor.room": 19, "sensor.other": 19}, 3, 0)
     c.fans.window["dirty"] = False
@@ -2105,7 +2159,7 @@ async def test_modelled_heat_keeps_thermal_samples_and_fan_window_valid(
     hass.states.async_set("switch.source", "on")
     c.learning.reconcile(["sensor.room"], c.learning.systems, ["switch.source"])
     row = c.learning.rows["sensor.room"]
-    row.theta = [0, 0, 0, 0.8, 0, 0, 0, 0, 0]
+    row.theta = [0, 0, 0, 0.8, 0, 0, 0, 0, 0, 0, 0, 0]
     row.counts = [100, 100, 100]
     start = dt_util.utc_from_timestamp(c.fans.window["start"])
     c.source_effort.finish({"switch.source": "heating"}, start.timestamp())
@@ -2158,7 +2212,13 @@ async def test_pause_deadline_expired_during_restart_resumes_without_sample(
     c = entry.runtime_data
     assert c.learning_enabled
     assert c.learning_resume_at is None
-    assert c.learning.to_dict() == before
+    assert {
+        k: v
+        for k, v in c.learning.to_dict().items()
+        if k not in ("effort_history", "effort_clock")
+    } == {
+        k: v for k, v in before.items() if k not in ("effort_history", "effort_clock")
+    }
     assert hass.states.get("switch.house_learning").state == "on"
 
 
@@ -2778,7 +2838,7 @@ async def test_interaction_diagnostics_include_zero_weight_rooms_and_device_rows
         system.async_write_ha_state()
     c.learning.reconcile(c.learning_sensors, c.learning.systems, ["switch.fan"])
     for row in c.learning.rows.values():
-        row.theta = [0, 0.3, 0, 0.01, 0.01, 0, 0.02, 0, 0]
+        row.theta = [0, 0.3, 0, 0.01, 0.01, 0, 0.02, 0, 0, 0, 0, 0]
         row.counts = [100, 100, 100]
     c.learning_enabled = False
     await c.async_tick(record=False)
