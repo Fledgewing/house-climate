@@ -282,7 +282,9 @@ class HouseSteps:
     async def async_step_source(self, user_input=None):
         source = self.settings["extra_heat_sources"][self.source_index]
         if user_input is not None:
-            source.update(user_input)
+            source.update({"response": source.get("response", "on_off"), **user_input})
+            if source.get("kind", "binary") != "power":
+                source["response"] = "on_off"
             self.source_index += 1
             if self.source_index == len(self.settings["extra_heat_sources"]):
                 return await self.async_step_tunables()
@@ -296,6 +298,13 @@ class HouseSteps:
                         "kind", default=source.get("kind", "binary")
                     ): selector.SelectSelector(
                         selector.SelectSelectorConfig(options=["binary", "power"])
+                    ),
+                    vol.Required(
+                        "response", default=source.get("response", "on_off")
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=["on_off", "proportional"]
+                        )
                     ),
                     vol.Required(
                         "threshold", default=source.get("threshold", 10)

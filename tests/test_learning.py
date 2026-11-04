@@ -330,3 +330,34 @@ def test_missing_influential_room_reports_house_fallback():
         learning=model,
     )
     assert "one low (effort 0.00)" in decision.explanation
+
+
+def test_numeric_effort_time_weighted_mean_and_missing():
+    tracker = EffortTracker()
+    tracker.finish({"server": 0.150}, 0)
+    tracker.change("server", 0.200, 150)
+    efforts, duration = tracker.finish({"server": 0.200}, 300)
+    assert duration == 300
+    assert efforts["server"] == pytest.approx(0.175)
+    tracker.change("server", None, 350)
+    tracker.change("server", 0.100, 400)
+    assert tracker.finish({"server": 0.100}, 600)[0]["server"] is None
+
+
+def test_varying_proportional_source_learns_positive_effect():
+    model = Learning(["room"], [], sources=["server"])
+    temperature = 20.0
+    for step in range(1200):
+        effort = (100 + (step * 37 % 151)) / 1000
+        after = temperature + 0.02 * (10 - temperature) + 0.8 * effort
+        model.update(
+            {"room": temperature},
+            {"room": after},
+            10,
+            {},
+            sources={"server": effort},
+        )
+        temperature = after
+    assert model.diagnostics()["sources"]["server"]["room"]["e"] == pytest.approx(
+        0.8, abs=0.02
+    )

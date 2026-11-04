@@ -631,7 +631,7 @@ class Learning:
 
 
 class EffortTracker:
-    """Integrate action transitions, including changes between controller passes.
+    """Integrate numeric efforts or action transitions between controller passes.
 
     Unknown/unavailable action makes that system's whole interval missing.
     A restart deliberately starts a new interval rather than guessing downtime.
@@ -651,14 +651,18 @@ class EffortTracker:
             if previous is None and elapsed > 0:
                 self.missing.add(system)
             self.totals[system] = self.totals.get(system, 0) + (previous or 0) * elapsed
-        self.actions[system] = {
-            "heating": 1,
-            "cooling": -1,
-            "idle": 0,
-            "off": 0,
-            "fan": 0,
-            "drying": 0,
-        }.get(action)
+        self.actions[system] = (
+            (action if isfinite(action) else None)
+            if isinstance(action, (int, float))
+            else {
+                "heating": 1,
+                "cooling": -1,
+                "idle": 0,
+                "off": 0,
+                "fan": 0,
+                "drying": 0,
+            }.get(action)
+        )
         self.times[system] = now
 
     def finish(self, actions, now):

@@ -868,12 +868,23 @@ def control(
                 else 0.03
                 for r in values
             }
+            weights = {m["entity_id"]: m.get("weight", 1) for m in members}
+            total = sum(weights[r] for r in values)
+            named = [
+                r
+                for r in values
+                if weights[r] / total >= config.get("minor_weight_share", 0.05)
+            ]
             helped = sorted(
-                (r for r in values if direction * (house - values[r]) > 0),
-                key=lambda r: reach[r] * abs(house - values[r]),
+                (r for r in named if direction * (house - values[r]) > 0),
+                key=lambda r: weights[r] * reach[r] * abs(house - values[r]),
                 reverse=True,
             )
-            above = max(values, key=lambda r: direction * (values[r] - house))
+            above = max(
+                named,
+                key=lambda r: weights[r] * direction * (values[r] - house),
+                default=None,
+            )
             action = "on" if effort > 0 else "low"
             notes.append(
                 f"{device.name or entity_id} {action} (effort {effort:.2f}): "
@@ -881,8 +892,14 @@ def control(
                     f"{'lifts' if mode == 'heat' else 'cools'} {', '.join(room_names[r] for r in helped)} toward the average; "
                     if helped and effort > 0
                     else f"limits {'heat' if mode == 'heat' else 'cooling'} into {room_names[above]}; "
+                    if above is not None
+                    else "balances the house average. "
                 )
-                + f"{room_names[above]} is {abs(values[above] - house):.2f} °C {'above' if mode == 'heat' else 'below'} the average."
+                + (
+                    f"{room_names[above]} is {abs(values[above] - house):.2f} °C {'above' if mode == 'heat' else 'below'} the average."
+                    if above is not None
+                    else ""
+                )
             )
         if house is None or mode == "off":
             state.rounding_errors.pop(entity_id, None)

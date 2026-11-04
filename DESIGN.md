@@ -177,6 +177,10 @@ Every control interval, and immediately when the house setpoint or mode changes:
    `last_decision` names each system's on/low effort, the rooms its learned reach can lift/cool
    toward the average, and the room above/below that average driving restraint. Room and device
    friendly names are used when available; the implementation contains no house-specific names.
+   In v0.5.7, explanation room names use active-priority weights: rank the restraining
+   room by weight × directional deviation, and helped rooms by weight × reach × deviation.
+   Never name rooms whose share of the available objective weights is below
+   `minor_weight_share`. This changes text only, with no effect on allocation.
 4. Run the fan/vane scheduler described below, adding at most one changed fan/vane command.
    Write only what changed: `climate.set_hvac_mode`, then `climate.set_temperature`. For a system with a
    configured required preset, re-assert that preset if it has left it.
@@ -506,28 +510,37 @@ standard deviation (the simulation's weighted spread metric). Production spread 
 
 ## External inputs and robust learning (v0.5.0)
 
-`extra_heat_sources` is an optional list of `{entity_id, kind, threshold}` records in
+`extra_heat_sources` is an optional list of `{entity_id, kind, threshold, response}` records in
 entry data/options. The ordinary membership page selects any binary-like or numeric
 entity; each source page chooses `binary` (literal HA on/off states) or `power`
 (finite W, kW or MW, strictly above `threshold` W, default 10). No heat-source device
 names or room mappings appear in implementation. Sources are never commanded.
+As of v0.5.7, `response` defaults to `on_off`, preserving existing entries. Power
+sources may instead select `proportional`: effort is W/1000 (after W/kW/MW conversion),
+zero at or below the threshold standby floor. Binary sources remain on/off.
 
 RLS columns are `[outdoor−room, HVAC efforts..., source fractions..., solar, 1]`.
 Source coefficients have zero prior means, covariance diagonal 100 and zero initial
 cross-covariances. Source effective activity counts use the same forgetting and
-`n/(n+N0)` confidence as HVAC inputs. Sources use a separate `EffortTracker`, translating
-on/off to 1/0, and listen to every state transition even during command locks. Both
+`n/(n+N0)` confidence as HVAC inputs. Sources use a separate `EffortTracker`, accepting numeric effort as well as the
+HVAC action strings. On/off translates to 1/0; proportional sources integrate kW.
+Both listen to every state transition even during command locks. Both
 trackers finish at the same scheduled passes; immediate control requests leave their
 integrals intact. Unknown observations make the interval unavailable. Observations
-record the integrated fractions. Startup and pause/resume reset the runtime baseline,
+record the integrated fractions or time-weighted mean kW. Forecasts use current effort. Startup and pause/resume reset the runtime baseline,
 so no unobserved interval is invented.
 
 Reconciliation maps covariance and coefficients by `(input kind, entity ID)`, retaining
 all surviving cross-covariances, fit errors, sample counts and effective activity counts.
 New columns alone start neutral; source removal shrinks rows without resetting HVAC,
-solar or drift. Old Store models with no source metadata load unchanged.
+solar or drift. Persist source response modes alongside the model. On reload, a
+changed response resets only that source's coefficient, activity count and covariance
+column to neutral priors, including challenger and saved regime rows. Other columns
+remain intact. Old Store models default to `on_off`.
 `sensor.house_learning.sources[source][room]` exposes `e`, confidence percent and
-`effective_samples`; overall confidence remains the HVAC-pair mean used previously.
+`effective_samples`; `sources[source]` also exposes `response` and current `effort`
+(0/1 or kW, null for unknown). Coefficient units are °C per full-on interval or °C per
+kW per interval. Overall confidence remains the HVAC-pair mean used previously.
 
 For each available row interval, calculate the prediction residual before updating.
 Normalize residual and fit error to one configured interval; delayed intervals scale

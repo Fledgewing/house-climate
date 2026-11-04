@@ -68,7 +68,13 @@ class LearningSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self):
-        return self.coordinator.learning.diagnostics()
+        diagnostics = self.coordinator.learning.diagnostics()
+        for source in self.coordinator.config.get("extra_heat_sources", []):
+            diagnostics["sources"][source["entity_id"]].update(
+                response=source.get("response", "on_off"),
+                effort=self.coordinator.source_value(source),
+            )
+        return diagnostics
 
 
 class FanLearningSensor(LearningSensor):

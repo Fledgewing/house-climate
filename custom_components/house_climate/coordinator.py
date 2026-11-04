@@ -187,6 +187,22 @@ class HouseCoordinator(DataUpdateCoordinator):
                 )
             if saved.get("learning"):
                 self.learning = Learning.from_dict(saved["learning"])
+                changed = {
+                    source["entity_id"]
+                    for source in self.config.get("extra_heat_sources", [])
+                    if saved.get("source_responses", {}).get(
+                        source["entity_id"], "on_off"
+                    )
+                    != source.get("response", "on_off")
+                }
+                if changed:
+                    # Drop changed columns before restoring them with neutral priors,
+                    # including challenger and saved regime rows/covariances.
+                    self.learning.reconcile(
+                        self.learning_sensors,
+                        self.learning.systems,
+                        [key for key in self.learning.sources if key not in changed],
+                    )
                 self.learning.reconcile(
                     self.learning_sensors,
                     [s["entity_id"] for s in self.config["systems"]],
@@ -250,11 +266,20 @@ class HouseCoordinator(DataUpdateCoordinator):
             if value is None or factor is None:
                 return None
             on = value * factor > source.get("threshold", 10)
+            if source.get("response", "on_off") == "proportional":
+                return value * factor / 1000 if on else 0.0
         elif entity.state in ("on", "off"):
             on = entity.state == "on"
         else:
             return None
         return "heating" if on else "off"
+
+    def source_value(self, source):
+        """Current model effort: on fraction or kW; unknown stays missing."""
+        action = self.source_action(source)
+        if isinstance(action, (int, float)) or action is None:
+            return action
+        return float(action == "heating")
 
     @callback
     def _source_changed(self, event):
@@ -736,7 +761,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 solar=solar,
                 measured_efforts=efforts if record else None,
                 sources={
-                    source["entity_id"]: float(self.source_action(source) == "heating")
+                    source["entity_id"]: self.source_value(source) or 0
                     for source in self.config.get("extra_heat_sources", [])
                 },
             )
@@ -877,6 +902,10 @@ class HouseCoordinator(DataUpdateCoordinator):
                     "fans": self.fans.to_dict(),
                     "samples": self.samples,
                     "learning": self.learning.to_dict(),
+                    "source_responses": {
+                        source["entity_id"]: source.get("response", "on_off")
+                        for source in self.config.get("extra_heat_sources", [])
+                    },
                     "reporting": self.reporting.to_dict(),
                     "filters": {key: f.to_dict() for key, f in self.filters.items()},
                 }

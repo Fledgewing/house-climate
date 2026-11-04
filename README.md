@@ -131,7 +131,7 @@ Changes made directly on physical systems are noted in `last_decision` and re-as
 
 ## Online learning and visibility
 
-Each room learns `ΔT = a × (outdoor − room) + Σ b × signed_runtime_fraction + Σ e × source_on_fraction + c × solar_kW + d` using recursive least squares. HVAC action changes are tracked between passes: heating contributes positive running effort, cooling negative. Every `b` starts at 0.03 °C per interval, with zero prior heat-loss, sun-gain and drift means and broad covariance. Default forgetting is 0.998 per sample. Each room/system confidence is `n/(n+24)`, where n is the forgetting-weighted number of intervals with nonzero effort. In v0.4.2, low-confidence pairs blend toward that system's confidence-weighted mean learned b across rooms with runtime evidence, falling back to 0.03 only when none has been explored. A new sensor therefore inherits measured system reach while its own effect is learned; no room mappings are assumed. Forgetting and prior sample count are available in options.
+Each room learns `ΔT = a × (outdoor − room) + Σ b × signed_runtime_fraction + Σ e × source_effort + c × solar_kW + d` using recursive least squares. HVAC action changes are tracked between passes: heating contributes positive running effort, cooling negative. Every `b` starts at 0.03 °C per interval, with zero prior heat-loss, sun-gain and drift means and broad covariance. Default forgetting is 0.998 per sample. Each room/system confidence is `n/(n+24)`, where n is the forgetting-weighted number of intervals with nonzero effort. In v0.4.2, low-confidence pairs blend toward that system's confidence-weighted mean learned b across rooms with runtime evidence, falling back to 0.03 only when none has been explored. A new sensor therefore inherits measured system reach while its own effect is learned; no room mappings are assumed. Forgetting and prior sample count are available in options.
 
 While a system's least-confident active, weighted room is below `explore_threshold` (default 0.8), it gets a ±0.5 °C two-hour square-wave exploration offset, with different phases per system. The amplitude fades to zero at that threshold and perturbs bounded effort. `last_decision` says **exploring** and explains room-level allocation tradeoffs.
 
@@ -164,12 +164,19 @@ In **Configure**, select optional **Extra heat source entities**, then choose **
 default **10 W**; W, kW and MW are supported. These entities are only observed. For
 example, a blower switch can indicate an insert running, or a plug power sensor can
 indicate a portable heater. Choose an indication that reliably tracks the heat source.
-Adding, removing or reordering sources preserves the rest of the thermal model.
+Power sources also offer **Response: proportional** (v0.5.7). Use it for devices such
+as an always-running server whose heat varies with its draw. Effort is power in kW,
+with zero effort at or below the threshold (a standby floor). The default **on_off**
+response preserves existing sources' behavior. Adding, removing or reordering sources
+preserves the rest of the thermal model; changing response resets that source's learned
+effects because their units change.
 
 Each source adds a learned effect `e` for every room, starting at zero with broad
-covariance. Its input is the fraction of the interval it was on, including state changes
-between control passes. `sensor.house_learning` exposes `sources → source entity → room`
-with `e` (°C per full-on interval), confidence percent and effective samples. Configured
+covariance. Its input is the fraction of the interval it was on, or the time-weighted
+mean kW for proportional sources, including power changes between control passes. `sensor.house_learning` exposes `sources → source entity → room`
+with `e` (°C per full-on interval, or °C per kW per interval), confidence percent and
+effective samples. Each source also exposes its `response` and current `effort` (0/1
+or kW; null when unknown). Configured
 sources are part of the thermal prediction: their operation does not itself discard
 thermal samples or fan experiments. Missing source observations skip the thermal interval.
 Control continues responding to measured room temperatures.

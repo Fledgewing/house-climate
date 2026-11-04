@@ -35,3 +35,40 @@ def test_balance_preserves_legacy_control_and_reconciles_members():
         "balance": {"a": 3, "new": 1},
         "night": {"a": 8, "new": 1},
     }
+
+
+def test_explanation_uses_active_weights_and_omits_minor_rooms():
+    config = {
+        "sensors": [{"entity_id": r} for r in ("cold", "weighted", "hot", "office")],
+        "systems": [{"entity_id": "unit"}],
+        "priority_modes": {
+            "day": {"cold": 10, "weighted": 5, "hot": 1, "office": 0.01}
+        },
+    }
+    readings = {
+        "cold": Reading(18),
+        "weighted": Reading(23),
+        "hot": Reading(25),
+        "office": Reading(35),
+    }
+    decision = control(
+        {**config, "sensors": members(config, "day")},
+        ControlState(mode="heat"),
+        readings,
+        {"unit": Device()},
+        0,
+    )
+    assert "weighted is" in decision.explanation
+    assert "hot is" not in decision.explanation
+    assert "office" not in decision.explanation
+    config["priority_modes"]["day"]["office"] = 10
+    config["priority_modes"]["day"]["weighted"] = 0.01
+    decision = control(
+        {**config, "sensors": members(config, "day")},
+        ControlState(mode="heat"),
+        readings,
+        {"unit": Device()},
+        0,
+    )
+    assert "office is" in decision.explanation
+    assert "weighted" not in decision.explanation

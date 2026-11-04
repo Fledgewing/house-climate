@@ -100,7 +100,8 @@
         "description": "Configure {entity}. Binary uses on/off states; power uses W, kW or MW. Threshold applies only to power inputs. These entities are observed, never controlled.",
         "data": {
           "kind": "Input type (binary or power)",
-          "threshold": "On above power (W)"
+          "response": "Response (on_off or proportional; power only)",
+          "threshold": "On above power / standby floor (W)"
         }
       }
     },
@@ -215,7 +216,8 @@
         "description": "Configure {entity}. Binary uses on/off states; power uses W, kW or MW. Threshold applies only to power inputs. These entities are observed, never controlled.",
         "data": {
           "kind": "Input type (binary or power)",
-          "threshold": "On above power (W)"
+          "response": "Response (on_off or proportional; power only)",
+          "threshold": "On above power / standby floor (W)"
         }
       }
     },

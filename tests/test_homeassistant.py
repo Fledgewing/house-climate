@@ -1779,6 +1779,10 @@ async def test_excitation_dispatch_between_tick_runtime_and_restart(hass, instal
 
 
 async def test_options_onboard_sources(hass, settings):
+    # An existing source without response must keep the historical default.
+    settings["extra_heat_sources"] = [
+        {"entity_id": "switch.source", "kind": "binary", "threshold": 10}
+    ]
     entry = MockConfigEntry(domain=DOMAIN, data=settings, version=3)
     entry.add_to_hass(hass)
     flow = hass.config_entries.options
@@ -1800,8 +1804,10 @@ async def test_options_onboard_sources(hass, settings):
     fields = {k.schema: k for k in result["data_schema"].schema}
     assert fields["kind"].default() == "power"
     assert fields["threshold"].default() == 10
+    assert fields["response"].default() == "on_off"
     result = await flow.async_configure(
-        result["flow_id"], {"kind": "power", "threshold": 25}
+        result["flow_id"],
+        {"kind": "power", "threshold": 25, "response": "proportional"},
     )
     tunables = {
         k: v
@@ -1811,8 +1817,18 @@ async def test_options_onboard_sources(hass, settings):
     result = await flow.async_configure(result["flow_id"], tunables)
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert entry.options["extra_heat_sources"] == [
-        {"entity_id": "switch.source", "kind": "binary", "threshold": 10},
-        {"entity_id": "sensor.power", "kind": "power", "threshold": 25},
+        {
+            "entity_id": "switch.source",
+            "kind": "binary",
+            "threshold": 10,
+            "response": "on_off",
+        },
+        {
+            "entity_id": "sensor.power",
+            "kind": "power",
+            "threshold": 25,
+            "response": "proportional",
+        },
     ]
 
 
@@ -2658,3 +2674,75 @@ async def test_options_average_and_fan_override(hass, settings, override):
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert entry.options["average_weight"] == 0.2
     assert entry.options["fan_reward_lambda"] == override
+
+
+@pytest.mark.parametrize(
+    "unit,value", [("W", "150"), ("kW", "0.15"), ("MW", "0.00015")]
+)
+async def test_proportional_source_events_and_response_reset(
+    hass, installed, unit, value
+):
+    entry, _ = installed
+    settings = deepcopy(dict(entry.options))
+    source = {
+        "entity_id": "sensor.server",
+        "kind": "power",
+        "threshold": 10,
+        "response": "proportional",
+    }
+    settings["extra_heat_sources"] = [source]
+    hass.states.async_set("sensor.server", value, {"unit_of_measurement": unit})
+    hass.config_entries.async_update_entry(entry, options=settings)
+    await hass.async_block_till_done()
+    c = entry.runtime_data
+    assert c.source_value(source) == pytest.approx(0.15)
+    start = dt_util.utcnow()
+    c.reset_learning_interval()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow", return_value=start
+    ):
+        await c.async_tick()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(seconds=150),
+    ):
+        async with c.lock:
+            hass.states.async_set("sensor.server", "200", {"unit_of_measurement": "W"})
+            await hass.async_block_till_done()
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=start + timedelta(seconds=300),
+    ):
+        await c.async_tick()
+    assert c.samples[-1]["extra_heat_sources"]["sensor.server"] == pytest.approx(0.175)
+    attrs = hass.states.get("sensor.house_learning").attributes["sources"][
+        "sensor.server"
+    ]
+    assert attrs["response"] == "proportional"
+    assert attrs["effort"] == pytest.approx(0.2)
+    hass.states.async_set("sensor.server", "5", {"unit_of_measurement": "W"})
+    assert c.source_value(source) == 0
+    hass.states.async_set("sensor.server", "unknown")
+    assert c.source_value(source) is None
+    hass.states.async_set("sensor.server", "200", {"unit_of_measurement": "W"})
+    await hass.async_block_till_done()
+    row = c.learning.rows["sensor.room"]
+    row.theta[3] = 1.7
+    row.counts[2] = 60
+    row.covariance[3][0] = row.covariance[0][3] = 0.4
+    # Persist a fitted column before changing its units via an options reload.
+    await c.async_tick(record=False)
+    retained = deepcopy(row.theta)
+    settings = deepcopy(settings)
+    settings["extra_heat_sources"][0]["response"] = "on_off"
+    hass.config_entries.async_update_entry(entry, options=settings)
+    await hass.async_block_till_done()
+    c = entry.runtime_data
+    row = c.learning.rows["sensor.room"]
+    assert row.theta[:3] == retained[:3]
+    assert row.theta[4:] == retained[4:]
+    assert row.theta[3] == 0
+    assert row.counts[2] == 0
+    assert row.covariance[3][3] == 100
+    assert row.covariance[3][0] == row.covariance[0][3] == 0
+    assert c.source_value(settings["extra_heat_sources"][0]) == 1
