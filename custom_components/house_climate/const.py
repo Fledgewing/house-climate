@@ -53,6 +53,7 @@ DEFAULTS = {
     "mean_integral_gain": 0.001,
     "learning_forgetting": 0.998,
     "learning_n0": 24,
+    "interaction_prior": 0.0001,
     "explore_threshold": 0.8,
     "excite_after_minutes": 120,
     "excite_minutes": 30,

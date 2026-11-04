@@ -48,7 +48,7 @@ def test_roundtrip_and_membership():
     assert restored.rows["a"].theta[2] == model.rows["a"].theta[1]
     assert restored.rows["a"].covariance[2][2] == model.rows["a"].covariance[1][1]
     assert restored.rows["a"].theta[3] == PRIOR_B
-    assert restored.rows["new"].theta == [0, 0.03, 0.03, 0.03, 0, 0]
+    assert restored.rows["new"].theta == [0, 0.03, 0.03, 0.03, 0, 0, 0, 0, 0]
     assert restored.system_confidence("x") == 0
 
 
@@ -255,7 +255,9 @@ def test_identifies_full_model_and_signed_effort(sign):
             efforts,
             solar,
         )
-    assert model.rows["room"].theta == pytest.approx(truth, abs=0.0001)
+    assert model.rows["room"].theta == pytest.approx(
+        [*truth[:3], 0, 0, *truth[3:]], abs=0.0001
+    )
 
 
 def test_learned_error_uses_sensor_weights_and_preserves_safeguards():

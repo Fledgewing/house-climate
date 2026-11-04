@@ -131,7 +131,7 @@ Changes made directly on physical systems are noted in `last_decision` and re-as
 
 ## Online learning and visibility
 
-Each room learns `ΔT = a × (outdoor − room) + Σ b × signed_runtime_fraction + Σ e × source_effort + c × solar_kW + d` using recursive least squares. HVAC action changes are tracked between passes: heating contributes positive running effort, cooling negative. Every `b` starts at 0.03 °C per interval, with zero prior heat-loss, sun-gain and drift means and broad covariance. Default forgetting is 0.998 per sample. Each room/system confidence is `n/(n+24)`, where n is the forgetting-weighted number of intervals with nonzero effort. In v0.4.2, low-confidence pairs blend toward that system's confidence-weighted mean learned b across rooms with runtime evidence, falling back to 0.03 only when none has been explored. A new sensor therefore inherits measured system reach while its own effect is learned; no room mappings are assumed. Forgetting and prior sample count are available in options.
+Each room learns `ΔT = a × Δ + Σ (b + g × Δ) × signed_runtime_fraction + Σ (e + g × Δ) × source_effort + c × solar_kW + d` (Δ = outdoor minus room temperature at interval start) using recursive least squares. HVAC action changes are tracked between passes: heating contributes positive running effort, cooling negative. Every `b` starts at 0.03 °C per interval, with zero prior heat-loss, sun-gain and drift means and broad covariance. Default forgetting is 0.998 per sample. Each room/system confidence is `n/(n+24)`, where n is the forgetting-weighted number of intervals with nonzero effort. In v0.4.2, low-confidence pairs blend toward that system's confidence-weighted mean learned b across rooms with runtime evidence, falling back to 0.03 only when none has been explored. A new sensor therefore inherits measured system reach while its own effect is learned; no room mappings are assumed. Forgetting and prior sample count are available in options.
 
 While a system's least-confident active, weighted room is below `explore_threshold` (default 0.8), it gets a ±0.5 °C two-hour square-wave exploration offset, with different phases per system. The amplitude fades to zero at that threshold and perturbs bounded effort. `last_decision` says **exploring** and explains room-level allocation tradeoffs.
 
@@ -150,7 +150,7 @@ the confidence threshold; threshold zero disables thermal exploration. `last_dec
 
 Read `sensor.house_learning` for overall confidence percent (the mean across room/system pairs). Under its attributes:
 
-- `systems` → system entity → room sensor: `b` is the learned effect in °C per full-running interval; `blended_b` includes the prior; `influence` is the nonnegative normalized control weight; `confidence` is percent; `effective_samples` is the activity count.
+- `systems` → system entity → room sensor: `b` is the fixed effect in °C per full-running interval; `g` is its learned temperature slope; `blended_b` includes the fixed-part prior blend and current temperature interaction; `effective_effect` also applies the nonnegative heat clamp; `influence` is the nonnegative normalized control weight; `confidence` is percent; `effective_samples` is the activity count.
 - `sensors` → room sensor: `a` is heat loss, `c` sun gain in °C/interval/kW, `d` background drift, `fit_error` is the forgetting-weighted RMS prediction error in °C, and `samples` counts valid updates.
 
 Press `button.house_reset_learning` to clear the model and confidence back to neutral priors. It retains the house target, mode and control state and starts learning again. Adding a sensor can restart exploration while that room learns. Confidence measures runtime evidence; learning needs distinct system operation to identify separate effects.
@@ -174,7 +174,8 @@ effects because their units change.
 Each source adds a learned effect `e` for every room, starting at zero with broad
 covariance. Its input is the fraction of the interval it was on, or the time-weighted
 mean kW for proportional sources, including power changes between control passes. `sensor.house_learning` exposes `sources → source entity → room`
-with `e` (°C per full-on interval, or °C per kW per interval), confidence percent and
+with fixed `e` (°C per full-on interval, or °C per kW per interval), temperature slope `g`,
+signed `effective_effect` at current outdoor/filtered room temperatures, confidence percent and
 effective samples. Each source also exposes its `response` and current `effort` (0/1
 or kW; null when unknown). Configured
 sources are part of the thermal prediction: their operation does not itself discard
@@ -367,3 +368,26 @@ The deterministic 12-hour weak-basement replay starts at 25/20.2/20.2 °C with s
 | 0.1 | 20.094 | 19.606 / 18.072 | 19.090 | 0.850 | 0 |
 
 At 0.2 the weighted spread is 45% smaller than at 1, and the integral-on replay exactly matches integral-off. The average remains 3.10 °C below setpoint. The final living-to-cold gaps are 1.20/2.51 °C; a 0.5 °C gap cannot be promised by this objective or these assumed losses.
+
+
+## Temperature-dependent effects (0.5.8)
+
+Each system and observed source now learns a fixed effect plus a temperature slope,
+`fixed + g × (outdoor − room)`. This lets heat pumps learn weaker output in colder weather
+and fans learn cooling or warming from outdoor air, without a predefined device curve.
+Systems retain the nonnegative heating-effect clamp; source effects can have either sign.
+Forecasts hold the starting temperature difference throughout the horizon so allocation
+stays affine in effort. Outage thermostat predictions update the difference each simulated step.
+
+The **Temperature interaction prior covariance** option (`interaction_prior`, default
+**0.0001**) keeps slopes near zero until there is enough variation in temperature difference.
+All slopes start at zero. Upgrading preserves fitted effects, full covariance, counts and
+main/challenger/saved models, inserting the new columns without resetting learning.
+Changing a source's response units resets both its fixed and interaction columns.
+
+Seeded simulations learn heat-pump **g=0.01189690** (truth 0.012), with held-out prediction
+RMSE **0.00053412 °C** versus **0.01787796 °C** for fixed-only learning. A whole-house fan
+learns **g=0.01992620** (truth 0.02), with fixed effect **−0.00093106** (truth 0).
+With constant temperature difference, **g=−0.0000027515** and allocated effort differs
+from the old model by less than **1e−9**. These are deterministic simulations; see
+[DESIGN.md](DESIGN.md) for conditions and migration details.

@@ -83,7 +83,7 @@ def test_physical_regimes(kind):
 
 def test_persistence_reconciliation_and_controls():
     model = Learning(["one", "two"], ["a", "b"], sources=["stove"])
-    model.rows["one"].theta = [0.02, 0.1, 0.2, 0.3, 0.04, 0.01]
+    model.rows["one"].theta = [0.02, 0.1, 0.2, 0.3, 0, 0, 0, 0.04, 0.01]
     model.promote("one")
     saved = deepcopy(model.regimes["one"]["saved"][0]["row"])
     model.set_temporary("one", True, 2)
@@ -107,6 +107,8 @@ def test_persistence_reconciliation_and_controls():
         0.02,
         0.2,
         0.1,
+        0,
+        0,
         0.04,
         0.01,
     ]
@@ -175,9 +177,9 @@ def test_old_store_loads_neutral_challengers_and_independent_rooms():
     restored.rows["one"].counts = [100]
     restored.rows["one"].samples = 100
     restored.rows["one"].covariance = [
-        [0.001 if i == j else 0 for j in range(4)] for i in range(4)
+        [0.001 if i == j else 0 for j in range(5)] for i in range(5)
     ]
-    restored.rows["one"].theta = [0, 0.03, 0, 0]
+    restored.rows["one"].theta = [0, 0.03, 0, 0, 0]
     for _ in range(5):
         restored.update({"one": 20, "two": 20}, {"one": 21, "two": 20.03}, 20, {"a": 1})
     assert restored.disturbed == {"one": "heat"}
@@ -192,8 +194,8 @@ def test_old_store_loads_neutral_challengers_and_independent_rooms():
 
 def test_boundary_scores_are_pre_update_and_duration_weighted():
     model = Learning(["room"], ["a"])
-    model.rows["room"].theta = [0, 0.1, 0, 0]
-    model.regimes["room"]["challenger"].theta = [0, 0.2, 0, 0]
+    model.rows["room"].theta = [0, 0.1, 0, 0, 0]
+    model.regimes["room"]["challenger"].theta = [0, 0.2, 0, 0, 0]
     model.update({"room": 20}, {"room": 20.2}, 20, {"a": 1}, now=7300, local_hour=8)
     blocks = model.regimes["room"]["blocks"]
     assert [b["seconds"] for b in blocks] == [200, 100]

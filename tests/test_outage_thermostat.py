@@ -33,8 +33,8 @@ def outage(request):
         "comfort_band": 0,
     }
     model = Learning(["room", "lost"], ["lost", "live"])
-    model.rows["room"].theta = [0, 0.2, 0.2, 0, 0]
-    model.rows["lost"].theta = [0, 1, 0, 0, 0]
+    model.rows["room"].theta = [0, 0.2, 0.2, 0, 0, 0, 0]
+    model.rows["lost"].theta = [0, 1, 0, 0, 0, 0, 0]
     for row in model.rows.values():
         row.counts = [1e30, 1e30]
     state = ControlState(mode=mode, active_mode=mode, setpoint=20 + sign)
@@ -140,10 +140,21 @@ def test_hysteresis_is_latched_and_learned_from_real_starts(outage):
     assert thermostat_effort(config, restored, "lost", thermostat) == sign
 
 
-def test_own_model_uses_joint_efforts_outdoor_solar_and_sources(outage):
+@pytest.mark.parametrize("interactions", [False, True])
+def test_own_model_uses_joint_efforts_outdoor_solar_and_sources(outage, interactions):
     config, _, state, _, sign = outage
     model = Learning(["lost"], ["lost", "live"], sources=["fire"])
-    model.rows["lost"].theta = [0.1, 0.3, 0.4, 0.5, 0.6, 0.7]
+    model.rows["lost"].theta = [
+        0.1,
+        0.3,
+        0.4,
+        0.5,
+        0.01 if interactions else 0,
+        0.02 if interactions else 0,
+        0.03 if interactions else 0,
+        0.6,
+        0.7,
+    ]
     model.rows["lost"].counts = [1e30, 1e30, 1e30]
     thermostat = state.thermostats["lost"]
     joint = outage_step(
@@ -157,7 +168,14 @@ def test_own_model_uses_joint_efforts_outdoor_solar_and_sources(outage):
         {"fire": 0.5},
     )
     assert joint == {"lost": sign, "live": 0.25 * sign}
-    assert thermostat["own"] == pytest.approx(20 - 1 + sign * 0.4 + 0.25 + 1.2 + 0.7)
+    assert thermostat["own"] == pytest.approx(
+        20
+        - 1
+        + sign * (0.25 if interactions else 0.4)
+        + (0.1 if interactions else 0.25)
+        + 1.2
+        + 0.7
+    )
 
 
 @pytest.mark.parametrize(

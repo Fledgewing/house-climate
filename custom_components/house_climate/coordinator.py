@@ -72,6 +72,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             for m in self.config["sensors"]
         }
         self.raw_readings = {}
+        self.current_temperatures = {}
         self.startup_sensors = set(self.filters)
 
     @property
@@ -118,6 +119,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.config.get("regime_hours", 24),
             self.config.get("regime_return_hours", 4),
             self.config.get("interval", 5),
+            self.config.get("interaction_prior", 0.0001),
         )
 
     async def async_load(self):
@@ -186,7 +188,14 @@ class HouseCoordinator(DataUpdateCoordinator):
                     saved.get("filters", {}).get(key),
                 )
             if saved.get("learning"):
-                self.learning = Learning.from_dict(saved["learning"])
+                self.learning = Learning.from_dict(
+                    {
+                        **saved["learning"],
+                        "interaction_prior": self.config.get(
+                            "interaction_prior", 0.0001
+                        ),
+                    }
+                )
                 changed = {
                     source["entity_id"]
                     for source in self.config.get("extra_heat_sources", [])
@@ -638,6 +647,16 @@ class HouseCoordinator(DataUpdateCoordinator):
                     clean_values[key] = reading.value
                 elif self.sensor_blocks_fans(key):
                     fan_problems.append(reason)
+            # Diagnostics cover every room and device row, including rooms with
+            # zero priority weight and passes while learning is paused.
+            self.current_temperatures = {
+                **clean_values,
+                **{
+                    key: device.current_temperature
+                    for key, device in devices.items()
+                    if device.available and device.current_temperature is not None
+                },
+            }
             fan_clean = not fan_problems
             if not fan_clean:
                 self.fans.invalidate("; ".join(fan_problems))

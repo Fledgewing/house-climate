@@ -68,7 +68,14 @@ class LearningSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self):
-        diagnostics = self.coordinator.learning.diagnostics()
+        outdoor = self.coordinator.number(self.coordinator.config.get("outdoor_sensor"))
+        if outdoor is None:
+            outdoor = self.coordinator.number(
+                self.coordinator.config.get("weather_entity"), "temperature"
+            )
+        diagnostics = self.coordinator.learning.diagnostics(
+            outdoor, self.coordinator.current_temperatures
+        )
         for source in self.coordinator.config.get("extra_heat_sources", []):
             diagnostics["sources"][source["entity_id"]].update(
                 response=source.get("response", "on_off"),

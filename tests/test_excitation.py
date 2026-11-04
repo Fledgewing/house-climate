@@ -186,7 +186,7 @@ def test_timeout_cooldown_abort_and_persistence():
 class LegacyLearning(Learning):
     """v0.4.1 comparison: fixed prior blend and dither, no forced runs."""
 
-    def blended(self, sensor, system):
+    def blended(self, sensor, system, outdoor=None, temperature=None):
         c = self.confidence(sensor, system)
         return (
             c * self.rows[sensor].theta[self.systems.index(system) + 1]
@@ -241,7 +241,7 @@ def simulate_late_sensors(legacy=False):
     losses = [0.5 / 17, 0.5 / 17, 0.005 / 11.8, 0.004 / 11.8]
     model = (LegacyLearning if legacy else Learning)(rooms[:2], systems)
     for i, room in enumerate(rooms[:2]):
-        model.rows[room].theta = [losses[i], *truth[i], 0, 0]
+        model.rows[room].theta = [losses[i], *truth[i], 0, 0, 0, 0]
         model.rows[room].counts = [80, 80]
     model.reconcile(rooms, systems)  # cold sensors join AFTER b last ran
     config = {

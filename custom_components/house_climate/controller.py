@@ -213,7 +213,9 @@ def effort_limits(config, state, key, now, in_band):
     return (0.001, 1) if hold is True else (0, 0) if hold is False else (0, 1)
 
 
-def excitation_target(config, state, devices, values, house, mode, now, learning):
+def excitation_target(
+    config, state, devices, values, house, mode, now, learning, outdoor=None
+):
     """Select one bounded, held experiment; never infer runtime from a target."""
     helps = house is not None and (
         (mode == "heat" and house < state.setpoint)
@@ -227,6 +229,11 @@ def excitation_target(config, state, devices, values, house, mode, now, learning
             or mode != active["mode"]
             or not device
             or not device.available
+            or learning is None
+            or not any(
+                learning.blended(r, active["system"], outdoor, values[r]) > 0
+                for r in values.keys() & learning.rows.keys()
+            )
             or active["runtime"] >= config.get("excite_minutes", 30) * 60
             or now - active["started"] >= 3600
         )
@@ -247,6 +254,9 @@ def excitation_target(config, state, devices, values, house, mode, now, learning
             or not isfinite(device.current_temperature)
             or device.hvac_action in ("heating", "cooling")
             or not sensors
+            or not any(
+                learning.blended(r, key, outdoor, values[r]) > 0 for r in sensors
+            )
             or cycling_hold(config, state, key, now) is False
             or all(
                 abs(t - state.setpoint) <= config.get("comfort_band", 1) / 2
@@ -727,7 +737,9 @@ def control(
         state.target_adjustments.clear()
     for key, device in devices.items():
         state.observe_action(key, device.hvac_action if device.available else None, now)
-    excitation_target(config, state, devices, values, house, mode, now, learning)
+    excitation_target(
+        config, state, devices, values, house, mode, now, learning, outdoor
+    )
     commands = []
     allocation = {}
     if values and mode in ("heat", "cool"):
@@ -863,7 +875,7 @@ def control(
                 )
             # Explain room-level tradeoffs with learned reach, never room mappings.
             reach = {
-                r: max(0, learning.blended(r, entity_id))
+                r: max(0, learning.blended(r, entity_id, outdoor, values[r]))
                 if learning and r in learning.rows and entity_id in learning.systems
                 else 0.03
                 for r in values

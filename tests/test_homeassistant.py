@@ -1908,7 +1908,7 @@ async def test_source_events_model_reload_and_missing(hass, installed):
     hass.config_entries.async_update_entry(entry, options=settings)
     await hass.async_block_till_done()
     assert entry.runtime_data.learning.rows["sensor.room"].samples == 1
-    assert len(entry.runtime_data.learning.rows["sensor.room"].theta) == 5
+    assert len(entry.runtime_data.learning.rows["sensor.room"].theta) == 7
 
 
 @pytest.mark.parametrize("hours", [0, 1])
@@ -1990,8 +1990,8 @@ async def test_disturbance_skips_room_learning_and_weight_gates_fans(
     c.learning.reconcile(["sensor.room", "sensor.other"], c.learning.systems)
     for row in c.learning.rows.values():
         row.counts = [100, 100]
-        row.theta = [0] * 5
-        row.covariance = [[0.001 if i == j else 0 for j in range(5)] for i in range(5)]
+        row.theta = [0] * 7
+        row.covariance = [[0.001 if i == j else 0 for j in range(7)] for i in range(7)]
     start = dt_util.utcnow()
     c.learning_baseline = ({"sensor.room": 19, "sensor.other": 19}, 3, 0)
     c.fans.window["dirty"] = False
@@ -2105,7 +2105,7 @@ async def test_modelled_heat_keeps_thermal_samples_and_fan_window_valid(
     hass.states.async_set("switch.source", "on")
     c.learning.reconcile(["sensor.room"], c.learning.systems, ["switch.source"])
     row = c.learning.rows["sensor.room"]
-    row.theta = [0, 0, 0, 0.8, 0, 0]
+    row.theta = [0, 0, 0, 0.8, 0, 0, 0, 0, 0]
     row.counts = [100, 100, 100]
     start = dt_util.utc_from_timestamp(c.fans.window["start"])
     c.source_effort.finish({"switch.source": "heating"}, start.timestamp())
@@ -2728,6 +2728,8 @@ async def test_proportional_source_events_and_response_reset(
     await hass.async_block_till_done()
     row = c.learning.rows["sensor.room"]
     row.theta[3] = 1.7
+    row.theta[6] = 0.012
+    row.covariance[6][1] = row.covariance[1][6] = 0.02
     row.counts[2] = 60
     row.covariance[3][0] = row.covariance[0][3] = 0.4
     # Persist a fitted column before changing its units via an options reload.
@@ -2740,9 +2742,58 @@ async def test_proportional_source_events_and_response_reset(
     c = entry.runtime_data
     row = c.learning.rows["sensor.room"]
     assert row.theta[:3] == retained[:3]
-    assert row.theta[4:] == retained[4:]
+    assert row.theta[4:6] == retained[4:6]
+    assert row.theta[7:] == retained[7:]
+    assert row.theta[6] == 0
+    assert row.covariance[6][6] == c.learning.interaction_prior
+    assert row.covariance[6][1] == row.covariance[1][6] == 0
     assert row.theta[3] == 0
     assert row.counts[2] == 0
     assert row.covariance[3][3] == 100
     assert row.covariance[3][0] == row.covariance[0][3] == 0
     assert c.source_value(settings["extra_heat_sources"][0]) == 1
+
+
+async def test_interaction_diagnostics_include_zero_weight_rooms_and_device_rows(
+    hass, installed
+):
+    from custom_components.house_climate.filtering import SensorFilter
+
+    entry, _ = installed
+    c = entry.runtime_data
+    c.config["sensors"].append({"entity_id": "sensor.ignored", "weight": 0})
+    c.config["priority_modes"] = {"balance": {"sensor.room": 1, "sensor.ignored": 0}}
+    c.priority_mode = "balance"
+    c.config["outdoor_sensor"] = "sensor.outdoor"
+    c.config["extra_heat_sources"] = [{"entity_id": "switch.fan", "kind": "binary"}]
+    c.filters["sensor.ignored"] = SensorFilter()
+    c.filters["sensor.ignored"].observe(20, dt_util.utcnow().timestamp() - 300)
+    hass.states.async_set("sensor.ignored", "20")
+    hass.states.async_set("sensor.outdoor", "5")
+    hass.states.async_set("switch.fan", "on")
+    # These device rows have no member-room counterpart in Decision.readings.
+    for settings in c.config["systems"]:
+        system = hass.data[DATA_COMPONENT].get_entity(settings["entity_id"])
+        system._attr_current_temperature = 22
+        system.async_write_ha_state()
+    c.learning.reconcile(c.learning_sensors, c.learning.systems, ["switch.fan"])
+    for row in c.learning.rows.values():
+        row.theta = [0, 0.3, 0, 0.01, 0.01, 0, 0.02, 0, 0]
+        row.counts = [100, 100, 100]
+    c.learning_enabled = False
+    await c.async_tick(record=False)
+    attrs = hass.states.get("sensor.house_learning").attributes
+    assert "sensor.ignored" not in c.data.readings
+    assert attrs["systems"]["climate.ducted"]["sensor.room"][
+        "effective_effect"
+    ] == pytest.approx(0.16)
+    assert attrs["systems"]["climate.ducted"]["sensor.ignored"][
+        "effective_effect"
+    ] == pytest.approx(0.15)
+    assert attrs["systems"]["climate.ducted"]["climate.ducted"][
+        "effective_effect"
+    ] == pytest.approx(0.13)
+    assert attrs["sources"]["switch.fan"]["sensor.ignored"]["g"] == 0.02
+    assert attrs["sources"]["switch.fan"]["sensor.ignored"][
+        "effective_effect"
+    ] == pytest.approx(-0.29)

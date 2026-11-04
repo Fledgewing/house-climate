@@ -118,9 +118,10 @@ Every control interval, and immediately when the house setpoint or mode changes:
    Normalize the active positive room weights to sum to one. Use `average_weight`
    for λ (default 1, options 0.01–10), independently of the fan override. Lower λ
    prioritizes spread and deliberately permits a mean below S in heating. `learning.forecast` propagates each interval model
-   `ΔT_i = a_i(T_out − T_i) + Σ_j b_ij u_j + Σ_k e_ik source_k + c_i solar + d_i`
+   `ΔT_i = a_i Δ_i + Σ_j (b_ij + g_ij Δ_i) u_j + Σ_k (e_ik + g_ik Δ_i) source_k + c_i solar + d_i`
    to the horizon (default 45 minutes), holding current outdoor, source states and solar
-   constant. Propagate losses every step; the resulting forecast is affine in effort.
+   constant. Here Δ_i is outdoor minus the room temperature at the start of the horizon.
+   Hold Δ_i in the interaction terms while propagating passive losses every step; the forecast stays affine in effort.
    Missing context omits that term. All nonnegative b coefficients use the existing
    optimistic confidence blend, preserving their physical scale rather than normalizing
    each system's room effects. Without learning, use the same neutral b prior for every pair.
@@ -207,13 +208,15 @@ Restored state takes precedence over adoption.
 Every scheduled interval fits one thermal model per available room sensor using recursive least
 squares (RLS), in the pure `learning.py` module:
 
-`ΔT_i = a_i (T_out − T_i) + Σ_j b_ij u_j + Σ_k e_ik s_k + c_i solar_kW + d_i`.
+`ΔT_i = a_i Δ_i + Σ_j (b_ij + g_ij Δ_i) u_j + Σ_k (e_ik + g_ik Δ_i) s_k + c_i solar_kW + d_i`,
+where `Δ_i = T_out − T_i` at the interval start. System and source g columns are distinct.
 
 Coefficients describe one configured control interval (5 minutes by default); elapsed time scales
 regressors for delayed passes. `a_i` describes heat loss, `b_ij` the temperature response to each
 system, `c_i` sun gain, and `d_i` background drift. Every system/room pair starts with the same
-neutral `b = 0.03 °C/interval`. All other prior means are zero; diagonal prior covariance is 100
-for every coefficient, with zero cross-covariances. There are no room-specific assumptions.
+neutral `b = 0.03 °C/interval`. All other prior means are zero. Fixed coefficients have
+diagonal prior covariance 100; interaction coefficients use `interaction_prior` (default 0.0001),
+with zero cross-covariances. There are no room-specific assumptions.
 
 The signed effort `u_j` is actual heating seconds minus cooling seconds, divided by interval
 seconds. A state-change listener integrates every `hvac_action` transition, including transitions
@@ -223,8 +226,9 @@ invalidate that interval. Sampling only the action at a pass would miss short cy
 The forgetting factor defaults to 0.998 per valid row sample. Effective activity counts follow
 `n_ij ← 0.998 n_ij + 1[u_j ≠ 0]`. Confidence is `n/(n+N0)` with `N0 = 24` by default (about two
 hours of active 5-minute samples to give learned and prior coefficients equal weight).
-Control blends `confidence × learned_b + (1 − confidence) × system_prior` and clips negative results to
-zero. Joint prediction uses those physical coefficients directly; normalized per-system influences remain diagnostic. `system_prior` is the confidence-weighted mean raw learned b
+Control uses `max(0, confidence × learned_b + (1 − confidence) × system_prior + g × Δ_i)`.
+Only the fixed part is confidence blended; the combined heating effect is clipped to zero.
+Sources use signed `e + g × Δ_i` without blending or clipping. Joint prediction uses those physical coefficients directly; normalized per-system influences remain diagnostic. `system_prior` is the confidence-weighted mean raw learned b
 over that system's sensors with nonzero runtime confidence, falling back to 0.03 only when
 none has evidence. Unexplored pairs therefore inherit measured system reach rather than
 being mistaken for weak influence. Learning starts affecting control from the first valid sample;
@@ -254,7 +258,8 @@ ID. Config-entry version 2 migrates existing data and options by removing obsole
 retaining the other settings and existing Store. Pre-learning Store files start at neutral priors.
 
 `sensor.house_learning` reports the mean confidence across all system/room pairs, as a percentage.
-Its `systems[system_entity][sensor_entity]` attributes expose raw `b`, `blended_b`, normalized
+Its `systems[system_entity][sensor_entity]` attributes expose raw fixed `b`, interaction `g`,
+`blended_b` (blended fixed part plus g × current Δ), clamped `effective_effect`, normalized
 `influence`, confidence percent and `effective_samples`. Its `sensors[sensor_entity]` attributes
 expose `a` (heat loss), `c` (sun gain), `d`, `fit_error` (forgetting-weighted RMS prediction error
 in °C), and `samples` (valid updates). Press `button.house_reset_learning` to reset the model and
@@ -869,3 +874,63 @@ its original effective mean gain (configured 0.002 × 1/2), isolating model-lear
 accuracy from this intentional change in integral dynamics. This objective provides
 no hard 0.5 °C gap bound: forecasts, passive losses and actuator reach determine
 what spread can be achieved.
+
+
+## Temperature-dependent system and source effects (v0.5.8)
+
+Rows use `[Δ_i, systems..., sources..., system interactions..., source interactions..., solar, 1]`.
+Each interaction is the same signed system effort or source value multiplied by the room's
+start-of-interval outdoor–indoor difference. Duration multiplies the whole regressor vector.
+Both active and challenger fits, saved-model scoring, and ordinary forgetting use these columns
+exactly like existing columns. No device-specific output curve or fan assumption is supplied.
+
+`interaction_prior` is a positive covariance tunable in Configure, default **0.0001**, versus
+**100** for fixed effects: a million-fold tighter covariance for the slope. A 10 °C difference
+therefore contributes prior predictive variance 0.01 from a slope, versus 100 from its fixed
+part. This gives fixed effects the initial freedom to explain runtime, keeping g near zero
+when effort × Δ is nearly collinear with effort. Repeated observations with different Δ identify
+the slope; forgetting gradually relaxes its prior as it does every other coefficient. This is
+regularization, not an identifiability guarantee: constant outdoor temperature with changing room
+temperature can still provide Δ variety, and synchronized inputs remain hard to separate.
+Changing the option affects new/migrated/reset columns, retaining fitted covariances.
+
+Forecasts freeze interaction Δ at the start of the requested horizon so effort allocation remains
+affine. Passive losses still propagate. Outage thermostat simulation reevaluates Δ at each
+simulated interval's starting temperature. Allocation, normalized influences, explanation reach,
+and eligibility to start/continue inactivity excitation all use the effective heating effect.
+Unknown outdoor or room context omits the interaction, preserving the fixed-effect fallback.
+Source effects remain signed: a fan can cool with colder outdoor air and warm with hotter air.
+`sensor.house_learning.sources[source][room]` exposes fixed `e`, slope `g`, and signed
+`effective_effect`; systems expose `b`, `g` and clamped blended `effective_effect`. Diagnostics use
+the current outdoor sensor/weather fallback and current filtered room readings. Slope units are
+°C per interval per input unit per °C difference; fixed/effective units match the input's existing
+on/off, signed runtime, or kW units. Missing context evaluates the interaction as zero.
+
+Loading v0.5.7 Store rows inserts zero-mean interaction columns before solar/drift, using the
+configured prior covariance and zero cross-covariances. Every old coefficient, covariance entry,
+activity count, sample count, fit error and regime identity/evidence is retained. This applies
+to main, challenger and saved regime rows; zero slopes reproduce v0.5.7 predictions exactly.
+Reconciliation maps fixed and interaction columns by input kind/entity ID, including full cross
+covariance. The v0.5.7 source response-change path removes/reintroduces both columns so changed
+units reset that source alone. No learning reset accompanies the upgrade.
+
+Deterministic five-minute simulations (`tests/test_interactions.py`, seeds 508 and 580):
+
+- Heat pump: twelve training days with daily outdoor swing 0–15 °C, independent varying duty,
+  heat loss and 0.0005 °C noise; then freeze both fits for three held-out days. Truth is
+  `b=0.4`, `g=0.012`: colder outdoor temperatures reduce output. Learned **b=0.39882142**,
+  **g=0.01189690**. One-interval prediction RMSE is **0.00053412 °C** versus **0.01787796 °C**
+  for the v0.5.7 fixed-only RLS on identical observations (about **33.5×** lower).
+- Whole-house fan: twelve days with the same outdoor swing, independent HVAC duty and fan
+  on/off, truth `e=0`, `g=0.02`. Learned **e=−0.00093106**, **g=0.01992620**. Tests check both
+  cooling and warming signs.
+- Constant Δ commissioning: outdoor 7.5 °C, room starts at 20 °C each observation, varying duty
+  and the same noise. Learned **g=−0.0000027515**; frozen three-day RMSE is **0.00050911 °C**
+  for both fits and maximum allocated effort difference is below **1e−9**.
+
+These are simulated results, not measured house performance. Existing physical/control tests
+retain their thresholds; their explicit coefficient/covariance fixtures gain zero interaction
+columns. Migration tests check every retained covariance entry in all three row roles, including
+a saved regime. Additional tests cover duration/signed cooling regressors, reordered inputs,
+source response resets, diagnostics, affine forecasts, outage thermostat predictions and the
+nonnegative combined system heat clamp.

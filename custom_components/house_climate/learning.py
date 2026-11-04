@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 from math import ceil, exp, isfinite, sqrt
 
 PRIOR_B = 0.03
+INTERACTION_PRIOR = 0.0001
 
 
 @dataclass
@@ -17,10 +18,10 @@ class Row:
 
 
 class Learning:
-    """RLS on [outdoor - room, signed efforts..., source fractions..., solar, 1].
+    """RLS on [delta, efforts/sources..., effort/source * delta..., solar, 1].
 
     Coefficients describe one configured control interval. Covariance 100 gives
-    weak, identical regularization for all coefficients; only b has nonzero mean.
+    weak regularization for fixed effects; interactions have a tighter zero prior.
     Counts forget on every valid row sample, including idle intervals.
     """
 
@@ -38,9 +39,13 @@ class Learning:
         regime_hours=24,
         regime_return_hours=4,
         interval_minutes=5,
+        interaction_prior=INTERACTION_PRIOR,
     ):
         if not 0 < forgetting <= 1 or n0 <= 0:
             raise ValueError("Invalid learning parameters")
+        if not isfinite(interaction_prior) or interaction_prior <= 0:
+            raise ValueError("Invalid interaction prior")
+        self.interaction_prior = interaction_prior
         self.regime_margin = regime_margin
         self.regime_hours = regime_hours
         self.regime_return_hours = regime_return_hours
@@ -68,21 +73,20 @@ class Learning:
             ("source", s) for s in self.sources
         ]
         inputs = [("system", s) for s in systems] + [("source", s) for s in sources]
-        size = len(inputs) + 3
         mapping = [
             0,
             *[previous.index(s) + 1 if s in previous else None for s in inputs],
-            len(previous) + 1,
-            len(previous) + 2,
+            *[
+                len(previous) + previous.index(s) + 1 if s in previous else None
+                for s in inputs
+            ],
+            2 * len(previous) + 1,
+            2 * len(previous) + 2,
         ]
         rows = {}
 
         def remap(old=None):
-            row = Row(
-                [0, *([PRIOR_B] * len(systems)), *([0.0] * len(sources)), 0, 0],
-                [[100.0 if i == j else 0.0 for j in range(size)] for i in range(size)],
-                [0.0] * len(inputs),
-            )
+            row = self.neutral_row(systems, sources)
             if old:
                 for i, source in enumerate(mapping):
                     if source is not None:
@@ -173,6 +177,7 @@ class Learning:
                 for v in [
                     outdoor - start,
                     *activity,
+                    *[value * (outdoor - start) for value in activity],
                     solar,
                     1,
                 ]
@@ -350,13 +355,45 @@ class Learning:
             return True
         return False
 
-    def neutral_row(self):
-        size = len(self.systems) + len(self.sources) + 3
+    def neutral_row(self, systems=None, sources=None):
+        systems = self.systems if systems is None else systems
+        sources = self.sources if sources is None else sources
+        count = len(systems) + len(sources)
+        size = 2 * count + 3
         return Row(
-            [0, *([PRIOR_B] * len(self.systems)), *([0.0] * len(self.sources)), 0, 0],
-            [[100.0 if i == j else 0.0 for j in range(size)] for i in range(size)],
-            [0.0] * (size - 3),
+            [
+                0,
+                *([PRIOR_B] * len(systems)),
+                *([0.0] * len(sources)),
+                *([0.0] * count),
+                0,
+                0,
+            ],
+            [
+                [
+                    (self.interaction_prior if count < i <= 2 * count else 100.0)
+                    if i == j
+                    else 0.0
+                    for j in range(size)
+                ]
+                for i in range(size)
+            ],
+            [0.0] * count,
         )
+
+    def interaction_index(self, index):
+        """Column for the interaction of a zero-based system/source input."""
+        return 1 + len(self.systems) + len(self.sources) + index
+
+    def source_effect(self, sensor, source, outdoor=None, temperature=None):
+        index = len(self.systems) + self.sources.index(source)
+        row = self.rows[sensor]
+        delta = (
+            outdoor - temperature
+            if outdoor is not None and temperature is not None
+            else 0
+        )
+        return row.theta[1 + index] + row.theta[self.interaction_index(index)] * delta
 
     def clear_regime_evidence(self, sensor):
         state = self.regimes[sensor]
@@ -476,10 +513,16 @@ class Learning:
         total = sum(c for c, _ in pairs)
         return sum(c * b for c, b in pairs) / total if total else PRIOR_B
 
-    def blended(self, sensor, system):
+    def blended(self, sensor, system, outdoor=None, temperature=None):
         confidence = self.confidence(sensor, system)
         b = self.rows[sensor].theta[self.systems.index(system) + 1]
-        return confidence * b + (1 - confidence) * self.system_prior(system)
+        delta = (
+            outdoor - temperature
+            if outdoor is not None and temperature is not None
+            else 0
+        )
+        g = self.rows[sensor].theta[self.interaction_index(self.systems.index(system))]
+        return confidence * b + (1 - confidence) * self.system_prior(system) + g * delta
 
     def forecast(
         self, sensor, temperature, systems, steps, outdoor=None, solar=0, sources=None
@@ -495,8 +538,9 @@ class Learning:
         background = a * outdoor if outdoor is not None else 0
         background += row.theta[-2] * (solar or 0) + row.theta[-1]
         background += sum(
-            row.theta[1 + len(self.systems) + k] * (sources or {}).get(source, 0)
-            for k, source in enumerate(self.sources)
+            self.source_effect(sensor, source, outdoor, temperature)
+            * (sources or {}).get(source, 0)
+            for source in self.sources
         )
         retention = 1 - a
         gain = sum(retention**k for k in range(steps))
@@ -506,15 +550,17 @@ class Learning:
                 gain
                 * max(
                     0,
-                    self.blended(sensor, system) if system in self.systems else PRIOR_B,
+                    self.blended(sensor, system, outdoor, temperature)
+                    if system in self.systems
+                    else PRIOR_B,
                 )
                 for system in systems
             ],
         )
 
-    def influences(self, system, sensors=None):
+    def influences(self, system, sensors=None, outdoor=None, temperatures=None):
         positive = {
-            s: max(0, self.blended(s, system))
+            s: max(0, self.blended(s, system, outdoor, (temperatures or {}).get(s)))
             for s in (self.rows if sensors is None else sensors)
         }
         total = sum(positive.values())
@@ -527,14 +573,22 @@ class Learning:
         phase = (now / 7200 + self.systems.index(system) / len(self.systems)) % 1
         return (0.5 if phase < 0.5 else -0.5) * (1 - confidence / threshold)
 
-    def diagnostics(self):
+    def diagnostics(self, outdoor=None, temperatures=None):
         return {
             "systems": {
                 j: {
                     s: {
                         "b": row.theta[k + 1],
-                        "blended_b": self.blended(s, j),
-                        "influence": self.influences(j).get(s, 0),
+                        "g": row.theta[self.interaction_index(k)],
+                        "blended_b": self.blended(
+                            s, j, outdoor, (temperatures or {}).get(s)
+                        ),
+                        "effective_effect": max(
+                            0, self.blended(s, j, outdoor, (temperatures or {}).get(s))
+                        ),
+                        "influence": self.influences(
+                            j, outdoor=outdoor, temperatures=temperatures
+                        ).get(s, 0),
                         "confidence": 100 * self.confidence(s, j),
                         "effective_samples": row.counts[k],
                     }
@@ -546,6 +600,10 @@ class Learning:
                 source: {
                     sensor: {
                         "e": row.theta[1 + len(self.systems) + k],
+                        "g": row.theta[self.interaction_index(len(self.systems) + k)],
+                        "effective_effect": self.source_effect(
+                            sensor, source, outdoor, (temperatures or {}).get(sensor)
+                        ),
                         "confidence": 100
                         * row.counts[len(self.systems) + k]
                         / (row.counts[len(self.systems) + k] + self.n0),
@@ -574,6 +632,7 @@ class Learning:
 
     def to_dict(self):
         return {
+            "interaction_prior": self.interaction_prior,
             "regime_margin": self.regime_margin,
             "regime_hours": self.regime_hours,
             "regime_return_hours": self.regime_return_hours,
@@ -611,8 +670,29 @@ class Learning:
             saved.get("disturbance_sigma", 3),
             saved.get("disturbance_intervals", 2),
             saved.get("disturbance_clear_intervals", 3),
+            interaction_prior=saved.get("interaction_prior", INTERACTION_PRIOR),
         )
-        model.rows = {s: Row(**row) for s, row in saved["rows"].items()}
+
+        def load_row(data):
+            row = Row(**deepcopy(data))
+            count = len(model.systems) + len(model.sources)
+            if len(row.theta) == count + 3 and count:
+                # v0.5.7: insert zero interactions before solar/drift. Preserve
+                # every old coefficient and covariance, including cross terms.
+                prior = model.neutral_row()
+                mapping = [*range(count + 1), *([None] * count), count + 1, count + 2]
+                for i, old_i in enumerate(mapping):
+                    if old_i is not None:
+                        prior.theta[i] = row.theta[old_i]
+                        for j, old_j in enumerate(mapping):
+                            if old_j is not None:
+                                prior.covariance[i][j] = row.covariance[old_i][old_j]
+                prior.counts = row.counts
+                prior.samples, prior.squared_error = row.samples, row.squared_error
+                row = prior
+            return row
+
+        model.rows = {s: load_row(row) for s, row in saved["rows"].items()}
         for key in (
             "regime_margin",
             "regime_hours",
@@ -623,9 +703,9 @@ class Learning:
             if key in saved:
                 setattr(model, key, saved[key])
         for sensor, state in deepcopy(saved.get("regimes", {})).items():
-            state["challenger"] = Row(**state["challenger"])
+            state["challenger"] = load_row(state["challenger"])
             for item in state["saved"]:
-                item["row"] = Row(**item["row"])
+                item["row"] = load_row(item["row"])
             model.regimes[sensor] = state
         return model
 
