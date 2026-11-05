@@ -1256,3 +1256,43 @@ that small step but still quarantines cumulative movement beyond max_rate over a
 minute, including many individually small fast steps. Large excursion and sustained
 step expiry behavior remain covered. This addresses a structural cause of excessive
 transient rejection without claiming to reconstruct sub-minute events from means.
+
+
+## v0.5.12: tunable learning window
+
+`DEFAULTS["learning_window_minutes"]` is 60 minutes, used by the coordinator
+for both new and restored models. The configuration and options tunables step
+exposes 15–240 minutes in one-minute increments. The pure Learning API retains
+its zero-window compatibility mode.
+
+The v0.5.11 48-minute integrated models already use the same coefficient units
+and integrated evidence version as 60-minute models. `from_dict` and `reconcile`
+therefore preserve active, challenger and saved model coefficients, full
+covariances and activity evidence. Only the earlier per-pass evidence migration
+reopens uncertainty. In-progress integrated windows are not serialized and refill
+after reload; changing the window does not reset learning. A coordinator regression
+loads a trained 48-minute model at 60, checks all rows and regimes for equality,
+and verifies no update occurs until a full new window has accumulated. It covers
+both an explicit 60-minute setting and an older configuration without the setting.
+
+The historical v0.5.11 results above remain at 48 minutes. The same night acceptance
+assertions now run at the default 60 minutes against the unchanged independent
+48-minute OLS reference:
+
+| Room | Fresh (°C/hour) | Small prior (°C/hour) | Fresh confidence |
+|---|---:|---:|---:|
+| Living | 1.271318 | 1.270509 | 3.100% |
+| Downstairs | 0.541438 | 0.540679 | 0.617% |
+| Guest | 0.528140 | 0.527364 | 0.571% |
+| Parent | 1.289562 | 1.288791 | 3.224% |
+| Annabelle | 1.531161 | 1.530360 | 4.381% |
+| Wesley/Gabriel | 1.708868 | 1.708104 | 5.639% |
+
+Every room remains within 35% of independent OLS, with confidence below 20%
+throughout any materially inaccurate estimates. The delayed-report controller
+replay has 12 starts, minimum completed run 16 minutes, minimum off 12 minutes
+(excluding the initial off period), and at most 3 starts per rolling hour. Mean
+absolute house error is 0.372406 °C versus recorded 0.271911 °C; mean room spread
+is 2.793989 °C versus recorded 2.934266 °C. The unchanged acceptance limits allow
+at most +0.2 °C for each comfort metric. The counterfactual plant and fixture
+limitations described above still apply.

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from custom_components.house_climate.const import DEFAULTS
 from custom_components.house_climate.controller import (
     ControlState,
     Device,
@@ -63,7 +64,7 @@ def independent():
     return result
 
 
-def replay(small=False, window=48):
+def replay(small=False, window=DEFAULTS["learning_window_minutes"]):
     references = independent()
     model = Learning(
         NAMES,
@@ -232,17 +233,22 @@ def test_night_one_pass_report_lag_obeys_command_and_report_limits():
 
 
 def test_integrated_window_discards_missing_rows_and_restart_gaps():
-    model = Learning(["room"], ["unit"], interval_minutes=4, window_minutes=48)
-    for i in range(11):
+    model = Learning(
+        ["room"],
+        ["unit"],
+        interval_minutes=4,
+        window_minutes=DEFAULTS["learning_window_minutes"],
+    )
+    for i in range(14):
         model.update({"room": 20}, {"room": 20.01}, 10, {"unit": 1})
     assert model.rows["room"].samples == 0
     model.update({}, {}, 10, {"unit": 1})
     assert not model.windows
-    for i in range(11):
+    for i in range(14):
         model.update({"room": 20}, {"room": 20.01}, 10, {"unit": 1})
     assert model.rows["room"].samples == 0
     restored = Learning.from_dict(model.to_dict())
-    assert restored.window_minutes == 48
+    assert restored.window_minutes == 60
     assert not restored.windows
     assert restored.rows["room"] == model.rows["room"]
 
@@ -255,7 +261,7 @@ def test_integrated_fit_keeps_delayed_system_and_measured_source_effects():
         ["room"],
         ["unit"],
         sources=["source"],
-        window_minutes=48,
+        window_minutes=DEFAULTS["learning_window_minutes"],
         disturbance_sigma=0,
         regime_hours=1e9,
     )

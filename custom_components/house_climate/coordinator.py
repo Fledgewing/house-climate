@@ -21,7 +21,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, fan_reward_weight
+from .const import DEFAULTS, DOMAIN, fan_reward_weight
 from .controller import ControlState, Device, Reading, control
 from .fans import FanLearning, quiet_modes
 from .filtering import SensorFilter
@@ -168,7 +168,9 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.config.get("interaction_prior", 0.0001),
             self.config.get("lag_minutes", 60),
             self.config.get("lag_prior", 0.01),
-            window_minutes=self.config.get("learning_window_minutes", 48),
+            window_minutes=self.config.get(
+                "learning_window_minutes", DEFAULTS["learning_window_minutes"]
+            ),
         )
 
     async def async_load(self):
@@ -247,7 +249,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                         "lag_minutes": self.config.get("lag_minutes", 60),
                         "lag_prior": self.config.get("lag_prior", 0.01),
                         "window_minutes": self.config.get(
-                            "learning_window_minutes", 48
+                            "learning_window_minutes",
+                            DEFAULTS["learning_window_minutes"],
                         ),
                         "interaction_prior": self.config.get(
                             "interaction_prior", 0.0001

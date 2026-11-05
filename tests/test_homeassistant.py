@@ -325,6 +325,8 @@ async def complete_flow(
     }
     fields = {field.schema: field for field in result["data_schema"].schema}
     assert fields["stale_after"].default() == 720
+    window_selector = result["data_schema"].schema[fields["learning_window_minutes"]]
+    assert window_selector.config == {"min": 15, "max": 240, "step": 1, "mode": "box"}
     tunables["stale_after"] = stale_after
     tunables["test_overshoot"] = test_overshoot
     tunables["average_weight"] = average_weight
@@ -3076,3 +3078,47 @@ async def test_own_mode_restore_does_not_dirty_fan_window(hass, installed):
     await hass.async_block_till_done()
     assert system.hvac_mode == HVACMode.HEAT
     assert not c.fans.window["dirty"]  # House re-assert echo.
+
+
+@pytest.mark.parametrize("configured_window", [None, 60])
+async def test_learning_window_change_preserves_saved_model(
+    hass, settings, configured_window
+):
+    from custom_components.house_climate.coordinator import HouseCoordinator
+
+    settings["learning_window_minutes"] = 48
+    entry = MockConfigEntry(domain=DOMAIN, data=settings)
+    coordinator = HouseCoordinator(hass, entry)
+    model = coordinator.learning
+    before = dict.fromkeys(model.rows, 20.0)
+    after = dict.fromkeys(model.rows, 20.1)
+    for _ in range(15):
+        model.update(before, after, 10, dict.fromkeys(model.systems, 1))
+    assert model.windows
+    assert model.rows["sensor.room"].samples > 0
+    # Exercise active, challenger and library coefficients/covariances together.
+    regime = model.regimes["sensor.room"]
+    regime["challenger"] = deepcopy(model.rows["sensor.room"])
+    regime["saved"] = [{"id": "previous", "row": deepcopy(regime["challenger"])}]
+    saved_model = model.to_dict()
+    if configured_window is None:
+        settings.pop("learning_window_minutes")
+    else:
+        settings["learning_window_minutes"] = configured_window
+    restored = HouseCoordinator(hass, MockConfigEntry(domain=DOMAIN, data=settings))
+    assert restored.learning.window_minutes == 60
+    with patch(
+        "custom_components.house_climate.coordinator.Store.async_load",
+        return_value={"state": asdict(ControlState()), "learning": saved_model},
+    ):
+        await restored.async_load()
+    assert restored.learning.window_minutes == 60
+    assert restored.learning.rows == model.rows
+    assert restored.learning.regimes == model.regimes
+    assert not restored.learning.windows
+    samples = restored.learning.rows["sensor.room"].samples
+    for _ in range(11):
+        restored.learning.update(before, after, 10, dict.fromkeys(model.systems, 1))
+    assert restored.learning.rows["sensor.room"].samples == samples
+    restored.learning.update(before, after, 10, dict.fromkeys(model.systems, 1))
+    assert restored.learning.rows["sensor.room"].samples == samples + 1

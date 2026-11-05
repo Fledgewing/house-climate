@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.11 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.12 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 The setpoint is the weighted **house average**. Each pass jointly chooses how much every available system should run to bring that average to the setpoint and reduce each room's deviation from it. A 45-minute prediction uses the learned room responses, outdoor losses, extra heat sources, solar gain and drift. There are no configured room mappings or individual room targets. A shared comfort band holds starts and stops only when every weighted room is comfortable.
 
@@ -133,7 +133,7 @@ Changes made directly on physical systems are noted in `last_decision` and re-as
 
 Each room learns `ΔT = a × Δ + Σ [(b + g × Δ) × signed_runtime_fraction + h × lagged_runtime] + Σ [(e + g × Δ) × source_effort + h × lagged_source] + c × solar_kW + d` using recursive least squares. HVAC action changes are integrated between passes; commands are never substituted for measured runtime.
 
-In v0.5.11, production learning uses rolling **48-minute integrated observations**. It sums temperature changes and every regressor over the same window, then normalizes to one configured interval. Raw room endpoints, after the existing transient/reporting checks, avoid shifting the response relative to runtime with a control median. Control still uses filtered readings. The rate filter allows one minute of small quantized movement while checking cumulative movement against a minute-old anchor, avoiding quarantine merely because reports arrive seconds apart. Missing or rejected intervals discard that room's incomplete window; restart and pause begin new windows. This lets slow, report-on-change sensors contribute their accumulated warming rather than mostly zero per-pass changes.
+In v0.5.12, production learning defaults to rolling **60-minute integrated observations**. Configure `learning_window_minutes` in the tunables step (15–240 minutes, step 1). Changing it preserves learned coefficients and covariances, including challenger and saved models; observation windows refill after reload. It sums temperature changes and every regressor over the same window, then normalizes to one configured interval. Raw room endpoints, after the existing transient/reporting checks, avoid shifting the response relative to runtime with a control median. Control still uses filtered readings. The rate filter allows one minute of small quantized movement while checking cumulative movement against a minute-old anchor, avoiding quarantine merely because reports arrive seconds apart. Missing or rejected intervals discard that room's incomplete window; restart and pause begin new windows. This lets slow, report-on-change sensors contribute their accumulated warming rather than mostly zero per-pass changes.
 
 Every b starts at 0.03 °C per interval. Interactions and lag terms keep their existing priors; background drift has zero mean and covariance **0.0001**, so an unconstrained constant cannot readily substitute for outdoor loss and HVAC heat. Integrated extra-source covariance starts at 0.01 to prevent nearly constant source inputs from acting as another free intercept. Measured rows use their own fitted effects instead of mixing in other rooms' thermostat-sensor response. Overlapping windows earn only elapsed/window fractional activity credit. Forgetting (default 0.998) uses that same fractional clock. Confidence is bounded by both `n/(n+24)` and the squared steady effect divided by its squared effect plus posterior variance; runtime alone cannot certify a tiny, poorly identified effect. On upgrade, physical coefficient means are retained, background drift returns to zero, and old per-pass covariance/count evidence is reopened. Saved regimes receive the same migration.
 
@@ -441,3 +441,16 @@ The bundled `tests/data/night-1104.txt` regression checks the real room inputs w
 a thermostat whose action reports lag commands by one pass. It also independently
 fits 48-minute warming rates to measured heating fractions and outdoor difference.
 See DESIGN.md's v0.5.11 section for estimates, ablations and limits of this export.
+
+
+## v0.5.12 learning window
+
+The night regression now replays production learning at 60 minutes with the same
+acceptance limits. Independent OLS remains a separate 48-minute reference. Steady
+heating effects in °C/hour (fresh / small prior) are living 1.271 / 1.271,
+downstairs 0.541 / 0.541, guest 0.528 / 0.527, parent 1.290 / 1.289,
+Annabelle 1.531 / 1.530, Wesley/Gabriel 1.709 / 1.708. Every room stays within
+35% of OLS and below 20% confidence. The controller replay makes 12 starts,
+with minimum run/off times of 16/12 minutes (excluding the initial off period).
+Mean absolute house error is 0.3724 °C versus 0.2719 recorded; mean room spread
+is 2.7940 °C versus 2.9343 recorded. Both remain within the existing +0.2 °C limits.
