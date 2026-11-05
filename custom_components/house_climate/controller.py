@@ -62,6 +62,26 @@ class ControlState:
     last_start: dict[str, float] = field(default_factory=dict)
     last_stop: dict[str, float] = field(default_factory=dict)
     starts: dict[str, list[float]] = field(default_factory=dict)
+    reported_starts: dict[str, list[float]] = field(default_factory=dict)
+    commanded: dict[str, bool] = field(default_factory=dict)
+    command_start: dict[str, float] = field(default_factory=dict)
+    command_stop: dict[str, float] = field(default_factory=dict)
+    pending_start: dict[str, bool] = field(default_factory=dict)
+
+    def demand_on(self, key):
+        return self.commanded.get(key, self.actions.get(key) in ("heating", "cooling"))
+
+    def command_demand(self, key, on, now):
+        """Reserve a transition before sending it; failure retains a safe dwell."""
+        previous = self.demand_on(key)
+        self.commanded[key] = on
+        if on != previous:
+            if on:
+                self.command_start[key] = now
+                self.starts.setdefault(key, []).append(now)
+                self.pending_start[key] = True
+            else:
+                self.command_stop[key] = now
 
     def observe_report(self, system, device, config):
         """Retain reported actuator input separately from unknown runtime."""
@@ -144,11 +164,18 @@ class ControlState:
         self.reported_names[key] = device.name or key
 
     def cycling_status(self, system, now):
-        running = self.actions.get(system) in ("heating", "cooling")
-        since = (self.last_start if running else self.last_stop).get(system)
+        running = self.demand_on(system)
+        clocks = (
+            (self.last_start, self.command_start)
+            if running
+            else (self.last_stop, self.command_stop)
+        )
+        times = [clock[system] for clock in clocks if system in clock]
+        since = max(times) if times else None
         return {
-            "starts_last_hour": sum(
-                now - 3600 < t <= now for t in self.starts.get(system, [])
+            "starts_last_hour": max(
+                sum(now - 3600 < t <= now for t in clock.get(system, []))
+                for clock in (self.starts, self.reported_starts)
             ),
             "run_minutes": max(0, now - since) / 60
             if running and since is not None
@@ -190,7 +217,9 @@ class ControlState:
         if known:
             if running and (not was_running or system not in self.last_start):
                 self.last_start[system] = now
-                self.starts.setdefault(system, []).append(now)
+                self.reported_starts.setdefault(system, []).append(now)
+                if not self.pending_start.pop(system, False):
+                    self.starts.setdefault(system, []).append(now)
             elif not running and (
                 was_running
                 or self.last_start.get(system, float("-inf"))
@@ -200,6 +229,9 @@ class ControlState:
             elif not running:
                 self.last_stop.setdefault(system, now)
         self.starts[system] = [t for t in self.starts.get(system, []) if t > now - 3600]
+        self.reported_starts[system] = [
+            t for t in self.reported_starts.get(system, []) if t > now - 3600
+        ]
         if running or previous in ("heating", "cooling"):
             self.last_run[system] = now
         else:
@@ -219,22 +251,30 @@ class ControlState:
 
 
 def cycling_hold(config, state, key, now):
-    """Return a required on/off state from reported action evidence only."""
+    """Protect command transitions immediately and extend holds with reports."""
     settings = {
         **config,
         **next((s for s in config["systems"] if s["entity_id"] == key), {}),
     }
-    running = state.actions.get(key) in ("heating", "cooling")
+    running = state.demand_on(key)
+    start = max(
+        state.last_start.get(key, float("-inf")),
+        state.command_start.get(key, float("-inf")),
+    )
+    stop = max(
+        state.last_stop.get(key, float("-inf")),
+        state.command_stop.get(key, float("-inf")),
+    )
+    # A real thermostat stop after acknowledgement is new evidence, unlike an
+    # old idle report arriving while the commanded start is still pending.
+    if not state.pending_start.get(key) and stop > start:
+        running = False
     if running:
-        if (
-            now - state.last_start.get(key, float("-inf"))
-            < settings.get("min_run_minutes", 10) * 60
-        ):
+        if now - start < settings.get("min_run_minutes", 10) * 60:
             return True
-    elif now - state.last_stop.get(key, float("-inf")) < settings.get(
-        "min_off_minutes", 5
-    ) * 60 or sum(
-        now - 3600 < t <= now for t in state.starts.get(key, [])
+    elif now - stop < settings.get("min_off_minutes", 5) * 60 or max(
+        sum(now - 3600 < t <= now for t in clocks.get(key, []))
+        for clocks in (state.starts, state.reported_starts)
     ) >= settings.get("max_starts_per_hour", 3):
         return False
     return None
@@ -243,7 +283,7 @@ def cycling_hold(config, state, key, now):
 def effort_limits(config, state, key, now, in_band):
     hold = cycling_hold(config, state, key, now)
     if hold is None and in_band:
-        hold = state.actions.get(key) in ("heating", "cooling")
+        hold = state.demand_on(key)
     return (0.001, 1) if hold is True else (0, 0) if hold is False else (0, 1)
 
 
@@ -690,10 +730,7 @@ def allocate(
         for key in systems
     ]
     previous = [abs(state.efforts.get(key, 0)) if state else 0 for key in systems]
-    on = [
-        state.actions.get(key) in ("heating", "cooling") if state else False
-        for key in systems
-    ]
+    on = [state.demand_on(key) if state else False for key in systems]
     switch_cost = config.get("switch_penalty", 0.05) if state else 0
     change_cost = config.get("effort_change_penalty", 0.005) if state else 0
     efforts = [clamp(u, low, high) for u, (low, high) in zip(previous, bounds)]
@@ -1168,7 +1205,7 @@ def control(
             )
             required = hold
             if required is None and in_band and not state.excitation:
-                required = state.actions.get(entity_id) in ("heating", "cooling")
+                required = state.demand_on(entity_id)
             if required is None and house is not None:
                 required = abs(state.efforts.get(entity_id, 0)) > 0
             if own is not None and required is not None:
@@ -1209,6 +1246,10 @@ def control(
                 else:
                     command_mode = "off"
         offset = target - state.setpoint
+        if command_mode == "off":
+            state.command_demand(entity_id, False, now)
+        elif mode in ("heat", "cool") and own is not None:
+            state.command_demand(entity_id, direction * (target - own) > 0, now)
         state.offsets[entity_id] = offset
         if device.mode != command_mode:
             notes.append(f"{entity_id}: mode differs; re-asserting {command_mode}.")

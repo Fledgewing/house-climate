@@ -112,7 +112,7 @@ Every control interval, and immediately when the house setpoint or mode changes:
    each room's deviation from that average and the average's error from S together:
 
    `J(u) = Σ_i w_i (T_hat_i − T_hat_mean)² + λ (T_hat_mean − S)²
-   + switch_penalty × Σ_j 1[on(u_j) ≠ reported_on_j]
+   + switch_penalty × Σ_j 1[on(u_j) ≠ committed_on_j]
    + effort_change_penalty × Σ_j |u_j − previous_u_j|`.
 
    Normalize the active positive room weights to sum to one. Use `average_weight`
@@ -135,11 +135,11 @@ Every control interval, and immediately when the house setpoint or mode changes:
    0..1; cool efforts −1..0. Without control state, `allocate` retains the original pure
    convex thermal objective for independent forecasting and grid validation.
 
-   A reported running unit inside `min_run_minutes` has magnitude at least 0.001;
+   A commanded or reported running unit inside `min_run_minutes` has magnitude at least 0.001;
    an idle unit inside `min_off_minutes` or at `max_starts_per_hour` has magnitude zero.
    Starts expire from the rolling window exactly one hour later. If every used,
    positive-weight filtered reading is inside setpoint ± `comfort_band/2`, retain the
-   reported on/off state as another allocation bound. Otherwise leave state changes to J,
+   committed on/off state as another allocation bound. Otherwise leave state changes to J,
    even when the average itself is comfortable. This band never selects heat/cool mode.
    A system with a fine target step (<0.5 °C by default) can modulate; otherwise evaluate
    only full-on/off efforts. Per-system `modulating` overrides that heuristic.
@@ -1063,3 +1063,196 @@ the disabled unit's effort fixed at zero. Last-decision text lists disabled unit
 only as under hand control, and states when every unit is under hand control.
 Re-enabling restores normal house-mode control on the next pass, with observed
 cycling clocks retained. The house thermostat and remaining units continue normally.
+
+## v0.5.11: command cycling and integrated identification
+
+The v0.5.10 allocator used only `actions`, `last_start` and `last_stop` from
+`observe_action` for cycling constraints. `control` could command on without
+updating any of those clocks. At the next pass an idle/old report therefore permitted
+zero effort before any minimum run had begun. A run that began and ended between
+reports could also escape the start quota. The state penalty compared candidate
+on/off to the reported action, rather than the last command. Its reference could
+move with a delayed report instead of providing hysteresis around the command.
+The every-room comfort hold did not help this night: downstairs remained far
+outside the band even when the average was comfortable. Endpoint efforts 0/1 are
+not created by drive bias; dither cannot promote zero to positive effort, and the
+final target-side clamp already prevents rounding from reversing demand.
+
+`command_demand` now reserves each transition at decision time, conservatively
+before sending services. Separate command start/stop clocks survive persistence.
+The later action start confirms the reservation rather than double counting it;
+its later timestamp extends minimum run protection. Reported stops extend off
+protection, and autonomous reported cycles still count. Both command-time and
+report-time rolling quotas must permit a start. A confirmed thermostat stop after
+acknowledgement enforces the off delay even if the previous command remained on.
+Failed sends retain the reservation: losing a slot temporarily is safer than
+issuing another start immediately. Hand-control handoff records its off command.
+Explicit House off remains an immediate override.
+
+The hysteresis rule is now stable across delayed reports: keep the committed
+command unless the forecast objective improves by more than `switch_penalty`
+(default 0.05 °C²) plus the L1 movement cost. If every weighted room is inside
+setpoint ± comfort_band/2, keep that command regardless of forecast preference.
+Run/off/quota constraints override both rules and are re-applied after excitation,
+feedback, dither and target rounding. No larger arbitrary switch penalty is needed.
+
+### Learning changes
+
+The coordinator's existing EffortTracker already integrates all reported action
+transitions, including service-call events; the thermal update receives elapsed
+heating/cooling fractions, not `last_decision` effort. Its hand-control exclusion
+remains in place; after the other unit was switched off, its measured fraction
+and excluded fraction are both zero. This does not explain the Bryant-only segment.
+Device own-temperature learning rows are separate RLS rows: they do not directly
+enter another room's regression. They *did* enter the shared system prior used by
+the old confidence blend, so a thermostat sensor's response could distort every
+low-confidence room's forecast.
+
+Production Learning now uses `window_minutes=48` (rounded up to whole elapsed
+passes). The pure Learning API retains zero as its per-interval compatibility mode;
+short wiring tests select that mode explicitly. A bounded per-room queue sums each
+interval's temperature difference and all its regressors: outdoor difference,
+actual runtime, temperature interactions, historical lag runtime, sources, solar
+and constant. Dividing by total elapsed duration keeps coefficients in their
+existing per-configured-interval units. The rolling fit updates each scheduled
+pass once a full clean window exists. Gaps and invalid endpoints discard only the
+affected window; missing global context clears all windows. Pause/restart discard
+incomplete windows rather than joining unobserved time.
+
+Control keeps the robust time-weighted median. Learning instead uses validated
+raw endpoints, because applying a median to temperature alone delays its response
+relative to the measured effort. Confirmed/pending sensor transients still exclude
+rows and break windows; they are not reclassified as HVAC heat. Background drift's
+zero prior covariance is 0.0001 in integrated mode, rather than 100. This regularizes
+the poorly identified constant/outdoor tradeoff without removing the constant,
+interaction, lag, source or regime terms. Integrated source-effect covariance is
+0.01 rather than 100: a nearly constant source must not recreate an unconstrained
+background intercept. Source means remain zero initially and can learn either sign. Existing measured rows use their own
+regularized coefficients, avoiding the shared thermostat-sensor prior.
+
+Each overlapping observation earns elapsed/window fractional activity credit;
+forgetting uses the same fractional exponent. Runtime confidence is additionally
+capped at `effect² / (effect² + steady_variance)` for b+h. It therefore remains low
+when covariance cannot separate heating from lag/background, even after many active
+passes. Upgrade retains physical coefficient means, resets background drift to
+zero, and reopens covariance/activity counts from the old per-pass identification
+scheme, including challenger/library rows. No completed learning windows persist.
+
+### Night 11-04 evidence and independent check
+
+Fixture: `tests/data/night-1104.txt`, including its original header. There are 180
+four-minute aggregate rows, 21:30–09:26 PT. It is not raw state-change history, a live
+Store snapshot, or a record of configured room weights. Consequently it cannot
+reconstruct the exact live event ordering, rapid transients, or saved covariance.
+The constructed small-effect prior below has b=0.004 °C per four-minute interval,
+100 activity samples, and covariance 0.001; it exercises recovery from confident
+small effects without claiming to reproduce the unavailable live Store.
+
+Independent OLS uses overlapping 48-minute windows, endpoint warming in °C/hour,
+and mean time-weighted Bryant fraction, Mitsubishi fraction, and outdoor-minus-room
+temperature. It uses no RLS, lag coefficients, confidence blend or fitted-model
+predictions. Including Mitsubishi permits the entire night to contribute while
+accounting for its operation before ~23:33. Constant background is zero in this
+independent check; fitting it freely on the Bryant-only portion is ill-conditioned
+(condition numbers 153–364), allowing physically implausible negative losses in
+Annabelle/Wesley and background cooling near 1 °C/hour. Zero is an explicit
+regularization assumption, not proof that other heat sources emit no heat.
+
+All effects below are steady °C/hour, evaluated at outdoor 11 °C and the final
+recorded room temperature for the replay models. “Before” runs the v0.5.10 algorithm
+with its control median and normal rejection. “After” uses validated raw endpoints,
+48-minute windows and the new priors/confidence treatment. The full replay also supplies the
+Soleia, server and papa power columns as proportional heat sources
+(10 W units converted to kW), and the two bedjet flags as binary source channels.
+Solar is zero in this replay. If Soleia instead represents a solar proxy, the
+alternate context replay gives 1.107/0.515/0.502/1.208/1.424/1.909 °C/hour, also
+within 35% of the simple independent fit.
+Papa power and mummy activity are zero throughout, so they contribute no heat.
+These context assignments are explicit replay assumptions; the export has no
+entity configuration. The independent check intentionally remains a simple
+HVAC/outdoor fit, so extra-source attribution can explain modest differences.
+Every measured room is
+within 35% of the independent whole-night estimate, from either initialization.
+
+| Room | Independent OLS | Before fresh | Before small prior | After fresh | After small prior |
+|---|---:|---:|---:|---:|---:|
+| Living | 0.990 | 0.484 | 0.377 | 1.262 | 1.262 |
+| Downstairs | 0.485 | 0.023 | 0.061 | 0.502 | 0.502 |
+| Guest | 0.593 | 0.034 | 0.113 | 0.475 | 0.475 |
+| Parent | 1.344 | 0.493 | 0.312 | 1.293 | 1.293 |
+| Annabelle | 1.596 | 0.248 | 0.338 | 1.485 | 1.484 |
+| Wesley/Gabriel | 1.774 | 0.199 | 0.523 | 1.733 | 1.732 |
+
+The own thermostat row is diagnostic, not a weighted member: OLS 0.398, old fresh
+-1.301, new 0.068 °C/hour. Its strong local cycling temperature is unsuitable as a
+house warming-rate proxy. New room confidences are respectively 3.5%, 0.6%, 0.5%,
+3.7%, 4.7%, 6.5%, versus about 74–75% old fresh and up to 85% with old runtime evidence.
+Negative old values above precede the forecast's nonnegative heat clamp.
+
+As a sensitivity check, Bryant-only fits after 23:38, excluding Mitsubishi, give
+32/48/60-minute-window effects: living 0.658/0.684/0.668, downstairs
+0.443/0.452/0.468, guest 0.597/0.609/0.624, parent 1.437/1.500/1.478,
+Annabelle 1.553/1.715/1.729, Wesley/Gabriel 1.730/1.743/1.704. Living is sensitive
+to the earlier operating regime: dropping it changes the fitted outdoor-loss
+coefficient from 0.0453 to 0.028 °C/hour/°C and lowers Bryant reach by 0.306 °C/hour.
+The whole-night multivariate estimate is the acceptance reference; this sensitivity
+is a limitation of the export's identification, not evidence of 1% physical accuracy.
+
+Candidate-cause ablations below isolate HVAC/outdoor identification with solar
+and extra sources omitted (fresh prior, same fixture). That reduced-context old
+replay gives living/down/guest/parent/Annabelle/Wesley =
+0.654/0.071/0.135/0.637/0.437/0.269 °C/hour:
+
+- Quantization is real: downstairs and guest have **97.8% zero four-minute
+  differences**, living 80.4%. Per-pass differences lose the accumulated response
+  and associate isolated steps with whichever duty fraction happens at that pass.
+- Response alignment is real: removing only the control median changes old effects
+  to living/down/guest/parent/Annabelle/Wesley =
+  1.701/0.715/0.761/1.428/2.498/2.285. Raw per-pass fitting alone is still noisy.
+- Rejecting disturbances is not the fresh replay's primary cause: zero rows are
+  fully disturbed. Disabling innovation clipping/rejection changes effects to
+  0.752/0.170/0.394/0.448/0.644/0.786, still wrong. The old small prior produces
+  68 disturbed row-passes with broad covariance. In the full-context replay, the
+  fresh old model rejects 148 row-passes (37 each for living/parent/Annabelle/
+  Wesley), whereas the tightly held small prior rejects none. New integrated
+  fitting rejects zero in both initializations. Four-minute means
+  trigger no rate excursions at 0.5 °C/min, so this file cannot reproduce or rule
+  out the live “sensor transient ignored” messages from faster raw reports.
+- Lag cancellation is not the primary cause: removing lag covariance gives
+  0.604/0.059/0.130/0.620/0.406/0.126. Removing forgetting gives
+  0.686/0.059/0.119/0.620/0.408/0.216. Neither repairs the estimates.
+- Constant/background regularization alone gives
+  0.512/0.061/0.121/0.589/0.424/0.250, also insufficient. Integrated windows while
+  retaining broad background covariance give living 1.912 and the other rooms
+  0.420/0.552/1.366/1.497/1.656. Both alignment/integration and regularization matter.
+- The own sensor does not dominate room regression, but the old shared-prior blend
+  can propagate its erroneous reach into other rooms. Integrated measured rows
+  no longer use that cross-room blend.
+
+### Regression scope
+
+The night controller replay uses equal weights for the six exported room members,
+setpoint 22, one controlled binary HVAC, the learned model, and one-pass-late reports.
+It feeds recorded room/outdoor/own-sensor inputs, with a simple counterfactual room
+correction from the independent rates times the difference between new and recorded
+heating fractions, decaying by 0.995 per pass. This is a deterministic sensitivity
+plant, not recovered physical ground truth. Exploration is disabled to isolate
+allocation; separate excitation tests retain its safety constraints.
+
+It produces 11 starts over the replay, completed runs of 16–20 minutes, off periods
+at least 12 minutes, and no more than 3 starts in any rolling hour. Mean absolute
+house error is 0.394 °C versus recorded 0.272; mean spread 2.786 versus 2.934 °C.
+The explicit materiality limits are +0.2 °C for each metric. Tests also cover an idle
+report after a pending command, acknowledgement without a duplicate start, and the
+later report-time quota at the hour boundary. A separate stochastic integrated
+simulation checks delayed HVAC response and a measured heat source. Existing delayed,
+interaction, source and regime simulations remain in the full regression suite.
+
+The rate filter also now compares cumulative movement against a minute-old anchor,
+with a minimum one-minute movement allowance. Previously a 0.1 °C change arriving
+one second after a report opened a pending excursion for up to 15 minutes; harmless
+quantized/report bursts could repeatedly withhold learning. The new rule admits
+that small step but still quarantines cumulative movement beyond max_rate over a
+minute, including many individually small fast steps. Large excursion and sustained
+step expiry behavior remain covered. This addresses a structural cause of excessive
+transient rejection without claiming to reconstruct sub-minute events from means.

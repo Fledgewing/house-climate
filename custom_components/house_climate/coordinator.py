@@ -98,6 +98,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.system_control[entity_id] = enabled
             if not enabled:
                 now = dt_util.utcnow().timestamp()
+                self.state.command_demand(entity_id, False, now)
                 self.fans.finish_system(entity_id, now)
                 self.state.efforts[entity_id] = 0
                 self.state.requested_efforts[entity_id] = 0
@@ -167,6 +168,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.config.get("interaction_prior", 0.0001),
             self.config.get("lag_minutes", 60),
             self.config.get("lag_prior", 0.01),
+            window_minutes=self.config.get("learning_window_minutes", 48),
         )
 
     async def async_load(self):
@@ -244,6 +246,9 @@ class HouseCoordinator(DataUpdateCoordinator):
                         **saved["learning"],
                         "lag_minutes": self.config.get("lag_minutes", 60),
                         "lag_prior": self.config.get("lag_prior", 0.01),
+                        "window_minutes": self.config.get(
+                            "learning_window_minutes", 48
+                        ),
                         "interaction_prior": self.config.get(
                             "interaction_prior", 0.0001
                         ),
@@ -361,6 +366,7 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.effort = EffortTracker()
         self.source_effort = EffortTracker()
         self.learning.streaks.clear()
+        self.learning.windows.clear()
 
     @property
     def frozen_window(self):
@@ -768,7 +774,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                     },
                 }
                 learning_values = {
-                    key: value
+                    key: raw[key]["value"]
                     for key, value in clean_values.items()
                     if not self.filters[key].blocked
                     and not self.filters[key].contaminated

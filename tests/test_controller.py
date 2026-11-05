@@ -117,7 +117,7 @@ def test_effort_switches_in_one_pass_despite_legacy_slew(config):
     device = Device(mode="heat", current_temperature=25)
     result = run(config, state, device=device)
     assert result.commands[-1][2] == {"temperature": 26}
-    result = run(config, state, {"sensor.a": Reading(26)}, device, now=10300)
+    result = run(config, state, {"sensor.a": Reading(26)}, device, now=10600)
     assert result.commands[-1][2] == {"temperature": 24}
 
 
@@ -139,7 +139,7 @@ def test_immediate_calls_retain_dwell_but_next_pass_can_switch(config):
     for now in (10001, 10002, 10299):
         result = run(config, state, {"sensor.a": Reading(25)}, device, now=now)
         assert result.commands[-1][2]["temperature"] > 24
-    result = run(config, state, {"sensor.a": Reading(25)}, device, now=10300)
+    result = run(config, state, {"sensor.a": Reading(25)}, device, now=10600)
     assert result.commands[-1][2]["temperature"] < 24
 
 

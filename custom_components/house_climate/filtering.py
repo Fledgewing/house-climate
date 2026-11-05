@@ -37,10 +37,20 @@ class SensorFilter:
                 self.dirty = True
                 self.contaminated = True
         elif previous and value is not None and previous[1] is not None:
-            elapsed = now - previous[0]
-            delta = value - previous[1]
+            # Report timing is not measurement timing: tiny quantized steps can
+            # arrive seconds apart. Allow one minute of movement, but compare
+            # against a minute-old anchor so many small steps cannot hide a jump.
+            anchor = self.points[0]
+            for point in reversed(self.points):
+                anchor = point
+                if now - point[0] >= 60:
+                    break
+            if anchor[1] is None:
+                anchor = previous
+            elapsed = max(60, now - anchor[0])
+            delta = value - anchor[1]
             if elapsed > 0 and abs(delta) * 60 > self.max_rate * elapsed:
-                self.pending = [now, previous[1], 1 if delta > 0 else -1]
+                self.pending = [now, anchor[1], 1 if delta > 0 else -1]
                 self.contaminated = True
         self.points.append([now, value])
         self._prune(now)

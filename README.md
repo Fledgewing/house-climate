@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.10 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.11 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 The setpoint is the weighted **house average**. Each pass jointly chooses how much every available system should run to bring that average to the setpoint and reduce each room's deviation from it. A 45-minute prediction uses the learned room responses, outdoor losses, extra heat sources, solar gain and drift. There are no configured room mappings or individual room targets. A shared comfort band holds starts and stops only when every weighted room is comfortable.
 
@@ -131,7 +131,11 @@ Changes made directly on physical systems are noted in `last_decision` and re-as
 
 ## Online learning and visibility
 
-Each room learns `ΔT = a × Δ + Σ [(b + g × Δ) × signed_runtime_fraction + h × lagged_runtime] + Σ [(e + g × Δ) × source_effort + h × lagged_source] + c × solar_kW + d` (Δ = outdoor minus room temperature at interval start) using recursive least squares. HVAC action changes are tracked between passes: heating contributes positive running effort, cooling negative. Every `b` starts at 0.03 °C per interval, with zero prior heat-loss, sun-gain and drift means and broad covariance. Default forgetting is 0.998 per sample. Each room/system confidence is `n/(n+24)`, where n is the forgetting-weighted number of intervals with nonzero effort. In v0.4.2, low-confidence pairs blend toward that system's confidence-weighted mean learned b across rooms with runtime evidence, falling back to 0.03 only when none has been explored. A new sensor therefore inherits measured system reach while its own effect is learned; no room mappings are assumed. Forgetting and prior sample count are available in options.
+Each room learns `ΔT = a × Δ + Σ [(b + g × Δ) × signed_runtime_fraction + h × lagged_runtime] + Σ [(e + g × Δ) × source_effort + h × lagged_source] + c × solar_kW + d` using recursive least squares. HVAC action changes are integrated between passes; commands are never substituted for measured runtime.
+
+In v0.5.11, production learning uses rolling **48-minute integrated observations**. It sums temperature changes and every regressor over the same window, then normalizes to one configured interval. Raw room endpoints, after the existing transient/reporting checks, avoid shifting the response relative to runtime with a control median. Control still uses filtered readings. The rate filter allows one minute of small quantized movement while checking cumulative movement against a minute-old anchor, avoiding quarantine merely because reports arrive seconds apart. Missing or rejected intervals discard that room's incomplete window; restart and pause begin new windows. This lets slow, report-on-change sensors contribute their accumulated warming rather than mostly zero per-pass changes.
+
+Every b starts at 0.03 °C per interval. Interactions and lag terms keep their existing priors; background drift has zero mean and covariance **0.0001**, so an unconstrained constant cannot readily substitute for outdoor loss and HVAC heat. Integrated extra-source covariance starts at 0.01 to prevent nearly constant source inputs from acting as another free intercept. Measured rows use their own fitted effects instead of mixing in other rooms' thermostat-sensor response. Overlapping windows earn only elapsed/window fractional activity credit. Forgetting (default 0.998) uses that same fractional clock. Confidence is bounded by both `n/(n+24)` and the squared steady effect divided by its squared effect plus posterior variance; runtime alone cannot certify a tiny, poorly identified effect. On upgrade, physical coefficient means are retained, background drift returns to zero, and old per-pass covariance/count evidence is reopened. Saved regimes receive the same migration.
 
 While a system's least-confident active, weighted room is below `explore_threshold` (default 0.8), it gets a ±0.5 °C two-hour square-wave exploration offset, with different phases per system. The amplitude fades to zero at that threshold and perturbs bounded effort. `last_decision` says **exploring** and explains room-level allocation tradeoffs.
 
@@ -161,8 +165,7 @@ excluding the current interval. `lag_prior` defaults to **0.01** covariance with
 Forecasts include the known past and the candidate effort entering that window, including
 outage thermostat predictions. The steady effect is `b + g × Δ + h` (or `e + g × Δ + h`
 for sources); system heating effects retain the nonnegative clamp. Bounded effort history
-survives restarts; gaps contribute zero lag feature and no lag learning credit. Upgrades
-preserve all learned rows, their covariance, counts and saved regimes.
+survives restarts; gaps contribute zero lag feature and no lag learning credit. The v0.5.11 evidence migration described above also applies to saved regimes.
 
 Read `sensor.house_learning` for overall confidence percent (the mean across room/system pairs). Under its attributes:
 
@@ -416,3 +419,25 @@ learns **0.294 °C/hour** with the lag model, versus **0.015 °C/hour** with the
 same-interval model. The learned forecast makes the allocator use the unit for the cold room.
 Tests also cover a full 60-minute steady experiment after repeated five-minute allocator runs,
 confidence growth, forecast safety, short-run eligibility, migration and source response changes.
+
+
+## v0.5.11 cycling and recorder regression
+
+A commanded start reserves a start immediately, even while `hvac_action` still says idle.
+Its later heating report confirms that reservation and extends the minimum run from
+the reported start, without counting the same start twice. Stops likewise protect both
+command and report times. Separate rolling command/report quotas prevent delayed
+reports from releasing a start slot early. Conservative command reservations survive
+service failure and restart. Explicit House off still takes effect immediately.
+
+On/off hysteresis uses the committed command as the reference for the existing
+switch cost: a change must improve the thermal objective by more than the switch
+penalty plus effort movement cost. If every weighted room is in the comfort band,
+retain that committed state. Minimum run/off and starts/hour remain hard bounds
+after feedback, exploration and target rounding. A confirmed autonomous thermostat
+stop also enforces the off delay before another call.
+
+The bundled `tests/data/night-1104.txt` regression checks the real room inputs with
+a thermostat whose action reports lag commands by one pass. It also independently
+fits 48-minute warming rates to measured heating fractions and outdoor difference.
+See DESIGN.md's v0.5.11 section for estimates, ablations and limits of this export.

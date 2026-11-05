@@ -31,7 +31,7 @@ def setup(mode="heat", modulating=False):
 
 
 @pytest.mark.parametrize("mode,action", [("heat", "heating"), ("cool", "cooling")])
-def test_reported_clocks_not_commands_and_exact_limits(mode, action):
+def test_command_clocks_reconcile_reports_and_exact_limits(mode, action):
     config, state, devices = setup(mode)
     state.observe_action("unit", "idle", 0)
     wants_on = 18 if mode == "heat" else 24
@@ -43,7 +43,7 @@ def test_reported_clocks_not_commands_and_exact_limits(mode, action):
     assert state.starts["unit"] == []
     control(config, state, readings, devices, 300)
     assert abs(state.efforts["unit"]) == 1
-    assert state.starts["unit"] == []  # Service success is no compressor evidence.
+    assert state.starts["unit"] == [300]  # Reserve the start before its report.
     devices["unit"].hvac_action = action
     state.observe_action("unit", action, 340)  # Delayed device response.
     opposite = {"a": Reading(24 if mode == "heat" else 18)}
@@ -386,3 +386,30 @@ def test_unknown_gap_cannot_reuse_an_old_off_clock_for_a_new_reported_stop():
     state.observe_action("unit", "idle", -60)
     assert state.last_stop["unit"] == -60
     assert cycling_hold(config, state, "unit", 0) is False
+
+
+def test_pending_command_start_survives_stale_idle_and_is_counted_once():
+    config, state, devices = setup()
+    device = devices["unit"]
+    device.hvac_action = "idle"
+    state.observe_action("unit", "idle", -600)
+    control(config, state, {"a": Reading(18)}, devices, 0)
+    assert state.starts["unit"] == [0]
+    control(config, state, {"a": Reading(26)}, devices, 300)
+    assert state.efforts["unit"] == 1
+    state.observe_action("unit", "heating", 320)
+    assert state.starts["unit"] == [0]
+    assert state.reported_starts["unit"] == [320]
+    assert cycling_hold(config, state, "unit", 919) is True
+    assert cycling_hold(config, state, "unit", 920) is None
+
+
+def test_reported_hour_quota_outlives_earlier_command_quota():
+    config, state, _ = setup()
+    for start in (0, 900, 1800):
+        state.command_demand("unit", True, start)
+        state.observe_action("unit", "heating", start + 240)
+        state.command_demand("unit", False, start + 840)
+        state.observe_action("unit", "idle", start + 850)
+    assert cycling_hold(config, state, "unit", 3600) is False
+    assert cycling_hold(config, state, "unit", 3840) is None

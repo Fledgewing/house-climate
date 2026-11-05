@@ -7,6 +7,8 @@ from math import ceil, exp, isfinite, sqrt
 PRIOR_B = 0.03
 INTERACTION_PRIOR = 0.0001
 LAG_PRIOR = 0.01
+BACKGROUND_PRIOR = 0.0001
+SOURCE_PRIOR = 0.01
 
 
 @dataclass
@@ -43,6 +45,7 @@ class Learning:
         interaction_prior=INTERACTION_PRIOR,
         lag_minutes=60,
         lag_prior=LAG_PRIOR,
+        window_minutes=0,
     ):
         if not 0 < forgetting <= 1 or n0 <= 0:
             raise ValueError("Invalid learning parameters")
@@ -50,7 +53,11 @@ class Learning:
             raise ValueError("Invalid interaction prior")
         if not isfinite(lag_prior) or lag_prior <= 0 or lag_minutes <= 0:
             raise ValueError("Invalid lag parameters")
+        if not isfinite(window_minutes) or window_minutes < 0:
+            raise ValueError("Invalid learning window")
         self.lag_minutes = lag_minutes
+        self.window_minutes = window_minutes
+        self.windows = {}
         self.lag_prior = lag_prior
         self.effort_history = []
         self.effort_clock = 0
@@ -183,11 +190,17 @@ class Learning:
         context = [outdoor, solar, duration, *activity]
         if any(v is None or not isfinite(v) for v in context) or duration <= 0:
             self.streaks.clear()
+            self.windows.clear()
             return
+        interval_duration = duration
+        interval_activity = activity
         for sensor, row in self.rows.items():
+            duration = interval_duration
+            activity = interval_activity
             start, end = before.get(sensor), after.get(sensor)
             if start is None or end is None or not isfinite(start) or not isfinite(end):
                 self.streaks.pop(sensor, None)
+                self.windows.pop(sensor, None)
                 continue
             self.clock = timestamp
             state = self.regimes[sensor]
@@ -214,6 +227,30 @@ class Learning:
             frozen = [
                 self.lag_index(k) for k, value in enumerate(lagged) if value is None
             ]
+            if self.window_minutes:
+                window = self.windows.get(sensor)
+                if window is None or abs(window["end"] - start_time) > 1e-6:
+                    window = {"segments": []}
+                window["segments"].append((x, end - start, duration, activity, frozen))
+                window["end"] = timestamp
+                self.windows[sensor] = window
+                segments = window["segments"]
+                while (
+                    sum(s[2] for s in segments[1:]) * self.interval_minutes
+                    >= self.window_minutes
+                ):
+                    segments.pop(0)
+                duration = sum(s[2] for s in segments)
+                if duration * self.interval_minutes < self.window_minutes:
+                    continue
+                x = [sum(s[0][k] for s in segments) / duration for k in range(len(x))]
+                end, start = sum(s[1] for s in segments) / duration, 0.0
+                activity = [
+                    sum(s[3][k] * s[2] for s in segments) / duration
+                    for k in range(len(activity))
+                ]
+                frozen = set().union(*(s[4] for s in segments))
+                duration = 1
             error = end - start - sum(a * b for a, b in zip(row.theta, x))
             self.score_regimes(sensor, x, end - start, activity, duration, local_hour)
             challenger = state["challenger"]
@@ -278,10 +315,26 @@ class Learning:
                     continue
                 state["disturbed_since"] = None
                 error = max(-limit * duration, min(limit * duration, error))
-            self.fit_row(row, x, error, activity, duration, self.forgetting, frozen)
+            evidence_weight = (
+                min(1, self.interval_minutes * interval_duration / self.window_minutes)
+                if self.window_minutes
+                else 1
+            )
+            self.fit_row(
+                row,
+                x,
+                error,
+                activity,
+                duration,
+                self.forgetting**evidence_weight,
+                frozen,
+                evidence_weight,
+            )
 
     @staticmethod
-    def fit_row(row, x, error, activity, duration, forgetting, frozen=()):
+    def fit_row(
+        row, x, error, activity, duration, forgetting, frozen=(), evidence_weight=1
+    ):
         p = row.covariance
         raw_px = [sum(a * b for a, b in zip(line, x)) for line in p]
         px = [0 if i in frozen else v for i, v in enumerate(raw_px)]
@@ -303,7 +356,7 @@ class Learning:
             for i, line in enumerate(p)
         ]
         row.counts = [
-            forgetting * n + (abs(value) > 1e-9)
+            forgetting * n + evidence_weight * (abs(value) > 1e-9)
             for value, n in zip(activity, row.counts)
         ]
         row.squared_error = forgetting * row.squared_error + (error / duration) ** 2
@@ -419,6 +472,10 @@ class Learning:
                         if 2 * count < i <= 3 * count
                         else self.interaction_prior
                         if count < i <= 2 * count
+                        else BACKGROUND_PRIOR
+                        if self.window_minutes and i == size - 1
+                        else SOURCE_PRIOR
+                        if self.window_minutes and len(systems) < i <= count
                         else 100.0
                     )
                     if i == j
@@ -615,7 +672,16 @@ class Learning:
 
     def confidence(self, sensor, system):
         n = self.rows[sensor].counts[self.systems.index(system)]
-        return n / (n + self.n0)
+        confidence = n / (n + self.n0)
+        if self.window_minutes:
+            row = self.rows[sensor]
+            k = self.systems.index(system)
+            effect = row.theta[1 + k] + row.theta[self.lag_index(k)]
+            confidence = min(
+                confidence,
+                effect**2 / (effect**2 + self.steady_std(sensor, system) ** 2 + 1e-12),
+            )
+        return confidence
 
     def system_confidence(self, system, sensors=None):
         return min(
@@ -645,6 +711,10 @@ class Learning:
     def blended(self, sensor, system, outdoor=None, temperature=None):
         confidence = self.confidence(sensor, system)
         b = self.rows[sensor].theta[self.systems.index(system) + 1]
+        if self.window_minutes and self.rows[sensor].samples:
+            # Integrated observations already regularize toward the row prior.
+            # Do not mix a measured room with another room's thermostat response.
+            confidence = 1
         delta = (
             outdoor - temperature
             if outdoor is not None and temperature is not None
@@ -799,6 +869,8 @@ class Learning:
             "interaction_prior": self.interaction_prior,
             "lag_prior": self.lag_prior,
             "lag_minutes": self.lag_minutes,
+            "window_minutes": self.window_minutes,
+            "integrated_version": int(bool(self.window_minutes)),
             "effort_history": deepcopy(self.effort_history),
             "effort_clock": self.effort_clock,
             "regime_margin": self.regime_margin,
@@ -841,6 +913,7 @@ class Learning:
             interaction_prior=saved.get("interaction_prior", INTERACTION_PRIOR),
             lag_prior=saved.get("lag_prior", LAG_PRIOR),
             lag_minutes=saved.get("lag_minutes", 60),
+            window_minutes=saved.get("window_minutes", 0),
         )
 
         def load_row(data):
@@ -865,6 +938,12 @@ class Learning:
                 prior.counts = row.counts
                 prior.samples, prior.squared_error = row.samples, row.squared_error
                 row = prior
+            if model.window_minutes and not saved.get("integrated_version"):
+                # Short, correlated samples were not independent identification
+                # evidence. Retain physical means but reopen their uncertainty.
+                row.covariance = model.neutral_row().covariance
+                row.theta[-1] = 0.0
+                row.counts = [0.0] * count
             return row
 
         model.effort_history = deepcopy(saved.get("effort_history", []))

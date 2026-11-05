@@ -59,17 +59,26 @@ def test_slow_drop_tracks_with_less_than_fifteen_minutes_lag():
     assert filtered == pytest.approx(18.8)
 
 
-def test_small_fast_step_does_not_confirm_itself_on_unchanged_reports():
+def test_small_report_burst_uses_one_minute_movement_allowance():
     f = SensorFilter()
     f.observe(22, 0)
     f.observe(22.1, 1)
     f.observe(22.1, 60)
-    assert f.pending
+    assert not f.pending
     assert not f.rejected
-    assert f.value(60) == 22
+    assert f.value(60) == 22.1
     f.observe(22, 120)
     assert not f.pending
-    assert f.rejected == [[1, 120]]
+    assert not f.rejected
+
+
+def test_cumulative_fast_steps_cannot_evade_rate_filter():
+    f = SensorFilter()
+    f.observe(22, 0)
+    for second in range(1, 8):
+        f.observe(22 + second * 0.1, second)
+    assert f.pending
+    assert 22 <= f.value(10) <= 22.5
 
 
 def test_report_on_change_step_expires_on_passes_without_reports():

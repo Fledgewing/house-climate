@@ -36,6 +36,7 @@ pytestmark = pytest.mark.usefixtures("enable_custom_integrations")
 @pytest.fixture
 def settings():
     data = deepcopy(DEFAULTS)
+    data["learning_window_minutes"] = 0
     data["sensors"] = [{"entity_id": "sensor.room", "weight": 1, "zone": "Main"}]
     data["systems"] = [
         {
@@ -99,6 +100,8 @@ class MockSystem(ClimateEntity):
 
 @pytest.fixture
 async def installed(hass, settings, request):
+    # These short wiring tests exercise individual intervals. Night replay tests
+    # cover the production 48-minute integrated estimator.
     hass.set_state(CoreState.running)
     hass.config.units = METRIC_SYSTEM
     hass.states.async_set("sensor.room", "19", {"unit_of_measurement": "°C"})
