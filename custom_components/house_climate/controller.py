@@ -258,7 +258,7 @@ def excitation_scores(config, state, values, learning, outdoor=None):
         and weights.get(r, 0) / total >= config.get("minor_weight_share", 0.05)
     ]
     scores = {}
-    for key in learning.systems:
+    for key in (s["entity_id"] for s in config["systems"]):
         ranked = sorted(
             rooms,
             key=lambda r: weights[r] * learning.steady_std(r, key, outdoor, values[r]),
@@ -318,6 +318,7 @@ def excitation_target(
             "uncertainty_score": score,
             "last_steady_test": last,
             "next_eligible": eligible,
+            "skip_reason": None,
         }
     helps = house is not None and (
         (mode == "heat" and house <= state.setpoint)
@@ -336,9 +337,19 @@ def excitation_target(
                 efforts[other] = state.reported_efforts.get(other, 0)
         efforts[key] = direction
         rooms = scores.get(key, (0, []))[1]
+        limit = config.get("test_overshoot", 1.5)
+        initial = state.excitation.get("initial_values", values)
+        ceilings = {
+            room: (
+                direction * (initial.get(room, values[room]) - state.setpoint) + 0.3
+                if direction * (initial.get(room, values[room]) - state.setpoint)
+                > limit
+                else limit
+            )
+            for room in rooms
+        }
         if any(
-            direction * (values[room] - state.setpoint)
-            > config.get("comfort_band", 1) / 2
+            direction * (values[room] - state.setpoint) > ceilings[room]
             for room in rooms
         ):
             return False
@@ -349,20 +360,60 @@ def excitation_target(
                     room, values[room], list(efforts), step, outdoor, solar, sources
                 )
                 predicted = base + sum(b * u for b, u in zip(effects, efforts.values()))
-                if (
-                    direction * (predicted - state.setpoint)
-                    > config.get("comfort_band", 1) / 2
-                ):
+                if direction * (predicted - state.setpoint) > ceilings[room]:
                     return False
         return bool(rooms)
 
+    threshold = (1 - config.get("explore_threshold", 0.8)) * 0.03
+    candidates = []
+    allocated = allocation if allocation is not None else state.efforts
+    for key, (score, _) in scores.items():
+        device = devices.get(key)
+        reason = None
+        if not device or not device.available:
+            reason = "unavailable"
+        elif device.current_temperature is None or not isfinite(
+            device.current_temperature
+        ):
+            reason = "missing local temperature"
+        elif (
+            device.hvac_action in ("heating", "cooling")
+            or abs(allocated.get(key, 0)) > 0
+        ):
+            # A continuing normal allocation supplies the same steady-run evidence.
+            reason = "running steadily"
+        elif house is None:
+            reason = "missing house data"
+        elif mode not in ("heat", "cool"):
+            reason = "inactive mode"
+        elif not helps:
+            reason = (
+                "house above setpoint" if mode == "heat" else "house below setpoint"
+            )
+        elif config.get("explore_threshold", 0.8) <= 0:
+            reason = "exploration disabled"
+        elif score <= threshold:
+            reason = "not uncertain enough"
+        elif cycling_hold(config, state, key, now) is False:
+            reason = "cycling hold"
+        elif now < state.experiment_info[key]["next_eligible"]:
+            reason = "eligibility wait"
+        elif state.excitation:
+            reason = "another experiment running"
+        elif not safe(key, minutes):
+            reason = "forecast above limit"
+        state.experiment_info[key]["skip_reason"] = reason
+        if reason is None:
+            candidates.append(key)
     active = state.excitation
     if active:
         key = active["system"]
         device = devices.get(key)
+        state.experiment_info[key]["skip_reason"] = None
         remaining = max(
             config.get("interval", 5), minutes - (now - active["started"]) / 60
         )
+        unsafe = not safe(key, remaining)
         finished = (
             not helps
             or mode != active["mode"]
@@ -372,45 +423,19 @@ def excitation_target(
             or active["runtime"] >= minutes * 60
             or state.last_steady_test.get(key, float("-inf")) >= active["started"]
             or now - active["started"] >= 2 * minutes * 60
-            or not safe(key, remaining)
+            or unsafe
         )
         if finished:
             # Aborts get a retry delay, but never masquerade as successful tests.
             state.last_excite[key] = now
             state.experiment_info[key]["next_eligible"] = now + wait
+            state.experiment_info[key]["skip_reason"] = (
+                "forecast above limit" if unsafe else "eligibility wait"
+            )
             state.excitation = {}
         return
-    if not helps or config.get("explore_threshold", 0.8) <= 0:
-        return
-    threshold = (1 - config.get("explore_threshold", 0.8)) * 0.03
-    highest = max(
-        (
-            score
-            for key, (score, _) in scores.items()
-            if (device := devices.get(key))
-            and device.available
-            and device.current_temperature is not None
-            and isfinite(device.current_temperature)
-        ),
-        default=0,
-    )
-    for key in sorted(scores, key=lambda k: scores[k][0], reverse=True):
-        if scores[key][0] < highest - 1e-12:
-            break
-        device = devices.get(key)
-        if (
-            not device
-            or not device.available
-            or device.current_temperature is None
-            or not isfinite(device.current_temperature)
-            or key not in state.experiment_info
-            or scores[key][0] <= threshold
-            or now < state.experiment_info[key]["next_eligible"]
-            or cycling_hold(config, state, key, now) is False
-        ):
-            continue
-        if not safe(key, minutes):
-            return
+    for key in sorted(candidates, key=lambda k: scores[k][0], reverse=True):
+        device = devices[key]
         target = clamp(
             floor(
                 (device.current_temperature + direction * config.get("run_margin", 1))
@@ -422,6 +447,7 @@ def excitation_target(
             device.maximum,
         )
         if direction * (target - device.current_temperature) <= 0:
+            state.experiment_info[key]["skip_reason"] = "target at device limit"
             continue
         state.excitation = {
             "system": key,
@@ -430,9 +456,8 @@ def excitation_target(
             "runtime": 0,
             "target": target,
             "rooms": scores[key][1][:2],
-            "others": {
-                k: v for k, v in (allocation or state.efforts).items() if k != key
-            },
+            "initial_values": dict(values),
+            "others": {k: v for k, v in allocated.items() if k != key},
         }
         break
 
@@ -548,7 +573,10 @@ def observe_thermostats(
             config,
             state,
             unavailable,
-            state.reported_efforts,
+            {
+                s["entity_id"]: state.reported_efforts.get(s["entity_id"], 0)
+                for s in config["systems"]
+            },
             learning,
             outdoor,
             solar,

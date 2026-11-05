@@ -23,7 +23,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
             HouseSensor(coordinator, entry.entry_id, "temperature_spread"),
             *[
                 HouseSensor(coordinator, entry.entry_id, "offset", s["entity_id"])
-                for s in coordinator.config["systems"]
+                for s in coordinator.active_systems(include_inactive=True)
             ],
         ]
     )
@@ -89,6 +89,7 @@ class LearningSensor(CoordinatorEntity, SensorEntity):
         config = {
             **coordinator.config,
             "sensors": members(coordinator.config, coordinator.priority_mode),
+            "systems": coordinator.active_systems(),
         }
         scores = excitation_scores(
             config,
@@ -101,6 +102,7 @@ class LearningSensor(CoordinatorEntity, SensorEntity):
         state = coordinator.state
         diagnostics["experiments"] = {
             key: {
+                "skip_reason": state.experiment_info.get(key, {}).get("skip_reason"),
                 "uncertainty_score": score,
                 "last_steady_test": state.last_steady_test.get(key),
                 "next_eligible": max(

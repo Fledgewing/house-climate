@@ -59,6 +59,7 @@ DEFAULTS = {
     "explore_threshold": 0.8,
     "excite_after_minutes": 120,
     "excite_minutes": 60,
+    "test_overshoot": 1.5,
 }
 
 

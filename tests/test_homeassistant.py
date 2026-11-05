@@ -300,6 +300,7 @@ async def complete_flow(
     stale_after=720,
     average_weight=1.0,
     fan_reward_lambda=None,
+    test_overshoot=1.5,
 ):
     result = await manager.async_configure(
         result["flow_id"], {"sensors": sensors, "systems": systems}
@@ -322,6 +323,7 @@ async def complete_flow(
     fields = {field.schema: field for field in result["data_schema"].schema}
     assert fields["stale_after"].default() == 720
     tunables["stale_after"] = stale_after
+    tunables["test_overshoot"] = test_overshoot
     tunables["average_weight"] = average_weight
     if fan_reward_lambda is not None:
         tunables["fan_reward_lambda"] = fan_reward_lambda
@@ -373,6 +375,7 @@ async def test_options_add_remove_reweight(hass, settings):
         ["sensor.new", "sensor.another"],
         ["climate.third"],
         stale_after=180,
+        test_overshoot=2.1,
     )
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert entry.options["sensors"] == [
@@ -381,6 +384,7 @@ async def test_options_add_remove_reweight(hass, settings):
     ]
     assert entry.options["systems"] == [{"entity_id": "climate.third", "preset": ""}]
     assert entry.options["stale_after"] == 180
+    assert entry.options["test_overshoot"] == 2.1
 
 
 async def test_empty_selection(hass):
@@ -556,6 +560,7 @@ async def test_config_flow_empty_defaults_and_selector_filters(hass):
         "explore_threshold": 0.8,
         "excite_after_minutes": 120,
         "excite_minutes": 60,
+        "test_overshoot": 1.5,
         "lag_minutes": 60,
         "lag_prior": 0.01,
     }.items():
@@ -1755,8 +1760,15 @@ async def test_excitation_dispatch_between_tick_runtime_and_restart(hass, instal
         key: start.timestamp() - 3 * 3600 for key in coordinator.state.last_run
     }
     coordinator.state.test_observed_since = dict(coordinator.state.last_run)
-    with patch(
-        "custom_components.house_climate.coordinator.dt_util.utcnow", return_value=start
+    with (
+        patch(
+            "custom_components.house_climate.coordinator.dt_util.utcnow",
+            return_value=start,
+        ),
+        patch(
+            "custom_components.house_climate.controller.allocate",
+            return_value=({"climate.ducted": 0, "climate.split": 0}, 22.5),
+        ),
     ):
         await coordinator.async_change(setpoint=22.5, mode="heat", enabled=True)
     assert coordinator.state.excitation["system"] == "climate.ducted"
@@ -2138,7 +2150,13 @@ async def test_last_run_seeds_from_full_history_before_control_and_persists(
         c.state.mode = "heat"
         c.state.setpoint = 22.5
         hass.states.async_set("sensor.room", "19")
-        with patch("homeassistant.core.ServiceRegistry.async_call"):
+        with (
+            patch("homeassistant.core.ServiceRegistry.async_call"),
+            patch(
+                "custom_components.house_climate.controller.allocate",
+                return_value=({"climate.ducted": 0, "climate.split": 0}, 22.5),
+            ),
+        ):
             await c.async_tick()
         assert c.state.excitation["system"] == "climate.ducted"
         restored = HouseCoordinator(hass, entry)
@@ -2857,3 +2875,201 @@ async def test_interaction_diagnostics_include_zero_weight_rooms_and_device_rows
     assert attrs["sources"]["switch.fan"]["sensor.ignored"][
         "effective_effect"
     ] == pytest.approx(-0.29)
+
+
+async def test_experiment_skip_reasons_exposed_in_learning_sensor(hass, installed):
+    entry, _ = installed
+    c = entry.runtime_data
+    await hass.services.async_call(
+        "climate",
+        "set_hvac_mode",
+        {"entity_id": "climate.house", "hvac_mode": "heat"},
+        blocking=True,
+    )
+    await c.async_tick()
+    experiments = hass.states.get("sensor.house_learning").attributes["experiments"]
+    assert experiments
+    for key, info in experiments.items():
+        assert "skip_reason" in info
+        assert info["skip_reason"] == c.state.experiment_info[key]["skip_reason"]
+        assert info["skip_reason"] is not None
+
+
+async def test_unit_control_handoff_learning_and_restart(hass, installed, freezer):
+    from custom_components.house_climate.coordinator import HouseCoordinator
+
+    c, system, calls = await prepare_fans(hass, installed)
+    entry, _ = installed
+    unit = "climate.ducted"
+    freezer.tick(timedelta(minutes=5))
+    await hass.services.async_call(
+        "switch",
+        "turn_off",
+        {"entity_id": "switch.house_ducted_control"},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    assert hass.states.get("switch.house_ducted_control").state == "off"
+    assert [
+        x
+        for x in calls
+        if x[0] == unit and x[1] == "set_hvac_mode" and x[2]["hvac_mode"] == "off"
+    ] == [(unit, "set_hvac_mode", {"hvac_mode": "off"})]
+    assert c.fans.window is None
+    assert any(
+        a["samples"]
+        for arms in c.fans.arms[unit]["fan"].values()
+        for a in arms.values()
+    )
+    calls.clear()
+    # Hand control, including after echo grace, must remain untouched.
+    freezer.tick(timedelta(minutes=5))
+    system._attr_hvac_mode = HVACMode.HEAT
+    system._attr_hvac_action = HVACAction.HEATING
+    system._attr_target_temperature = 28
+    system.async_write_ha_state()
+    await hass.async_block_till_done()
+    before = c.learning.rows["sensor.room"].samples
+    await c.async_tick()
+    assert not [x for x in calls if x[0] == unit]
+    assert "re-assert" not in c.data.explanation
+    assert "Under hand control: climate.ducted" in c.data.explanation
+    assert c.samples[-1]["efforts"][unit] == 0
+    assert c.learning.rows["sensor.room"].samples > before
+    assert [s["entity_id"] for s in c.active_systems()] == ["climate.split"]
+    assert unit not in hass.states.get("climate.house").attributes["cycling"]
+    assert (
+        unit not in hass.states.get("sensor.house_learning").attributes["experiments"]
+    )
+    restored = HouseCoordinator(hass, entry)
+    await restored.async_load()
+    assert not restored.system_control[unit]
+    # The switch state persists without sending another off on restart.
+    calls.clear()
+    await restored.async_tick(record=False)
+    assert not [x for x in calls if x[0] == unit]
+    system._attr_hvac_mode = HVACMode.OFF
+    system._attr_hvac_action = HVACAction.IDLE
+    system.async_write_ha_state()
+    await hass.async_block_till_done()
+    await c.async_system_control(unit, True)
+    assert any(x == (unit, "set_hvac_mode", {"hvac_mode": "heat"}) for x in calls)
+    await c.async_system_control(unit, False)
+    await c.async_system_control("climate.split", False)
+    assert "Every unit is under hand control" in c.data.explanation
+
+
+@pytest.mark.parametrize("window_unit", ["climate.ducted", "climate.split"])
+@pytest.mark.parametrize("early_stop", [False, True])
+async def test_heating_test_does_not_interrupt_either_fan_window(
+    hass, installed, freezer, window_unit, early_stop
+):
+    c, bryant, _ = await prepare_fans(hass, installed)
+    mitsubishi = hass.data[DATA_COMPONENT].get_entity("climate.split")
+    for unit in (bryant, mitsubishi):
+        unit._attr_current_temperature = 24
+        unit._attr_supported_features |= ClimateEntityFeature.FAN_MODE
+        unit._attr_fan_modes = ["gentle", "strong"]
+        unit._attr_fan_mode = "gentle"
+        unit.async_write_ha_state()
+    await hass.async_block_till_done()
+    c.config["excite_after_minutes"] = 0
+    c.config["excite_minutes"] = 10
+    c.state.last_stop = {
+        s["entity_id"]: dt_util.utcnow().timestamp() - 10800 for s in c.active_systems()
+    }
+    c.fans.window = None
+    c.fans.chosen = {window_unit: {"fan": "gentle"}}
+    c.fans.options(window_unit, "fan", "heat|0|0", ["gentle"])
+    start = dt_util.utcnow().timestamp()
+    c.fans._start(
+        start,
+        window_unit,
+        "fan",
+        "heat|0|0",
+        "gentle",
+        c.state.setpoint,
+        {"sensor.room": -2},
+    )
+    with patch(
+        "custom_components.house_climate.controller.allocate",
+        return_value=({"climate.ducted": 0, "climate.split": 0}, c.state.setpoint),
+    ):
+        await c.async_tick(record=False)
+        assert c.state.excitation["system"] == "climate.ducted"
+        assert not c.fans.window["dirty"]
+        bryant._attr_hvac_action = HVACAction.HEATING
+        bryant.async_write_ha_state()
+        await hass.async_block_till_done()
+        freezer.tick(timedelta(minutes=5 if early_stop else 10))
+        if early_stop:
+            c.config["explore_threshold"] = 0
+            # End early through the test's safety predicate.
+            with patch(
+                "custom_components.house_climate.controller.cycling_hold",
+                return_value=False,
+            ):
+                await c.async_tick(record=False)
+        else:
+            await c.async_tick(record=False)
+        assert not c.state.excitation
+        assert not c.fans.window["dirty"]
+        bryant._attr_hvac_action = HVACAction.IDLE
+        bryant.async_write_ha_state()
+        await hass.async_block_till_done()
+        c.config["explore_threshold"] = 0
+        freezer.tick(timedelta(minutes=25 if early_stop else 20))
+        await c.async_tick(record=False)
+    arms = c.fans.arms[window_unit]["fan"]
+    assert sum(bucket["gentle"]["samples"] for bucket in arms.values()) >= 1
+    # A physical user setpoint change still dirties the next window.
+    bryant._attr_target_temperature += 1
+    bryant.async_write_ha_state()
+    await hass.async_block_till_done()
+    assert c.fans.window["dirty"]
+
+
+async def test_disabled_unit_excluded_from_all_control_boundaries(hass, installed):
+    from custom_components.house_climate import controller
+
+    c, _, _ = await prepare_fans(hass, installed)
+    await c.async_system_control("climate.ducted", False)
+    with (
+        patch.object(controller, "allocate", wraps=controller.allocate) as allocation,
+        patch.object(
+            controller, "excitation_target", wraps=controller.excitation_target
+        ) as excitation,
+        patch.object(
+            controller, "observe_thermostats", wraps=controller.observe_thermostats
+        ) as outage,
+        patch.object(
+            controller, "effort_limits", wraps=controller.effort_limits
+        ) as holds,
+        patch.object(c.fans, "tick", wraps=c.fans.tick) as fans,
+    ):
+        await c.async_tick(record=False)
+    for boundary in (allocation, excitation, outage):
+        assert boundary.called
+        args = boundary.call_args.args
+        assert [s["entity_id"] for s in args[0]["systems"]] == ["climate.split"]
+    assert all(call.args[2] == "climate.split" for call in holds.call_args_list)
+    assert set(fans.call_args.args[3]) == {"climate.split"}
+    assert set(c.state.experiment_info) <= {"climate.split"}
+    assert not any(
+        "ducted" in sentence
+        for sentence in c.data.explanation.split(".")
+        if "lifts" in sentence or "limits" in sentence
+    )
+
+
+async def test_own_mode_restore_does_not_dirty_fan_window(hass, installed):
+    c, system, _ = await prepare_fans(hass, installed)
+    system._attr_hvac_mode = HVACMode.OFF
+    system.async_write_ha_state()
+    await hass.async_block_till_done()
+    assert c.fans.window["dirty"]  # Real user mode change.
+    c.fans.window["dirty"] = False
+    await c.async_tick(record=False)
+    await hass.async_block_till_done()
+    assert system.hvac_mode == HVACMode.HEAT
+    assert not c.fans.window["dirty"]  # House re-assert echo.

@@ -3,6 +3,7 @@
 from copy import deepcopy
 from dataclasses import asdict
 from math import floor, sqrt
+from unittest.mock import patch
 
 import pytest
 
@@ -54,7 +55,12 @@ def test_system_mean_prior_and_confidence_blend():
 
 def tick(parts, now, **kwargs):
     config, state, model, devices, readings = parts
-    return control(config, state, readings, devices, now, learning=model, **kwargs)
+    # These tests exercise forced idle-unit runs; normal allocated runs now skip tests.
+    with patch(
+        "custom_components.house_climate.controller.allocate",
+        return_value=(dict.fromkeys(devices, 0.0), state.setpoint),
+    ):
+        return control(config, state, readings, devices, now, learning=model, **kwargs)
 
 
 def test_excitation_waits_then_holds_local_target_and_one_system():

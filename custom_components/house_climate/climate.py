@@ -74,7 +74,7 @@ class HouseClimate(CoordinatorEntity, ClimateEntity, RestoreEntity):
                 system["entity_id"]: self.coordinator.state.cycling_status(
                     system["entity_id"], dt_util.utcnow().timestamp()
                 )
-                for system in self.coordinator.config["systems"]
+                for system in self.coordinator.active_systems()
             },
             "active_mode": self.coordinator.state.active_mode,
         }

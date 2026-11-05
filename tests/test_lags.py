@@ -216,7 +216,7 @@ def test_short_allocator_runs_trigger_full_steady_experiment_and_confidence_rise
 
 
 @pytest.mark.parametrize(
-    "mode,temperature,drift", [("heat", 21, 0.05), ("cool", 21, -0.05)]
+    "mode,temperature,drift", [("heat", 21, 0.2), ("cool", 21, -0.2)]
 )
 def test_experiment_safety_stops_early_cycling_mode_and_minor_rooms(
     mode, temperature, drift
@@ -380,14 +380,138 @@ def test_transition_history_exact_partial_windows_and_restart():
     assert restored.to_dict() == model.to_dict()
 
 
-def test_experiment_checks_the_start_of_the_forecast_too():
+def test_experiment_allows_an_already_hot_room_forecast_to_cool():
     config, state, devices, model = experiment_setup()
     for key in devices:
         state.observe_action(key, "idle", 0)
-    # Passive cooling would bring this room inside the band by the first step;
-    # it is already beyond the heating ceiling at the start of the run.
+    # An already overheated room is eligible when the test does not heat it further.
     model.rows["D"].theta[0] = 0.1
     excitation_target(
-        config, state, devices, {"D": 21.6}, 20.5, "heat", 300, model, outdoor=0
+        config, state, devices, {"D": 23}, 20.5, "heat", 300, model, outdoor=0
     )
+    assert state.excitation
+
+
+@pytest.mark.parametrize("mode", ["heat", "cool"])
+@pytest.mark.parametrize("running", ["reported", "allocated"])
+def test_live_steady_mitsubishi_leaves_idle_bryant_a_turn(monkeypatch, mode, running):
+    config = {
+        "sensors": [{"entity_id": "b_room"}, {"entity_id": "cold", "weight": 3}],
+        "systems": [{"entity_id": "M"}, {"entity_id": "B"}],
+    }
+    direction = 1 if mode == "heat" else -1
+    state = ControlState(mode=mode, active_mode=mode, setpoint=22.5)
+    model = Learning(["b_room", "cold"], ["M", "B"])
+    for row in model.rows.values():
+        row.covariance[1][1] *= 4
+    devices = {
+        key: Device(mode=mode, current_temperature=22.5, hvac_action="idle")
+        for key in ("M", "B")
+    }
+    if running == "reported":
+        devices["M"].hvac_action = "heating" if mode == "heat" else "cooling"
+    state.test_observed_since = dict.fromkeys(devices, 0)
+    state.last_stop = dict.fromkeys(devices, 0)
+    monkeypatch.setattr(
+        "custom_components.house_climate.controller.allocate",
+        lambda *args: ({"M": direction if running == "allocated" else 0, "B": 0}, 22.5),
+    )
+    rise = 0.2
+    monkeypatch.setattr(
+        model,
+        "forecast",
+        lambda room, temperature, systems, step, *args: (
+            temperature,
+            [0, rise * step / 12],
+        ),
+    )
+    readings = {
+        "b_room": Reading(22.5 + direction * 1.2),
+        "cold": Reading(22.5 - direction),
+    }
+    control(config, state, readings, devices, 7200, learning=model)
+    assert state.excitation["system"] == "B"
+    assert (
+        state.experiment_info["M"]["uncertainty_score"]
+        > state.experiment_info["B"]["uncertainty_score"]
+    )
+    assert state.experiment_info["M"]["skip_reason"] == "running steadily"
+    # A room initially inside the limit cannot cross it during the experiment.
+    readings["b_room"] = Reading(22.5 + direction * 1.6)
+    control(config, state, readings, devices, 7500, learning=model)
     assert not state.excitation
+    assert state.experiment_info["B"]["skip_reason"] == "forecast above limit"
+    # Starting beyond the limit is allowed only with at most 0.3 C further rise.
+    state.last_excite.clear()
+    readings["b_room"] = Reading(22.5 + direction * 2)
+    rise = 0.4
+    control(config, state, readings, devices, 15000, learning=model)
+    assert not state.excitation
+    assert state.experiment_info["B"]["skip_reason"] == "forecast above limit"
+    rise = 0.2
+    control(config, state, readings, devices, 15300, learning=model)
+    assert state.excitation["system"] == "B"
+    # Preserve the initial 0.3 C allowance across passes, without ratcheting it.
+    readings["b_room"] = Reading(22.5 + direction * 2.2)
+    control(config, state, readings, devices, 15600, learning=model)
+    assert not state.excitation
+
+
+@pytest.mark.parametrize(
+    "blocked,expected",
+    [
+        ("cooldown", "eligibility wait"),
+        ("cycling", "cycling hold"),
+        ("forecast", "forecast above limit"),
+        ("target", "target at device limit"),
+    ],
+)
+def test_ineligible_high_score_never_blocks_lower_eligible(
+    monkeypatch, blocked, expected
+):
+    config, state, devices, model = experiment_setup()
+    state.test_observed_since = {"A": 0, "B": 0}
+    model.rows["D"].covariance[1][1] *= 10
+    if blocked == "cooldown":
+        state.last_excite["A"] = 299
+    elif blocked == "cycling":
+        state.last_stop["A"] = 299
+    elif blocked == "target":
+        devices["A"].maximum = devices["A"].current_temperature
+    else:
+        monkeypatch.setattr(
+            model,
+            "forecast",
+            lambda room, temperature, systems, step, *args: (
+                temperature,
+                [3 if key == "A" else 0 for key in systems],
+            ),
+        )
+    excitation_target(config, state, devices, {"D": 20.5}, 20.5, "heat", 300, model)
+    assert state.excitation["system"] == "B"
+    assert state.experiment_info["A"]["skip_reason"] == expected
+    # Reasons for other systems remain current while an experiment is active.
+    excitation_target(config, state, devices, {"D": 20.5}, 20.5, "heat", 301, model)
+    assert state.experiment_info["B"]["skip_reason"] is None
+    if blocked in ("cooldown", "cycling"):
+        assert state.experiment_info["A"]["skip_reason"] == expected
+
+
+@pytest.mark.parametrize("mode", ["heat", "cool"])
+@pytest.mark.parametrize("confident", [False, True])
+def test_experiment_house_and_uncertainty_skip_reasons(mode, confident):
+    config, state, devices, model = experiment_setup(mode)
+    state.test_observed_since = dict.fromkeys(devices, 0)
+    direction = 1 if mode == "heat" else -1
+    house = 21 + direction * 0.1
+    expected = "house above setpoint" if mode == "heat" else "house below setpoint"
+    if confident:
+        house = 21
+        expected = "not uncertain enough"
+        for row in model.rows.values():
+            row.covariance = [[0] * len(row.theta) for _ in row.theta]
+    excitation_target(config, state, devices, {"D": house}, house, mode, 300, model)
+    assert not state.excitation
+    assert all(
+        info["skip_reason"] == expected for info in state.experiment_info.values()
+    )

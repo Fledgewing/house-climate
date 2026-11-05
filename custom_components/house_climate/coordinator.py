@@ -41,6 +41,7 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.priority_mode = next(iter(modes(self.config)))
         self.state = ControlState()
         self.enabled = True
+        self.system_control = {}
         self.fan_enabled = True
         self.learning_enabled = True
         self.learning_resume_at = None
@@ -75,6 +76,50 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.current_temperatures = {}
         self.startup_sensors = set(self.filters)
 
+    def active_systems(self, *, include_inactive=False):
+        """Control selections exclude hand-controlled units; observations retain all."""
+        return [
+            system
+            for system in self.config["systems"]
+            if include_inactive or self.system_control.get(system["entity_id"], True)
+        ]
+
+    def active_devices(self, devices):
+        return {s["entity_id"]: devices[s["entity_id"]] for s in self.active_systems()}
+
+    async def async_system_control(self, entity_id, enabled):
+        async with self.lock:
+            if entity_id not in {
+                s["entity_id"] for s in self.active_systems(include_inactive=True)
+            }:
+                raise ValueError("Unknown system")
+            if self.system_control.get(entity_id, True) == enabled:
+                return
+            self.system_control[entity_id] = enabled
+            if not enabled:
+                now = dt_util.utcnow().timestamp()
+                self.fans.finish_system(entity_id, now)
+                self.state.efforts[entity_id] = 0
+                self.state.requested_efforts[entity_id] = 0
+                self.state.reported_efforts[entity_id] = 0
+                self.state.experiment_info.pop(entity_id, None)
+                self.state.steady_runs.pop(entity_id, None)
+                self.state.completed_runs.pop(entity_id, None)
+                if self.state.excitation.get("system") == entity_id:
+                    self.state.last_excite[entity_id] = now
+                    self.state.excitation = {}
+                elif self.state.excitation:
+                    self.state.excitation.get("others", {}).pop(entity_id, None)
+                entity = self.hass.states.get(entity_id)
+                if entity and entity.state in ("heat", "cool"):
+                    await self.hass.services.async_call(
+                        "climate",
+                        "set_hvac_mode",
+                        {"entity_id": entity_id, "hvac_mode": "off"},
+                        blocking=True,
+                    )
+        await self.async_tick(record=False)
+
     @property
     def priority_weights(self):
         return modes(self.config)[self.priority_mode]
@@ -84,7 +129,7 @@ class HouseCoordinator(DataUpdateCoordinator):
         return list(
             dict.fromkeys(
                 [s["entity_id"] for s in self.config["sensors"]]
-                + [s["entity_id"] for s in self.config["systems"]]
+                + [s["entity_id"] for s in self.active_systems(include_inactive=True)]
             )
         )
 
@@ -108,7 +153,7 @@ class HouseCoordinator(DataUpdateCoordinator):
     def new_learning(self):
         return Learning(
             self.learning_sensors,
-            [s["entity_id"] for s in self.config["systems"]],
+            [s["entity_id"] for s in self.active_systems(include_inactive=True)],
             self.config.get("learning_forgetting", 0.998),
             self.config.get("learning_n0", 24),
             [s["entity_id"] for s in self.config.get("extra_heat_sources", [])],
@@ -142,6 +187,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                     dt_util.utcnow().timestamp()
                 )
                 self.state.excitation = {}
+            self.system_control = saved.get("system_control", {})
             self.enabled = saved.get("enabled", True)
             self.fan_enabled = saved.get("fan_enabled", True)
             self.learning_enabled = saved.get("learning_enabled", True)
@@ -152,10 +198,12 @@ class HouseCoordinator(DataUpdateCoordinator):
                 learn_exclude_modes=self.config.get("learn_exclude_modes", "auto"),
                 saved=saved.get("fans"),
             )
-            self.fans.reconcile([s["entity_id"] for s in self.config["systems"]])
+            self.fans.reconcile(
+                [s["entity_id"] for s in self.active_systems(include_inactive=True)]
+            )
             self.samples = saved.get("samples", [])
             # Upgrade old Store data even when recorder is absent during an outage.
-            for system in self.config["systems"]:
+            for system in self.active_systems(include_inactive=True):
                 key = system["entity_id"]
                 if key in self.state.thermostats:
                     continue
@@ -219,7 +267,10 @@ class HouseCoordinator(DataUpdateCoordinator):
                     )
                 self.learning.reconcile(
                     self.learning_sensors,
-                    [s["entity_id"] for s in self.config["systems"]],
+                    [
+                        s["entity_id"]
+                        for s in self.active_systems(include_inactive=True)
+                    ],
                     [s["entity_id"] for s in self.config.get("extra_heat_sources", [])],
                 )
                 self.learning.forgetting = self.config.get("learning_forgetting", 0.998)
@@ -243,7 +294,7 @@ class HouseCoordinator(DataUpdateCoordinator):
         )
         cancel_states = async_track_state_change_event(
             self.hass,
-            [s["entity_id"] for s in self.config["systems"]],
+            [s["entity_id"] for s in self.active_systems(include_inactive=True)],
             self._system_changed,
         )
 
@@ -371,7 +422,11 @@ class HouseCoordinator(DataUpdateCoordinator):
         entity_id = event.data["entity_id"]
         if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             self.state.observe_report(
-                next(s for s in self.config["systems"] if s["entity_id"] == entity_id),
+                next(
+                    s
+                    for s in self.active_systems(include_inactive=True)
+                    if s["entity_id"] == entity_id
+                ),
                 Device(
                     mode=new.state,
                     hvac_action=new.attributes.get("hvac_action"),
@@ -413,6 +468,17 @@ class HouseCoordinator(DataUpdateCoordinator):
             else None,
             dt_util.utcnow().timestamp(),
         )
+        if not self.system_control.get(entity_id, True):
+            self.state.reported_efforts[entity_id] = 0
+            self.state.steady_runs.pop(entity_id, None)
+            self.state.completed_runs.pop(entity_id, None)
+            return
+        if new:
+            self.fans.running_changed(
+                entity_id,
+                dt_util.utcnow().timestamp(),
+                new.attributes.get("hvac_action") in ("heating", "cooling"),
+            )
         if old and new:
             commanded_target = self.last_commands.get(entity_id)
             pending_target = self.pending_commands.get(entity_id, {}).get("temperature")
@@ -426,7 +492,10 @@ class HouseCoordinator(DataUpdateCoordinator):
                 )
             ):
                 self.fans.invalidate(f"{entity_id} user setpoint changed")
-            if old.state != new.state or any(
+            commanded_mode = self.pending_commands.get(entity_id, {}).get(
+                "hvac_mode", commanded_target[0] if commanded_target else None
+            )
+            if (old.state != new.state and new.state != commanded_mode) or any(
                 old.attributes.get(f"{action}_mode")
                 != new.attributes.get(f"{action}_mode")
                 and new.attributes.get(f"{action}_mode")
@@ -501,7 +570,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                         and entity.attributes.get("hvac_action")
                         in ("heating", "cooling")
                     )
-                    for s in self.config["systems"]
+                    for s in self.active_systems(include_inactive=True)
                 },
                 self.frozen_window,
             )
@@ -608,7 +677,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                     solar_before,
                 )
             devices = {}
-            for system in self.config["systems"]:
+            for system in self.active_systems(include_inactive=True):
                 entity_id = system["entity_id"]
                 entity = self.hass.states.get(entity_id)
                 if not entity or entity.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
@@ -628,7 +697,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             adoption = ""
             if not self.initialized:
                 if not self.restored:
-                    adoption = self.adopt_systems(devices)
+                    adoption = self.adopt_systems(self.active_devices(devices))
                 self.initialized = True
             outdoor = self.number(self.config.get("outdoor_sensor"))
             if outdoor is None:
@@ -673,6 +742,12 @@ class HouseCoordinator(DataUpdateCoordinator):
                     },
                     now.timestamp(),
                 )
+                for key in efforts:
+                    if not self.system_control.get(key, True):
+                        efforts[key] = 0
+                        self.effort.finished_segments[key] = [
+                            (now.timestamp() - duration, now.timestamp(), 0)
+                        ]
                 source_fractions, _ = self.source_effort.finish(
                     {
                         source["entity_id"]: self.source_action(source)
@@ -765,7 +840,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 self.fans.invalidate("; ".join(fan_problems))
             control_systems = [
                 {**system, "own_sensor": self.own_sensor(system)}
-                for system in self.config["systems"]
+                for system in self.active_systems()
             ]
             for system in control_systems:
                 sensor = system["own_sensor"]
@@ -798,7 +873,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 },
                 self.state,
                 readings,
-                devices,
+                self.active_devices(devices),
                 now.timestamp(),
                 outdoor,
                 self.enabled,
@@ -810,6 +885,15 @@ class HouseCoordinator(DataUpdateCoordinator):
                     for source in self.config.get("extra_heat_sources", [])
                 },
             )
+            hand = [
+                s["entity_id"]
+                for s in self.active_systems(include_inactive=True)
+                if not self.system_control.get(s["entity_id"], True)
+            ]
+            if hand:
+                decision.explanation += f" Under hand control: {', '.join(hand)}."
+                if not control_systems:
+                    decision.explanation += " Every unit is under hand control."
             decision.explanation = (
                 f"Priority mode {self.priority_mode}. " + decision.explanation
             )
@@ -834,7 +918,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             if adoption:
                 decision.explanation = f"{adoption} {decision.explanation}"
             fan_systems = {}
-            for entity_id, device in devices.items():
+            for entity_id, device in self.active_devices(devices).items():
                 entity = self.hass.states.get(entity_id)
                 attrs = entity.attributes if entity else {}
                 fan_systems[entity_id] = {
@@ -847,7 +931,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                         attrs.get("fan_modes") or [],
                         next(
                             s
-                            for s in self.config["systems"]
+                            for s in self.active_systems(include_inactive=True)
                             if s["entity_id"] == entity_id
                         ).get("quiet_max_fan"),
                         self.config.get("quiet_hours_enabled", False),
@@ -906,7 +990,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                         )
                 except HomeAssistantError as err:
                     failures.add(entity_id)
-                    self.fans.invalidate()
+                    if service in ("set_fan_mode", "set_swing_mode"):
+                        self.fans.invalidate()
                     decision.explanation += f" {entity_id}: command failed ({err})."
                     _LOGGER.warning("Command to %s failed: %s", entity_id, err)
                 finally:
@@ -940,6 +1025,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 {
                     "priority_mode": self.priority_mode,
                     "state": asdict(self.state),
+                    "system_control": self.system_control,
                     "enabled": self.enabled,
                     "fan_enabled": self.fan_enabled,
                     "learning_enabled": self.learning_enabled,
@@ -991,7 +1077,7 @@ class HouseCoordinator(DataUpdateCoordinator):
         from homeassistant.components.recorder.history import get_significant_states
 
         sensors = [s["entity_id"] for s in self.config["sensors"]]
-        systems = [s["entity_id"] for s in self.config["systems"]]
+        systems = [s["entity_id"] for s in self.active_systems(include_inactive=True)]
 
         def read():
             return (
@@ -1074,7 +1160,9 @@ class HouseCoordinator(DataUpdateCoordinator):
 
             if entity_id not in self.state.thermostats:
                 system = next(
-                    s for s in self.config["systems"] if s["entity_id"] == entity_id
+                    s
+                    for s in self.active_systems(include_inactive=True)
+                    if s["entity_id"] == entity_id
                 )
                 for recorded in sorted(states, key=lambda s: s.last_updated):
                     self.state.observe_report(

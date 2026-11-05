@@ -161,7 +161,7 @@ def test_switching_cost_and_effort_movement_enter_objective():
         "opposite_report",
     ],
 )
-def test_fixed_house_mode_never_commands_opposite_mode(mode, path):
+def test_fixed_house_mode_never_commands_opposite_mode(monkeypatch, mode, path):
     config, state, devices = setup(mode, modulating=True)
     other = "cool" if mode == "heat" else "heat"
     action = "heating" if mode == "heat" else "cooling"
@@ -172,6 +172,11 @@ def test_fixed_house_mode_never_commands_opposite_mode(mode, path):
     model = Learning(["a", "b"], ["unit"])
     if path == "excitation":
         config.update(explore_threshold=0.8, excite_after_minutes=1)
+        # Keep the unit idle under normal allocation to exercise forced excitation.
+        monkeypatch.setattr(
+            "custom_components.house_climate.controller.allocate",
+            lambda *args: ({"unit": 0}, state.setpoint),
+        )
     elif path == "held_on":
         state.observe_action("unit", action, -60)
         devices["unit"].hvac_action = action

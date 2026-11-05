@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.9 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.10 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 The setpoint is the weighted **house average**. Each pass jointly chooses how much every available system should run to bring that average to the setpoint and reduce each room's deviation from it. A 45-minute prediction uses the learned room responses, outdoor losses, extra heat sources, solar gain and drift. There are no configured room mappings or individual room targets. A shared comfort band holds starts and stops only when every weighted room is comfortable.
 
@@ -138,11 +138,17 @@ While a system's least-confident active, weighted room is below `explore_thresho
 Steady learning runs are selected by **room-level posterior uncertainty**, weighted by the
 active priority mode. Short allocator runs do not postpone them. After `excite_after_minutes`
 (default **120**) without a steady test, the most uncertain eligible system can run at full,
-constant effort for `excite_minutes` (default **60**). The other systems retain their allocated
+constant effort for `excite_minutes` (default **60**). Units already heating/cooling or
+allocated nonzero effort supply steady-test evidence through normal operation and are skipped.
+Each candidate is checked independently, so an ineligible higher-score unit does not block
+the others. The other systems retain their allocated
 efforts for the experiment; dither is suspended. Only one test runs at a time, with the normal
 cycling and House mode guards. The house must be at/below setpoint in heat (at/above in cool).
 Tests are allowed inside the comfort band, but every forecast step must keep every non-minor
-room below setpoint + half the band in heat, mirrored for cooling. A forecast breach stops
+room at/below setpoint + `test_overshoot` (default **1.5 °C**, configurable in options),
+mirrored below setpoint for cooling. A room already beyond that limit vetoes the start only
+if the forecast raises it further by more than **0.3 °C**; that allowance stays anchored to
+its starting temperature during the run. A current or forecast breach stops
 the test early, subject to minimum-run protection. Interrupted runs do not count as steady tests.
 A failed attempt waits the retry interval; a restart cancels a test and never credits downtime.
 A test times out after twice its configured duration if observed steady runtime never completes.
@@ -161,7 +167,7 @@ preserve all learned rows, their covariance, counts and saved regimes.
 Read `sensor.house_learning` for overall confidence percent (the mean across room/system pairs). Under its attributes:
 
 - `systems` → system entity → room sensor: `b` is the fixed effect in °C per full-running interval; `g` is its learned temperature slope; `h` is its delayed effect; `steady_std` is posterior uncertainty in the steady effect; `blended_b` includes the fixed-part prior blend, temperature interaction and delayed effect; `effective_effect` also applies the nonnegative heat clamp; `influence` is the nonnegative normalized control weight; `confidence` is percent; `effective_samples` is the activity count.
-- `experiments` → system entity: `uncertainty_score`, `last_steady_test` and `next_eligible` (Unix timestamps for the latter two).
+- `experiments` → system entity: `uncertainty_score`, `last_steady_test`, `next_eligible` (Unix timestamps for the latter two), and `skip_reason` (for example "running steadily", "cycling hold", "forecast above limit", "not uncertain enough", or "house above setpoint"; null when selected/eligible).
 - `sensors` → room sensor: `a` is heat loss, `c` sun gain in °C/interval/kW, `d` background drift, `fit_error` is the forgetting-weighted RMS prediction error in °C, and `samples` counts valid updates.
 
 Press `button.house_reset_learning` to clear the model and confidence back to neutral priors. It retains the house target, mode and control state and starts learning again. Adding a sensor can restart exploration while that room learns. Confidence measures runtime evidence; learning needs distinct system operation to identify separate effects.

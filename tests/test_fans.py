@@ -501,3 +501,20 @@ def test_outdoor_band_and_runtime_context_changes_keep_filtered_window():
     systems["unit"]["running"] = False
     model.tick(1800, "heat", 7, systems, {"one": 21}, {}, 21)
     assert samples(model) == 1
+
+
+def test_running_transitions_split_credit_without_interrupting_hold():
+    model = FanLearning()
+    systems = devices()
+    systems["unit"]["running"] = False
+    tick(model, systems, 0)
+    choice = model.window["choice"]
+    # Test starts and ends between scheduler passes.
+    model.running_changed("unit", 300, True)
+    model.running_changed("unit", 1200, False)
+    tick(model, systems, 1800)
+    buckets = model.arms["unit"]["fan"]
+    assert buckets["heat|0|0"][choice]["samples"] == 1
+    assert buckets["heat|0|1"][choice]["samples"] == 1
+    assert buckets["heat|0|0"][choice]["rooms"]["one"]["seconds"] == 900
+    assert buckets["heat|0|1"][choice]["rooms"]["one"]["seconds"] == 900

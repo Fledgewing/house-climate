@@ -388,6 +388,7 @@ class HouseSteps:
             ("explore_threshold", 0, 1, 0.01),
             ("excite_after_minutes", 1, 10080, 1),
             ("excite_minutes", 1, 1440, 1),
+            ("test_overshoot", 0, 5, 0.1),
         ]:
             fields[vol.Required(key, default=self.settings[key])] = number(
                 low, high, step

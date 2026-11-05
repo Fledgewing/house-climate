@@ -336,13 +336,14 @@ class FanLearning:
                 self.invalidate(
                     f"{w['system']} unavailable or selected {w['action']} mode no longer offered"
                 )
-            duration = max(0, now - w["last"])
-            for room, error in w["reward"].items():
-                stats = w["rooms"].setdefault(room, [0.0, 0.0, 0.0])
-                stats[0] += duration
-                stats[1] += duration * error
-                stats[2] += duration * error**2
-            w["last"], w["reward"] = now, sample
+            self._observe(now, sample)
+            bucket = context(mode, outdoor, device.get("running", False))
+            if bucket is not None and bucket != w["bucket"]:
+                w["segments"].setdefault(w["bucket"], {})
+                w["segments"][w["bucket"]] = w["rooms"]
+                w["bucket"] = bucket
+                self.options(w["system"], w["action"], bucket, [w["choice"]])
+                w["rooms"] = w["segments"].pop(bucket, {})
         if self.window and now - self.window["start"] < self.hold:
             w = self.window
             self.last_decision = (
@@ -353,26 +354,7 @@ class FanLearning:
             )
             return None
         if self.window:
-            w = self.window
-            if not w["dirty"]:
-                arm = self.arms[w["system"]][w["action"]][w["bucket"]][w["choice"]]
-                arm["samples"] += 1
-                for room, (seconds, error, squared) in w["rooms"].items():
-                    if not seconds:
-                        continue
-                    stats = arm["rooms"].setdefault(
-                        room, dict(seconds=0.0, mean_error=0.0, mean_squared_error=0.0)
-                    )
-                    total = stats["seconds"] + seconds
-                    stats["mean_error"] += (
-                        error - seconds * stats["mean_error"]
-                    ) / total
-                    stats["mean_squared_error"] += (
-                        squared - seconds * stats["mean_squared_error"]
-                    ) / total
-                    stats["seconds"] = total
-                arm["mean_reward"] = self.score(arm)
-            self.window = None
+            self._finish()
         restricted = [
             c
             for c in candidates
@@ -401,6 +383,65 @@ class FanLearning:
             return self._command(system, action, choice)
         return None
 
+    def _observe(self, now, sample):
+        w = self.window
+        duration = max(0, now - w["last"])
+        for room, error in w["reward"].items():
+            stats = w["rooms"].setdefault(room, [0.0, 0.0, 0.0])
+            stats[0] += duration
+            stats[1] += duration * error
+            stats[2] += duration * error**2
+        w["last"], w["reward"] = now, sample or {}
+
+    def _finish(self):
+        w = self.window
+        if not w["dirty"]:
+            segments = {**w.get("segments", {}), w["bucket"]: w["rooms"]}
+            for bucket, rooms in segments.items():
+                if not any(stats[0] for stats in rooms.values()):
+                    continue
+                arm = self.arms[w["system"]][w["action"]][bucket][w["choice"]]
+                arm["samples"] += 1
+                for room, (seconds, error, squared) in rooms.items():
+                    if not seconds:
+                        continue
+                    stats = arm["rooms"].setdefault(
+                        room, dict(seconds=0.0, mean_error=0.0, mean_squared_error=0.0)
+                    )
+                    total = stats["seconds"] + seconds
+                    stats["mean_error"] += (
+                        error - seconds * stats["mean_error"]
+                    ) / total
+                    stats["mean_squared_error"] += (
+                        squared - seconds * stats["mean_squared_error"]
+                    ) / total
+                    stats["seconds"] = total
+                arm["mean_reward"] = self.score(arm)
+        self.window = None
+
+    def running_changed(self, system, now, running):
+        """Split runtime contexts at reported transitions, including between ticks."""
+        w = self.window
+        if not w or w["system"] != system or not w["bucket"]:
+            return
+        mode, low, _ = w["bucket"].split("|")
+        bucket = f"{mode}|{low}|{int(running)}"
+        if bucket == w["bucket"]:
+            return
+        self._observe(now, w["reward"])
+        w["segments"][w["bucket"]] = w["rooms"]
+        w["bucket"] = bucket
+        self.options(system, w["action"], bucket, [w["choice"]])
+        w["rooms"] = w["segments"].pop(bucket, {})
+
+    def finish_system(self, system, now):
+        """Credit the observed part of a hold before handing a unit to its user."""
+        if self.window and self.window["system"] == system:
+            self._observe(now, {})
+            self._finish()
+        if self.resume and self.resume["system"] == system:
+            self.resume = None
+
     def _start(self, now, system, action, bucket, choice, setpoint, sample):
         self.window = dict(
             start=now,
@@ -412,6 +453,7 @@ class FanLearning:
             setpoint=setpoint,
             reward=sample or {},
             rooms={},
+            segments={},
             dirty=sample is None or bucket is None,
             reason=self.wait_reason,
         )

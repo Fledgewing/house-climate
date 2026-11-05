@@ -11,6 +11,12 @@ async def async_setup_entry(hass, entry, async_add_entities):
             FanSwitch(entry.runtime_data, entry.entry_id),
             LearningSwitch(entry.runtime_data, entry.entry_id),
             *[
+                SystemControlSwitch(
+                    entry.runtime_data, entry.entry_id, system["entity_id"]
+                )
+                for system in entry.runtime_data.active_systems(include_inactive=True)
+            ],
+            *[
                 TemporarySwitch(entry.runtime_data, entry.entry_id, sensor["entity_id"])
                 for sensor in entry.runtime_data.config["sensors"]
             ],
@@ -106,3 +112,29 @@ class TemporarySwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs):
         await self.coordinator.async_room_learning(self.sensor, "temporary", False)
+
+
+class SystemControlSwitch(CoordinatorEntity, SwitchEntity):
+    _attr_icon = "mdi:thermostat"
+    _attr_translation_key = "system_control"
+
+    def __init__(self, coordinator, entry_id, system):
+        super().__init__(coordinator)
+        self.system = system
+        object_id = system.split(".", 1)[1]
+        self._attr_unique_id = f"{entry_id}_{system}_control"
+        self.entity_id = f"switch.house_{object_id}_control"
+        entity = coordinator.hass.states.get(system)
+        self._attr_translation_placeholders = {
+            "system": entity.name if entity else object_id
+        }
+
+    @property
+    def is_on(self):
+        return self.coordinator.system_control.get(self.system, True)
+
+    async def async_turn_on(self, **kwargs):
+        await self.coordinator.async_system_control(self.system, True)
+
+    async def async_turn_off(self, **kwargs):
+        await self.coordinator.async_system_control(self.system, False)

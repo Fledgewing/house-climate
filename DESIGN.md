@@ -313,8 +313,12 @@ A missing/stale/not-reporting member with at least
 an HVAC mode switch, user house/physical
 setpoint change or fan-control toggle dirties the complete experiment. Rejected/pending
 transients do not: fan rewards use the robust filtered value, including its held anchor.
-Outdoor band and runtime context changes apply to the next selection; each hold retains
-its starting context. Events between ticks
+Outdoor band and runtime context changes split the observed moments by context within the
+same hold, preserving its deadline and crediting each context with observed seconds.
+Heating excitation/steady tests and fan/vane learning run independently, on the same unit
+or different units: neither reserves a unit from the other. House target/effort commands
+and test start, completion or early stop never dirty fan windows. Command echoes are
+recognized through pending and last commands; real user setpoint/mode changes still invalidate. Events between ticks
 latch dirtiness; recovery before a tick cannot make it train. Dirty windows retain their deadline
 but contribute no sample. Disabled house/fan control invalidates experiments and sends no fan/vane
 commands. Missing/stale/not-reporting minor members are excluded from fan rewards;
@@ -985,14 +989,19 @@ step, allowing its delayed response to continue after it stops; they never train
 
 The information score for system j is `Σ_i active_weight_i × std(b_ij + g_ij Δ_i + h_ij)`.
 Use the full posterior covariance, including cross terms, and omit rooms below
-`minor_weight_share`. Consider the highest available-system score (breaking equal-score ties by eligibility) above
+`minor_weight_share`. As of v0.5.10, choose the highest score among eligible systems above
 `(1 - explore_threshold) × PRIOR_B`; the default threshold is 0.006 °C/interval.
-If the most informative test cannot run safely or is still in cooldown, wait rather than
-starting a less informative test. Thus increasing the existing exploration setting tolerates less remaining uncertainty;
+Exclude systems already reporting heating/cooling or receiving nonzero allocated effort:
+their continuing normal runs supply steady-test evidence. Check every candidate independently;
+unavailability, missing local temperature, cooldown, cycling holds, unsafe forecasts or device
+target limits on a higher-score unit never block an eligible lower-score unit.
+Increasing the existing exploration setting tolerates less remaining uncertainty;
 zero disables exploration. Whole-system runtime confidence does not gate tests.
 Rank named rooms by their contribution to this score and name the top two in `last_decision`.
 `sensor.house_learning.experiments` exposes each score, last qualifying steady test time,
-and next eligible time. A qualifying allocator or experimental run is continuously observed
+next eligible time, and current `skip_reason` (null for a selected/eligible system). Reasons
+include "running steadily", "cycling hold", "forecast above limit", "not uncertain enough",
+and "house above setpoint" ("house below setpoint" in cool). A qualifying allocator or experimental run is continuously observed
 matching HVAC action with effort stable within 0.05 for at least `excite_minutes` (default 60).
 Short runs never reset the test clock. With no prior test, the initial observation starts the
 eligibility wait. Store retains qualifying times; restarts clear open run endpoints.
@@ -1000,8 +1009,15 @@ eligibility wait. Store retains qualifying times; restarts clear open run endpoi
 Tests require the house mean at or below setpoint in heat (at or above in cool), including
 inside the comfort band. Forecast every interval of the proposed run against the unmodified
 baseline allocation, holding other systems' allocated effort for the run. Every non-minor room
-must stay within setpoint + comfort_band/2 in heat (mirror for cool). Recheck each pass over
-the remaining run; skip/abort on breach, missing house data, mode change or unavailable unit.
+may reach setpoint + `test_overshoot` in heat (mirror below setpoint in cool).
+In v0.5.10, `test_overshoot` defaults to **1.5 °C**, tunable in options (0–5 °C).
+A room starting above that limit vetoes a start only if any forecast step would raise it
+further by more than **0.3 °C** over the run (mirror for cool). For these rooms, retain
+the starting temperature plus 0.3 °C as the ceiling throughout the test so the allowance
+cannot grow on successive passes. Rooms initially within the limit must remain within it.
+Use these same per-room ceilings for the start check, current readings and forecasts on
+every pass over the remaining run; skip/abort on breach, missing house data, mode change
+or unavailable unit. The house-average condition is unchanged.
 Cycling constraints retain precedence. One global test runs at full steady effort, with no
 dither on any system and no mode selection caused by a test. Targets track the own sensor as
 needed to retain full effort. Complete after the configured observed steady duration; interrupted
@@ -1015,3 +1031,35 @@ samples, v0.5.8 same-interval RLS learns 0.01531 °C/h; v0.5.9 learns 0.29402 °
 five-minute runs that never qualify, then verify a 60-minute constant experiment, increased D
 confidence, room safety in heat/cool, early forecast aborts, cycling, mode guards, source history,
 missing/restart coverage, horizon affinity and lossless main/challenger/library migration.
+
+
+### v0.5.10 validation
+
+Heat/cool live-shaped tests keep a higher-uncertainty M running under reported action or
+normal allocation while idle B starts with its room 1.2 °C beyond setpoint. At 2.0 °C beyond
+setpoint, a further 0.4 °C forecast vetoes B, while a 0.2 °C forecast permits it. Tests
+verify early stops and that cooldown, cycling, forecast and device-limit failures on a
+higher-score candidate do not starve another system. Options persist `test_overshoot`;
+the learning sensor exposes per-system skip reasons.
+
+The existing seeded two-day physical replay now includes the revised experiments with
+the default 1.5 °C allowance. It learns all original response coefficients within the
+unchanged 0.003 °C tolerance; day-two house mean spans 20.0777–21.2457 °C and final
+room spread is 1.0074 °C (learning disabled: 18.3733 °C). Its comfort assertions now
+allow 1.5 °C for these deliberate tests; coefficient, early convergence, exploration and
+confidence assertions remain unchanged. These are deterministic simulations.
+
+
+Each configured unit has `switch.house_<system object id>_control`, default on,
+persisted in Store and translated. Turning it off sends HVAC off once if currently
+in heat/cool, then leaves all hand changes alone. It receives no targets, presets,
+fan/vane commands or mode re-assertions. A clean fan window on that unit credits
+its observed portion and ends; other units retain their holds.
+`active_systems()` is the coordinator's common selection boundary: allocation,
+excitation/steady tests, uncertainty ranking, cycling holds, outage thermostat
+prediction and the global fan scheduler see only enabled units. Observation paths
+explicitly request all configured systems so room/device learning continues with
+the disabled unit's effort fixed at zero. Last-decision text lists disabled units
+only as under hand control, and states when every unit is under hand control.
+Re-enabling restores normal house-mode control on the next pass, with observed
+cycling clocks retained. The house thermostat and remaining units continue normally.

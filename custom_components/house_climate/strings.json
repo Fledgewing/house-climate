@@ -68,6 +68,7 @@
           "explore_threshold": "Exploration confidence threshold (0\u20131)",
           "excite_after_minutes": "Minimum time between steady tests (minutes)",
           "excite_minutes": "Steady test duration (minutes)",
+          "test_overshoot": "Steady test overshoot allowance (\u00b0C)",
           "disturbance_sigma": "Disturbance sigma (0 disables protection)",
           "disturbance_intervals": "Consecutive intervals to flag a disturbance",
           "disturbance_clear_intervals": "Clean intervals to clear a disturbance",
@@ -187,6 +188,7 @@
           "explore_threshold": "Exploration confidence threshold (0\u20131)",
           "excite_after_minutes": "Minimum time between steady tests (minutes)",
           "excite_minutes": "Steady test duration (minutes)",
+          "test_overshoot": "Steady test overshoot allowance (\u00b0C)",
           "disturbance_sigma": "Disturbance sigma (0 disables protection)",
           "disturbance_intervals": "Consecutive intervals to flag a disturbance",
           "disturbance_clear_intervals": "Clean intervals to clear a disturbance",
@@ -242,6 +244,13 @@
     "regime": {
       "title": "Room behavior has changed",
       "description": "{room} behaves differently than learned; if something changed, press Accept new normal."
+    }
+  },
+  "entity": {
+    "switch": {
+      "system_control": {
+        "name": "{system} control"
+      }
     }
   }
 }
