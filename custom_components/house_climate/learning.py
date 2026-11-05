@@ -4,6 +4,8 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from math import ceil, exp, isfinite, sqrt
 
+from .filtering import SensorFilter
+
 PRIOR_B = 0.03
 INTERACTION_PRIOR = 0.0001
 LAG_PRIOR = 0.01
@@ -46,6 +48,7 @@ class Learning:
         lag_minutes=60,
         lag_prior=LAG_PRIOR,
         window_minutes=0,
+        average_minutes=10,
     ):
         if not 0 < forgetting <= 1 or n0 <= 0:
             raise ValueError("Invalid learning parameters")
@@ -55,8 +58,13 @@ class Learning:
             raise ValueError("Invalid lag parameters")
         if not isfinite(window_minutes) or window_minutes < 0:
             raise ValueError("Invalid learning window")
+        if not isfinite(average_minutes) or average_minutes < 0:
+            raise ValueError("Invalid learning average")
         self.lag_minutes = lag_minutes
         self.window_minutes = window_minutes
+        self.average_minutes = average_minutes
+        self.context_history = []
+        self.temperature_filters = {}
         self.windows = {}
         self.lag_prior = lag_prior
         self.effort_history = []
@@ -165,6 +173,7 @@ class Learning:
         now=None,
         local_hour=None,
         observed_history=None,
+        sensor_filters=None,
     ):
         """Fit available rows; duration is elapsed/configured interval.
 
@@ -192,6 +201,12 @@ class Learning:
             self.streaks.clear()
             self.windows.clear()
             return
+        averaged = self.window_minutes and self.average_minutes
+        sensor_filters = sensor_filters or {}
+        if averaged:
+            self.context_history.append((start_time, timestamp, outdoor, solar))
+            cutoff = timestamp - (self.window_minutes + self.average_minutes) * 60
+            self.context_history = [v for v in self.context_history if v[1] > cutoff]
         interval_duration = duration
         interval_activity = activity
         for sensor, row in self.rows.items():
@@ -227,7 +242,20 @@ class Learning:
             frozen = [
                 self.lag_index(k) for k, value in enumerate(lagged) if value is None
             ]
-            if self.window_minutes:
+            if averaged:
+                integrated = self.averaged_window(
+                    sensor,
+                    sensor_filters.get(sensor),
+                    start_time,
+                    timestamp,
+                    start,
+                    end,
+                )
+                if integrated is None:
+                    continue
+                x, target, activity, frozen = integrated
+                start, end, duration = 0.0, target, 1
+            elif self.window_minutes:
                 window = self.windows.get(sensor)
                 if window is None or abs(window["end"] - start_time) > 1e-6:
                     window = {"segments": []}
@@ -330,6 +358,102 @@ class Learning:
                 frozen,
                 evidence_weight,
             )
+
+    def averaged_window(self, sensor, sensor_filter, start, end, before, after):
+        """Integrate clean spans on the trailing mean's half-span delayed clock."""
+        span = self.average_minutes * 60
+        lag = span / 2
+        width = self.window_minutes * 60
+        if sensor_filter is None:
+            sensor_filter = self.temperature_filters.setdefault(
+                sensor,
+                SensorFilter(
+                    history_minutes=self.window_minutes + self.average_minutes + 5
+                ),
+            )
+            if not sensor_filter.points:
+                sensor_filter.observe(before, start)
+            sensor_filter.observe(after, end)
+        window = self.windows.get(sensor)
+        if window is None or abs(window["end"] - start) > 1e-6:
+            window = {"start": start}
+        window["end"] = end
+        self.windows[sensor] = window
+        if end - window["start"] < width + span:
+            return None
+        left, right = end - lag - width, end - lag
+        excluded = [
+            (max(a, left), min(b, right))
+            for a, b in sensor_filter.exclusions(end)
+            if a < right and b > left
+        ]
+        if sum(b - a for a, b in excluded) > width / 4:
+            return None
+        runs = []
+        cursor = left
+        for a, b in excluded:
+            if a > cursor:
+                runs.append((cursor, a))
+            cursor = max(cursor, b)
+        if cursor < right:
+            runs.append((cursor, right))
+        count = len(self.systems) + len(self.sources)
+        x = [0.0] * (3 * count + 3)
+        target = seconds = 0.0
+        frozen = set()
+        keys = [
+            (kind, key)
+            for kind, keys in (("system", self.systems), ("source", self.sources))
+            for key in keys
+        ]
+        for a, b in runs:
+            first = sensor_filter.mean(a + lag - span, a + lag)
+            last = sensor_filter.mean(b + lag - span, b + lag)
+            if first is None or last is None:
+                return None
+            target += last - first
+            boundaries = sorted(
+                {a, b}
+                | {t for row in self.context_history for t in row[:2] if a < t < b}
+                | {t for row in self.effort_history for t in row[:2] if a < t < b}
+            )
+            for lo, hi in zip(boundaries, boundaries[1:]):
+                context = next(
+                    (v for v in self.context_history if v[0] <= lo and v[1] >= hi), None
+                )
+                if context is None:
+                    return None
+                activity = [self.past_effort(kind, key, hi, lo) for kind, key in keys]
+                if any(v is None for v in activity):
+                    return None
+                temperature = sensor_filter.mean(lo + lag - span, lo + lag)
+                if temperature is None:
+                    return None
+                delta = context[2] - temperature
+                lagged = [self.past_effort(kind, key, lo) for kind, key in keys]
+                frozen.update(
+                    self.lag_index(k) for k, v in enumerate(lagged) if v is None
+                )
+                values = [
+                    delta,
+                    *activity,
+                    *[v * delta for v in activity],
+                    *[v or 0 for v in lagged],
+                    context[3],
+                    1,
+                ]
+                for k, v in enumerate(values):
+                    x[k] += v * (hi - lo)
+                seconds += hi - lo
+        if not seconds:
+            return None
+        # Same per-control-interval units as the unsmoothed integrated model.
+        return (
+            [v / seconds for v in x],
+            target * self.interval_minutes * 60 / seconds,
+            [v / seconds for v in x[1 : count + 1]],
+            frozen,
+        )
 
     @staticmethod
     def fit_row(
@@ -530,7 +654,10 @@ class Learning:
         self.effort_history = [
             item
             for item in self.effort_history
-            if item[1] > end - self.lag_minutes * 60 - (end - start)
+            if item[1]
+            > end
+            - (self.lag_minutes + self.window_minutes + self.average_minutes) * 60
+            - (end - start)
         ]
         self.effort_clock = max(self.effort_clock, end)
 
@@ -870,6 +997,7 @@ class Learning:
             "lag_prior": self.lag_prior,
             "lag_minutes": self.lag_minutes,
             "window_minutes": self.window_minutes,
+            "average_minutes": self.average_minutes,
             "integrated_version": int(bool(self.window_minutes)),
             "effort_history": deepcopy(self.effort_history),
             "effort_clock": self.effort_clock,
@@ -914,6 +1042,7 @@ class Learning:
             lag_prior=saved.get("lag_prior", LAG_PRIOR),
             lag_minutes=saved.get("lag_minutes", 60),
             window_minutes=saved.get("window_minutes", 0),
+            average_minutes=saved.get("average_minutes", 10),
         )
 
         def load_row(data):

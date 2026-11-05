@@ -34,6 +34,7 @@
       "tunables": {
         "title": "Control settings",
         "data_description": {
+          "learning_average_minutes": "Time-weighted trailing temperature mean (default 10 minutes). Inputs are aligned half this span earlier.",
           "learning_window_minutes": "Integrate observations over 15–240 minutes (default 60). Changing this refills observation windows while preserving learned coefficients and covariances."
         },
         "description": "Temperatures are in \u00b0C. Solar power is converted to kW for online learning. PI integral gain is per control interval.",
@@ -53,6 +54,7 @@
           "kp": "Legacy proportional gain (unused)",
           "ki": "Legacy integral gain (unused)",
           "learning_window_minutes": "Learning observation window (minutes)",
+          "learning_average_minutes": "Learning temperature average (minutes)",
           "learning_forgetting": "Learning forgetting factor per sample",
           "learning_n0": "Learning prior blend sample count",
           "interaction_prior": "Temperature interaction prior covariance",
@@ -158,6 +160,7 @@
       "tunables": {
         "title": "Control settings",
         "data_description": {
+          "learning_average_minutes": "Time-weighted trailing temperature mean (default 10 minutes). Inputs are aligned half this span earlier.",
           "learning_window_minutes": "Integrate observations over 15–240 minutes (default 60). Changing this refills observation windows while preserving learned coefficients and covariances."
         },
         "description": "Temperatures are in \u00b0C. Solar power is converted to kW for online learning. PI integral gain is per control interval.",
@@ -177,6 +180,7 @@
           "kp": "Legacy proportional gain (unused)",
           "ki": "Legacy integral gain (unused)",
           "learning_window_minutes": "Learning observation window (minutes)",
+          "learning_average_minutes": "Learning temperature average (minutes)",
           "learning_forgetting": "Learning forgetting factor per sample",
           "learning_n0": "Learning prior blend sample count",
           "interaction_prior": "Temperature interaction prior covariance",

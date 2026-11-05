@@ -266,9 +266,10 @@ def test_integrated_fit_keeps_delayed_system_and_measured_source_effects():
         regime_hours=1e9,
     )
     history = [0.0] * 8
+    temperature = 20.0
     for step in range(12000):
         effort, source = float(rng.random() < 0.5), rng.random()
-        temperature, outdoor = rng.uniform(18, 23), rng.uniform(5, 15)
+        outdoor = rng.uniform(5, 15)
         response = 0.01 * (outdoor - temperature) + 0.025 * history[-8] + 0.04 * source
         model.update(
             {"room": temperature},
@@ -277,8 +278,74 @@ def test_integrated_fit_keeps_delayed_system_and_measured_source_effects():
             {"unit": effort},
             sources={"source": source},
         )
+        temperature += response
         history.append(effort)
     assert model.blended("room", "unit", 10, 20) * 12 == pytest.approx(0.3, abs=0.06)
     assert model.source_effect("room", "source", 10, 20) == pytest.approx(
         0.04, abs=0.008
     )
+
+
+def test_raw_two_minute_jitter_identifies_bryant():
+    """Replay actual interval efforts against synthetic raw report noise."""
+    model = Learning(
+        NAMES,
+        ["B", "M"],
+        interval_minutes=4,
+        window_minutes=60,
+        sources=["soleia", "papa_power", "server", "papa", "mummy"],
+    )
+    filters = {room: SensorFilter(history_minutes=80) for room in NAMES}
+    previous = {}
+    for i, row in enumerate(DATA):
+        values = {}
+        for j, room in enumerate(NAMES):
+            f = filters[room]
+            value = row[j] / 10
+            noise = 0.5 if room in ("parent", "wesley_gabriel") else 0
+            # Each 4-min exported mean becomes two 2-min last-value reports.
+            if i:
+                f.observe(DATA[i - 1][j] / 10 - noise, i * 240 - 120)
+            f.observe(value + noise, i * 240)
+            values[room] = value + noise
+            assert not f.pending
+            assert not f.rejected
+        if i:
+            model.update(
+                previous,
+                values,
+                DATA[i - 1][7] / 10,
+                {"B": row[12] / 10, "M": row[15] / 10},
+                now=i * 240,
+                sources={
+                    "soleia": row[8] / 100,
+                    "papa_power": row[9] / 100,
+                    "server": row[10] / 100,
+                    "papa": int(row[11]) // 10,
+                    "mummy": int(row[11]) % 10,
+                },
+                sensor_filters=filters,
+            )
+        previous = values
+        for f in filters.values():
+            f.finish_interval()
+    references = independent()
+    for room in ("parent", "wesley_gabriel"):
+        j = NAMES.index(room)
+        effect = model.blended(room, "B", 11, DATA[-1][j] / 10) * 15
+        count = model.rows[room].counts[0]
+        print(
+            "raw jitter",
+            room,
+            "effect C/hour",
+            effect,
+            "effective_samples",
+            count,
+            "windows",
+            model.rows[room].samples,
+            "reference",
+            references[room],
+        )
+        assert model.rows[room].samples > 100
+        assert count > 5
+        assert effect == pytest.approx(references[room], rel=0.35)

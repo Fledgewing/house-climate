@@ -325,6 +325,9 @@ async def complete_flow(
     }
     fields = {field.schema: field for field in result["data_schema"].schema}
     assert fields["stale_after"].default() == 720
+    assert fields["learning_average_minutes"].default() == 10
+    average_selector = result["data_schema"].schema[fields["learning_average_minutes"]]
+    assert average_selector.config == {"min": 1, "max": 60, "step": 1, "mode": "box"}
     window_selector = result["data_schema"].schema[fields["learning_window_minutes"]]
     assert window_selector.config == {"min": 15, "max": 240, "step": 1, "mode": "box"}
     tunables["stale_after"] = stale_after
@@ -975,8 +978,8 @@ async def test_real_house_transient_replay(hass, installed):
     assert max(temperatures) - min(temperatures) <= 0.5
     # Proportional efforts alternate adjacent target steps to avoid rounding bias.
     assert max(targets) - min(targets) <= 0.5
-    # Warmup rows learn; the cold and hot excursions add no contaminated rows.
-    assert c.learning.rows["sensor.room"].samples == 3
+    # Warmup and small jitter learn; the large excursions are still withheld.
+    assert c.learning.rows["sensor.room"].samples == 5
     assert c.learning.rows["sensor.other"].samples == 8
     attrs = hass.states.get("climate.house").attributes
     assert attrs["raw_sensor_readings"]["sensor.room"]["value"] == 22
@@ -1697,7 +1700,7 @@ async def test_major_defrost_replay_completes_fan_windows(hass, installed, freez
         for arms in buckets.values()
         for arm in arms.values()
     )
-    assert transients >= 18
+    assert transients >= 12  # Small movements now fall inside normal jitter.
     assert count - initial == 8
     assert any(
         arm["samples"] and "sensor.room" in arm["rooms"]
@@ -3117,8 +3120,37 @@ async def test_learning_window_change_preserves_saved_model(
     assert restored.learning.regimes == model.regimes
     assert not restored.learning.windows
     samples = restored.learning.rows["sensor.room"].samples
-    for _ in range(11):
+    # Refill 60 minutes plus the 10-minute endpoint averaging history.
+    for _ in range(13):
         restored.learning.update(before, after, 10, dict.fromkeys(model.systems, 1))
     assert restored.learning.rows["sensor.room"].samples == samples
     restored.learning.update(before, after, 10, dict.fromkeys(model.systems, 1))
     assert restored.learning.rows["sensor.room"].samples == samples + 1
+
+
+async def test_jitter_completes_averaged_windows_without_transient_text(
+    hass, installed
+):
+    from custom_components.house_climate.filtering import SensorFilter
+
+    c = installed[0].runtime_data
+    c.learning.window_minutes = 60
+    c.learning.average_minutes = 10
+    c.learning_baseline = None
+    c.filters["sensor.room"] = SensorFilter(history_minutes=80)
+    c.config["outdoor_sensor"] = "sensor.outdoor"
+    hass.states.async_set("sensor.outdoor", "10")
+    start = dt_util.utcnow()
+    for minute in range(0, 101, 2):
+        with patch(
+            "custom_components.house_climate.coordinator.dt_util.utcnow",
+            return_value=start + timedelta(minutes=minute),
+        ):
+            hass.states.async_set(
+                "sensor.room", str(20 + (0.5 if minute % 4 else -0.5))
+            )
+            await hass.async_block_till_done()
+            if minute % 10 == 0:
+                await c.async_tick()
+                assert "sensor transient ignored" not in c.data.explanation
+    assert c.learning.rows["sensor.room"].samples >= 3

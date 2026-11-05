@@ -52,6 +52,7 @@ DEFAULTS = {
     "ki": 0.1,
     "mean_integral_gain": 0.001,
     "learning_window_minutes": 60,
+    "learning_average_minutes": 10,
     "learning_forgetting": 0.998,
     "learning_n0": 24,
     "interaction_prior": 0.0001,

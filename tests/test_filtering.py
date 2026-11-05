@@ -75,10 +75,10 @@ def test_small_report_burst_uses_one_minute_movement_allowance():
 def test_cumulative_fast_steps_cannot_evade_rate_filter():
     f = SensorFilter()
     f.observe(22, 0)
-    for second in range(1, 8):
+    for second in range(1, 24):
         f.observe(22 + second * 0.1, second)
     assert f.pending
-    assert 22 <= f.value(10) <= 22.5
+    assert 22 <= f.value(25) <= 23.6
 
 
 def test_report_on_change_step_expires_on_passes_without_reports():
@@ -92,3 +92,37 @@ def test_report_on_change_step_expires_on_passes_without_reports():
     assert f.value(960) == 20.6
     assert not f.blocked
     assert len(f.points) == 1
+
+
+def test_learning_mean_time_weighted_quantized_step_and_old_state():
+    f = SensorFilter(saved={"points": [[0, 20]], "pending": None, "rejected": []})
+    f.observe(20.5, 120)
+    for second in range(121, 131):
+        f.observe(20.5, second)
+    assert not f.pending
+    assert f.mean(0, 600) == pytest.approx(20.4)
+    assert f.jitter >= 0.4
+    restored = SensorFilter(saved=f.to_dict())
+    assert restored.jitter == f.jitter
+    assert restored.changes == f.changes
+
+
+def test_jitter_scale_adapts_slowly_and_survives_restart():
+    f = SensorFilter(history_minutes=80)
+    for minute in range(0, 240, 2):
+        f.observe(20 + (0.6 if minute % 4 else -0.6), minute * 60)
+    assert 0.4 < f.jitter < 0.6
+    restored = SensorFilter(history_minutes=80, saved=f.to_dict())
+    assert restored.jitter == f.jitter
+    restored.observe(23, 240 * 60)
+    assert restored.pending
+    assert restored.jitter == f.jitter  # Excursions cannot inflate the noise floor.
+
+
+def test_legacy_pending_and_rejected_state_masks_learning():
+    f = SensorFilter(
+        saved={"points": [[0, 20], [60, 23]], "pending": [60, 20, 1], "rejected": []}
+    )
+    f.observe(20, 180)
+    assert f.mean(0, 300) == 20
+    assert f.exclusions(300) == [(60, 180)]

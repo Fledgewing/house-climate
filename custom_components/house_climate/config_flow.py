@@ -381,6 +381,7 @@ class HouseSteps:
             ("ki", 0, 10, 0.01),
             ("mean_integral_gain", 0, 1, 0.001),
             ("learning_window_minutes", 15, 240, 1),
+            ("learning_average_minutes", 1, 60, 1),
             ("learning_forgetting", 0.9, 1, 0.001),
             ("learning_n0", 1, 1000, 1),
             ("interaction_prior", 0.000001, 1, "any"),

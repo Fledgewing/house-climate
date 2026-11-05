@@ -68,7 +68,11 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.history_seeded = False
         self.filters = {
             m["entity_id"]: SensorFilter(
-                self.config.get("filter_minutes", 15), self.config.get("max_rate", 0.5)
+                self.config.get("filter_minutes", 15),
+                self.config.get("max_rate", 0.5),
+                history_minutes=self.config.get("learning_window_minutes", 60)
+                + self.config.get("learning_average_minutes", 10)
+                + 5,
             )
             for m in self.config["sensors"]
         }
@@ -168,6 +172,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.config.get("interaction_prior", 0.0001),
             self.config.get("lag_minutes", 60),
             self.config.get("lag_prior", 0.01),
+            average_minutes=self.config.get("learning_average_minutes", 10),
             window_minutes=self.config.get(
                 "learning_window_minutes", DEFAULTS["learning_window_minutes"]
             ),
@@ -241,12 +246,18 @@ class HouseCoordinator(DataUpdateCoordinator):
                     self.config.get("filter_minutes", 15),
                     self.config.get("max_rate", 0.5),
                     saved.get("filters", {}).get(key),
+                    history_minutes=self.config.get("learning_window_minutes", 60)
+                    + self.config.get("learning_average_minutes", 10)
+                    + 5,
                 )
             if saved.get("learning"):
                 self.learning = Learning.from_dict(
                     {
                         **saved["learning"],
                         "lag_minutes": self.config.get("lag_minutes", 60),
+                        "average_minutes": self.config.get(
+                            "learning_average_minutes", 10
+                        ),
                         "lag_prior": self.config.get("lag_prior", 0.01),
                         "window_minutes": self.config.get(
                             "learning_window_minutes",
@@ -370,6 +381,8 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.source_effort = EffortTracker()
         self.learning.streaks.clear()
         self.learning.windows.clear()
+        self.learning.context_history.clear()
+        self.learning.temperature_filters.clear()
 
     @property
     def frozen_window(self):
@@ -394,6 +407,13 @@ class HouseCoordinator(DataUpdateCoordinator):
                 sensor_filter = self.filters[entity_id] = SensorFilter(
                     self.config.get("filter_minutes", 15),
                     self.config.get("max_rate", 0.5),
+                    saved={
+                        "jitter": sensor_filter.jitter,
+                        "changes": sensor_filter.changes,
+                    },
+                    history_minutes=self.config.get("learning_window_minutes", 60)
+                    + self.config.get("learning_average_minutes", 10)
+                    + 5,
                 )
         sensor_filter.observe(value, now)
         return sensor_filter
@@ -643,6 +663,9 @@ class HouseCoordinator(DataUpdateCoordinator):
                     SensorFilter(
                         self.config.get("filter_minutes", 15),
                         self.config.get("max_rate", 0.5),
+                        history_minutes=self.config.get("learning_window_minutes", 60)
+                        + self.config.get("learning_average_minutes", 10)
+                        + 5,
                     ),
                 )
                 if (
@@ -675,11 +698,10 @@ class HouseCoordinator(DataUpdateCoordinator):
                         for key, value in baseline.items()
                         if key not in self.not_reporting
                         and (
-                            key not in self.filters
-                            or (
-                                not self.filters[key].blocked
-                                and not self.filters[key].contaminated
-                            )
+                            self.learning.window_minutes
+                            or key not in self.filters
+                            or not self.filters[key].blocked
+                            and not self.filters[key].contaminated
                         )
                     },
                     outdoor_before,
@@ -713,7 +735,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 outdoor = self.number(self.config.get("weather_entity"), "temperature")
             solar = self.solar_kw()
             # Fan rewards use the robust filter's value, including its held anchor.
-            # Pending/rejected excursions block thermal rows, not fan experiments.
+            # Learning masks excursion spans; fan rewards retain the robust value.
             fan_problems = []
             clean_values = {}
             for key, reading in readings.items():
@@ -779,7 +801,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                 learning_values = {
                     key: raw[key]["value"]
                     for key, value in clean_values.items()
-                    if not self.filters[key].blocked
+                    if self.learning.window_minutes
+                    or not self.filters[key].blocked
                     and not self.filters[key].contaminated
                 }
                 learning_values.update(
@@ -805,6 +828,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                         duration / (self.config.get("interval", 5) * 60),
                         sources=source_fractions,
                         observed_history=observed_history,
+                        sensor_filters=self.filters,
                         now=now.timestamp(),
                         local_hour=dt_util.as_local(now).hour
                         + dt_util.as_local(now).minute / 60
@@ -907,7 +931,14 @@ class HouseCoordinator(DataUpdateCoordinator):
                 f"Priority mode {self.priority_mode}. " + decision.explanation
             )
             for entity_id, sensor_filter in self.filters.items():
-                if sensor_filter.pending or sensor_filter.rejected:
+                if (
+                    sensor_filter.pending
+                    or sensor_filter.rejected
+                    or any(
+                        b is None or b > now.timestamp() - sensor_filter.window
+                        for _, b, _, _ in sensor_filter.excursions
+                    )
+                ):
                     entity = self.hass.states.get(entity_id)
                     name = entity.name if entity else entity_id
                     decision.explanation += f" {name} sensor transient ignored."

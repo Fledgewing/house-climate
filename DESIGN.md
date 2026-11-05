@@ -84,22 +84,17 @@ Every control interval, and immediately when the house setpoint or mode changes:
    (default 15 minutes); readings hold their value until the next state change.
    Capture every sensor state-change event, including events between control passes.
    Unknown/unavailable periods carry no median weight and remain unavailable at the
-   current endpoint. Control, house mean/spread and learning all use these medians;
-   the existing reporting/staleness checks still apply to the raw member.
-   A movement faster than `max_rate` (default 0.5 °C/min) opens a pending excursion,
-   immediately withholding its readings from control and learning. Returning to within
-   one minute's allowed movement of the pre-excursion value, or crossing that value,
-   within the filter window confirms a transient. Exclude its held intervals from the
-   median; name the member in `last_decision` as “sensor transient ignored”. If it
-   does not return, admit the sustained change when the window expires, evaluated
-   on every control pass even if the sensor sends no further reports. While all
-   elapsed readings are withheld, hold the pre-excursion value. This is symmetric
-   for upward/downward excursions and assumes no device type or operating cycle.
-   Skip learning rows whose interval overlaps a pending or confirmed excursion,
-   including an excursion that starts and ends between passes. Require clean endpoints
-   before resuming. Keep only the rolling event window plus its preceding value,
-   rejected intervals and pending anchor in Store for restart continuity; do not
-   archive event history. Restarts still start a fresh learning/runtime interval.
+   current endpoint. Control and house mean/spread use these medians; learning uses
+   the aligned time-weighted means described under v0.5.13 below. Reporting and
+   staleness checks still apply to the raw member.
+   Transient detection compares movement with both `max_rate` and four times a
+   sensor's learned robust jitter scale. Ordinary jitter and quantized steps remain
+   in the average. Real excursions are held out of the control median until return
+   or `filter_minutes` expiry; their exact spans remain masked for learning.
+   Short excursions do not break integrated learning windows. Missing sensor data
+   and reporting failures still break the affected window. State retains bounded
+   raw events, masks and jitter evidence for restart continuity; a restart always
+   starts a fresh learning/runtime interval.
    House temperature = weighted mean of the remaining filtered reporting sensors.
    `climate.house.raw_sensor_readings` exposes raw value, age, state and reporting
    status alongside `filtered_sensor_readings` (also the existing `sensor_readings`).
@@ -322,7 +317,7 @@ recognized through pending and last commands; real user setpoint/mode changes st
 latch dirtiness; recovery before a tick cannot make it train. Dirty windows retain their deadline
 but contribute no sample. Disabled house/fan control invalidates experiments and sends no fan/vane
 commands. Missing/stale/not-reporting minor members are excluded from fan rewards;
-transients still block their thermal learning rows while fan rewards use filtered values. Commands use `climate.set_fan_mode` / `climate.set_swing_mode` only when different.
+transients are masked by duration in thermal learning while fan rewards use filtered values. Commands use `climate.set_fan_mode` / `climate.set_swing_mode` only when different.
 Failures discard the window. Re-assert outside changes to chosen settings, restarting a full
 hold; another action's re-assertion waits for the global deadline. Outside-change notices use the
 same two-minute echo grace as targets. The required preset path remains unchanged.
@@ -1296,3 +1291,61 @@ absolute house error is 0.372406 °C versus recorded 0.271911 °C; mean room spr
 is 2.793989 °C versus recorded 2.934266 °C. The unchanged acceptance limits allow
 at most +0.2 °C for each comfort metric. The counterfactual plant and fixture
 limitations described above still apply.
+
+
+## v0.5.13: average jitter with aligned inputs
+
+`learning_average_minutes` is an options-flow tunable (1–60 minutes, default 10).
+Every integrated observation uses a time-weighted **mean**, with last reported
+values held until the next event, including quantized report-on-change sensors.
+Control retains its time-weighted median. The coordinator passes raw event filters
+to Learning instead of deleting baselines whenever `blocked`/`contaminated` is set.
+The zero-window compatibility mode retains its previous quarantine behavior.
+
+Let A be the averaging span, W the learning window, and t the current pass.
+The endpoints are means over [t−W−A,t−W] and [t−A,t]. These trailing means describe
+temperatures at approximately t−W−A/2 and t−A/2. Integrate **all** regressors over
+[t−W−A/2,t−A/2]: actual effort, measured sources, outdoor, solar, interactions,
+and the historical lag-effort term. Outdoor/solar retain their observed interval
+values; effort/source transition boundaries retain exact overlap weights. Indoor
+context uses the same aligned mean. Thus smoothing does not repeat v0.5.11's
+unaligned-median delay. Startup/reload/pause refill W+A minutes of observations;
+coefficients and covariance survive tuning/reload. Unobserved gaps never join.
+
+Per sensor, retain 31 absolute short-term deviations about the rolling ten-minute
+median. Their median estimates normal jitter, with a 0.4 °C floor and a 2% move
+toward that estimate per eligible report (reports at most five minutes apart).
+Reports outside the current excursion threshold and pending excursions cannot
+inflate this estimate. Persist the scale and bounded deviation history. Detection
+requires movement beyond **4 × jitter scale**, as well as the configured rate
+allowance (one to two minutes, capped so quiet report-on-change periods do not
+hide a new excursion). The default amplitude floor is therefore 1.6 °C, admitting
+normal ±0.5 °C alternation and ordinary quantization without pending/rejected flags
+or “sensor transient ignored” text. No sensor identity enters this logic.
+
+Retain separate learning masks after the control hold expires. A return closes
+its original mask and cannot open a false reverse excursion. Each mean omits only
+masked time and renormalizes by valid duration. The integrated target sums mean
+differences over clean spans, and regressors omit those same physical spans.
+More than W/4 total excursion time in a window withholds that observation; a
+shorter excursion does not reset its history. Pending time is conservatively
+masked too. A sustained new level can rebase after the bounded retention horizon
+(W+A+5 minutes in the coordinator); masks cannot suppress learning forever.
+Unknown/missing values remain missing rather than being imputed. Legacy saved
+filters without scale/history/masks load using the floor and migrate any existing
+pending/rejected spans. Restart baseline refresh preserves the learned scale.
+
+The raw-style night acceptance reconstructs two-minute Parent and Wesley/Gabriel
+reports from `night-1104.txt`, alternating +0.5/−0.5 °C around each exported value.
+Both complete **162** windows, with **7.653** Bryant effective samples and no jitter
+transients. Bryant steady effects at 11 °C outdoor are **1.275 / 1.659 °C/hour**,
+respectively, versus independent OLS **1.344 / 1.774** (within the existing 35%
+acceptance). A 3 °C ten-minute excursion is flagged and masked while learning
+continues; a thirty-minute excursion withholds the affected sixty-minute window.
+Additional regressions check all-input half-span alignment, last-value quantized
+means, slow noise-scale adaptation, old state loading, coordinator explanation
+text, and refill after reload. The delayed-system/source simulation now maintains
+a physically continuous temperature trajectory so averaging has meaningful time
+endpoints. The older defrost replay admits smaller movements inside the new
+jitter floor while continuing to flag its large excursions and preserve control
+and fan acceptance limits.

@@ -454,3 +454,21 @@ Annabelle 1.531 / 1.530, Wesley/Gabriel 1.709 / 1.708. Every room stays within
 with minimum run/off times of 16/12 minutes (excluding the initial off period).
 Mean absolute house error is 0.3724 °C versus 0.2719 recorded; mean room spread
 is 2.7940 °C versus 2.9343 recorded. Both remain within the existing +0.2 °C limits.
+
+
+## v0.5.13 jitter-tolerant learning
+
+Learning temperatures now use a time-weighted trailing mean (`learning_average_minutes`,
+default 10, configurable from 1–60 in options). All inputs shift earlier by half
+that span to keep temperature and effort aligned. Control keeps its robust median.
+Each sensor learns a persisted jitter scale; only movement beyond four scales
+opens a transient. Short excursions exclude their own duration; more than a
+quarter-window of excursion time withholds the observation. Quantized steps and
+ordinary jitter stay in the mean and do not produce “sensor transient ignored”.
+
+The two-minute ±0.5 °C night replay completes 162 windows for both Parent and
+Wesley/Gabriel, earning 7.653 Bryant effective samples each. Their learned Bryant
+effects are 1.275 and 1.659 °C/hour, versus independent references 1.344 and 1.774.
+Tests also cover a flagged/excluded 3 °C ten-minute spike, a discarded thirty-minute
+excursion, quantized last-value averaging, alignment, and old filter state loading.
+See DESIGN.md for timing, masks, noise-scale adaptation and acceptance details.
