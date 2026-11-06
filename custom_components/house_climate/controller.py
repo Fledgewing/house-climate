@@ -36,8 +36,9 @@ class ControlState:
     offsets: dict[str, float] = field(default_factory=dict)
     last_update: float | None = None
     last_run: dict[str, float] = field(default_factory=dict)
-    # Legacy retry timestamps remain loadable; only steady evidence gates tests.
+    # Legacy interruption timestamps remain loadable; they do not postpone tests.
     last_excite: dict[str, float] = field(default_factory=dict)
+    last_test_attempt: dict[str, float] = field(default_factory=dict)
     last_steady_test: dict[str, float] = field(default_factory=dict)
     steady_runs: dict[str, dict] = field(default_factory=dict)
     completed_runs: dict[str, dict] = field(default_factory=dict)
@@ -315,6 +316,31 @@ def cycling_hold(config, state, key, now):
     return None
 
 
+def counted_rooms(config, values):
+    """Reporting rooms with a significant share of the active priority weights."""
+    weights = {
+        m["entity_id"]: m.get("weight", 1)
+        for m in config["sensors"]
+        if isfinite(m.get("weight", 1)) and m.get("weight", 1) > 0
+    }
+    total = sum(weights.get(room, 0) for room in values)
+    return {
+        room: weights[room]
+        for room in values
+        if total > 0
+        and weights.get(room, 0) > 0
+        and weights[room] / total >= config.get("minor_weight_share", 0.05)
+    }
+
+
+def rooms_in_band(config, values, setpoint):
+    rooms = counted_rooms(config, values)
+    return bool(rooms) and all(
+        abs(values[room] - setpoint) <= config.get("comfort_band", 1) / 2
+        for room in rooms
+    )
+
+
 def effort_limits(config, state, key, now, in_band):
     hold = cycling_hold(config, state, key, now)
     if hold is None and in_band:
@@ -323,15 +349,8 @@ def effort_limits(config, state, key, now, in_band):
 
 
 def excitation_scores(config, state, values, learning, outdoor=None):
-    weights = {m["entity_id"]: m.get("weight", 1) for m in config["sensors"]}
-    total = sum(weights.get(r, 0) for r in values)
-    rooms = [
-        r
-        for r in values
-        if r in learning.rows
-        and total > 0
-        and weights.get(r, 0) / total >= config.get("minor_weight_share", 0.05)
-    ]
+    weights = counted_rooms(config, values)
+    rooms = [r for r in weights if r in learning.rows]
     scores = {}
     for key in (s["entity_id"] for s in config["systems"]):
         ranked = sorted(
@@ -377,7 +396,7 @@ def excitation_target(
     sources=None,
     allocation=None,
 ):
-    """Select one steady, informative run within forecast comfort limits."""
+    """Select a due steady run; measured room ceilings protect active tests."""
     minutes = config.get("excite_minutes", 60)
     for key, runs in state.completed_runs.items():
         for run in runs:
@@ -396,102 +415,47 @@ def excitation_target(
     wait = config.get("excite_after_minutes", 120) * 60
     for key, (score, _) in scores.items():
         last = state.last_steady_test.get(key)
-        # Only qualifying evidence postpones a test, never a failed attempt.
+        # Qualifying evidence or a measured ceiling abort postpones a test.
         eligible = (
-            last if last is not None else state.test_observed_since.get(key, now)
-        ) + wait
+            max(
+                last if last is not None else state.test_observed_since.get(key, now),
+                state.last_test_attempt.get(key, float("-inf")),
+            )
+            + wait
+        )
         state.experiment_info[key] = {
             "uncertainty_score": score,
             "last_steady_test": last,
             "next_eligible": eligible,
             "skip_reason": None,
             "blocked_by": None,
-            "blocked_forecast": None,
+            "blocked_reading": None,
             "blocked_ceiling": None,
         }
-    helps = house is not None and (
-        (mode == "heat" and house <= state.setpoint)
-        or (mode == "cool" and house >= state.setpoint)
-    )
+    rooms = counted_rooms(config, values)
     direction = 1 if mode == "heat" else -1
+    helps = mode in ("heat", "cool") and any(
+        direction * (values[room] - state.setpoint) < -config.get("comfort_band", 1) / 2
+        for room in rooms
+    )
+    room_names = {
+        m["entity_id"]: m.get("name", m["entity_id"]) for m in config["sensors"]
+    }
 
-    def safe(key, remaining):
-        efforts = dict(
-            state.excitation.get(
-                "others", allocation if allocation is not None else state.efforts
-            )
-        )
-        for other, device in devices.items():
-            if not device.available:
-                efforts[other] = state.reported_efforts.get(other, 0)
-        baseline_effort = (allocation if allocation is not None else state.efforts).get(
-            key, 0
-        )
-        efforts[key] = direction
-        systems = list(efforts)
-        tested_index = systems.index(key)
-        rooms = scores.get(key, (0, []))[1]
-        limit = config.get("test_overshoot", 1.5)
+    def measured_ceiling(key):
         initial = state.excitation.get("initial_values", values)
-        ceilings = {
-            room: (
-                direction * (initial.get(room, values[room]) - state.setpoint) + 0.3
-                if direction * (initial.get(room, values[room]) - state.setpoint)
-                > limit
-                else limit
-            )
-            for room in rooms
-        }
-        # Account for the test's predicted contribution so far as well as its
-        # remaining contribution. This keeps the 0.3 C allowance per test rather
-        # than renewing it on every pass, while unrelated drift cancels out.
-        elapsed_steps = max(
-            0,
-            ceil(
-                (now - state.excitation.get("started", now))
-                / (config.get("interval", 5) * 60)
-            ),
-        )
-        steps = max(1, ceil(remaining / config.get("interval", 5)))
-        for step in range(steps + 1):
-            for room in rooms:
-                base, effects = learning.forecast(
-                    room, values[room], systems, step, outdoor, solar, sources
+        limit = config.get("test_overshoot", 1.5)
+        for room in rooms:
+            start = direction * (initial.get(room, values[room]) - state.setpoint)
+            ceiling = max(limit, start + 0.3) if start > limit else limit
+            if direction * (values[room] - state.setpoint) > ceiling:
+                state.experiment_info[key].update(
+                    blocked_by=room,
+                    blocked_reading=values[room],
+                    blocked_ceiling=state.setpoint + direction * ceiling,
                 )
-                predicted = base + sum(b * u for b, u in zip(effects, efforts.values()))
-                # Full-horizon effort coefficient retains passive decay and
-                # delayed response across the elapsed/remaining boundary.
-                _, test_effects = learning.forecast(
-                    room,
-                    initial.get(room, values[room]),
-                    systems,
-                    elapsed_steps + step,
-                    outdoor,
-                    solar,
-                    sources,
-                )
-                increment = (
-                    direction
-                    * test_effects[tested_index]
-                    * (direction - baseline_effort)
-                )
-                forecast = direction * (predicted - state.setpoint)
-                without_test = forecast - increment
-                if forecast > ceilings[room] and (
-                    (
-                        direction * (initial.get(room, values[room]) - state.setpoint)
-                        <= limit
-                        and without_test <= ceilings[room]
-                    )
-                    or increment > 0.3
-                ):
-                    state.experiment_info[key].update(
-                        blocked_by=room,
-                        blocked_forecast=predicted,
-                        blocked_ceiling=state.setpoint + direction * ceilings[room],
-                    )
-                    return False
-        return bool(rooms)
+                return True
+        return False
 
     threshold = (1 - config.get("explore_threshold", 0.8)) * 0.03
     candidates = []
@@ -510,8 +474,8 @@ def excitation_target(
         elif mode not in ("heat", "cool"):
             reason = "inactive mode"
         elif not helps:
-            reason = (
-                "house above setpoint" if mode == "heat" else "house below setpoint"
+            reason = "no counted room needs " + (
+                "heat" if mode == "heat" else "cooling"
             )
         elif config.get("explore_threshold", 0.8) <= 0:
             reason = "exploration disabled"
@@ -523,9 +487,6 @@ def excitation_target(
             reason = "eligibility wait"
         elif state.excitation:
             reason = "another experiment running"
-        elif not safe(key, minutes):
-            room = state.experiment_info[key]["blocked_by"]
-            reason = f"forecast above limit: {room}" if room else "no test rooms"
         state.experiment_info[key]["skip_reason"] = reason
         if reason is None:
             candidates.append(key)
@@ -534,12 +495,24 @@ def excitation_target(
         key = active["system"]
         device = devices.get(key)
         state.experiment_info[key]["skip_reason"] = None
-        remaining = max(
-            config.get("interval", 5), minutes - (now - active["started"]) / 60
+        system = next(s for s in config["systems"] if s["entity_id"] == key)
+        settings = {**config, **system}
+        unsafe = mode == active["mode"] and measured_ceiling(key)
+        run_started = max(
+            (
+                clock[key]
+                for clock in (state.last_start, state.command_start)
+                if key in clock
+            ),
+            default=active["started"],
         )
-        unsafe = not safe(key, remaining)
+        can_stop = (
+            now - run_started >= settings.get("min_run_minutes", 10) * 60
+            and cycling_hold(config, state, key, now) is not True
+        )
         finished = (
-            not helps
+            not rooms
+            or (not helps and not unsafe)
             or mode != active["mode"]
             or not device
             or not device.available
@@ -547,19 +520,22 @@ def excitation_target(
             or active["runtime"] >= minutes * 60
             or state.last_steady_test.get(key, float("-inf")) >= active["started"]
             or now - active["started"] >= 2 * minutes * 60
-            or unsafe
+            or (unsafe and can_stop)
         )
         if finished:
-            # An abort remains due on the next pass. Only steady evidence earns
-            # another full eligibility period.
+            if unsafe and can_stop:
+                state.last_test_attempt[key] = now
+                state.experiment_info[key]["next_eligible"] = now + wait
+                if allocation is not None:
+                    allocation[key] = 0
             if active["runtime"] >= minutes * 60:
                 state.last_steady_test[key] = now
                 state.experiment_info[key]["last_steady_test"] = now
                 state.experiment_info[key]["next_eligible"] = now + wait
             room = state.experiment_info[key]["blocked_by"]
             state.experiment_info[key]["skip_reason"] = (
-                f"forecast above limit: {room}"
-                if unsafe and room
+                f"reading beyond test ceiling: {room_names.get(room, room)}"
+                if unsafe and can_stop and room
                 else "eligibility wait"
             )
             state.excitation = {}
@@ -755,11 +731,11 @@ def allocate(
     state=None,
     now=0,
 ):
-    """Bounded least squares for the joint horizon objective, without dependencies.
+    """Coordinate allocation for a centered band or legacy variance objective.
 
     Propagate the interval model as an affine function of constant signed effort.
-    Coordinate candidates include discrete state changes and L1 movement kinks.
-    Weights are normalized so lambda has the same meaning as the fan reward.
+    Evaluate band costs directly at discrete/grid candidates; the variance path
+    retains quadratic stationary points and normalized weights for lambda.
     """
     from .learning import PRIOR_B
 
@@ -807,6 +783,18 @@ def allocate(
         sum(w * line[j] for w, line in zip(weights, effects))
         for j in range(len(systems))
     ]
+    band = config.get("objective", "band") == "band"
+    counted = counted_rooms(config, values)
+    max_weight = max(counted.values(), default=1)
+
+    def thermal_cost(temperatures):
+        deviations = [
+            (counted[r] / max_weight, temperatures[r] - setpoint) for r in counted
+        ]
+        return max((w * abs(d) for w, d in deviations), default=0) + 0.1 * sum(
+            w * d * d for w, d in deviations
+        ) / max(1, len(deviations))
+
     penalty = config.get("average_weight", 1.0)
     # Residual rows: weighted deviations about the predicted mean and mean error.
     residual = [t - mean_base for t in base] + [mean_base - setpoint]
@@ -814,10 +802,7 @@ def allocate(
         mean_effect
     ]
     objective_weights = weights + [penalty]
-    in_band = state is not None and all(
-        abs(t - state.setpoint) <= config.get("comfort_band", 1) / 2
-        for t in values.values()
-    )
+    in_band = state is not None and rooms_in_band(config, values, state.setpoint)
     bounds = [
         effort_limits(config, state, key, now, in_band) if state else (0, 1)
         for key in systems
@@ -857,14 +842,31 @@ def allocate(
                     )
             candidates = [u for u in candidates if low <= u <= high]
             system = next(s for s in config["systems"] if s["entity_id"] == systems[j])
-            if state and not system.get("modulating", devices[systems[j]].step < 0.5):
+            if band:
+                candidates += [k / 20 for k in range(21) if low <= k / 20 <= high]
+            if (state or band) and not system.get(
+                "modulating", devices[systems[j]].step < 0.5
+            ):
                 candidates = [u for u in (0, 1) if low <= u <= high]
 
             def cost(u):
                 delta = u - efforts[j]
+                thermal = (
+                    thermal_cost(
+                        {
+                            room: base[i]
+                            + sum(
+                                effect * (u if k == j else efforts[k])
+                                for k, effect in enumerate(effects[i])
+                            )
+                            for i, room in enumerate(rooms)
+                        }
+                    )
+                    if band
+                    else curvature * delta * delta + 2 * gradient * delta
+                )
                 return (
-                    curvature * delta * delta
-                    + 2 * gradient * delta
+                    thermal
                     + switch_cost * ((u > 0) != on[j])
                     + change_cost * abs(u - previous[j])
                 )
@@ -917,6 +919,8 @@ def allocate(
                 w * (temperatures[r] - average) ** 2 for w, r in zip(weights, rooms)
             )
             objective += penalty * (average - setpoint) ** 2
+            if band:
+                objective = thermal_cost(temperatures)
             objective += sum(
                 switch_cost * ((u > 0) != running) + change_cost * abs(u - old)
                 for u, running, old in zip(candidate, on, previous)
@@ -1061,7 +1065,8 @@ def control(
     commands = []
     allocation = {}
     if values and mode in ("heat", "cool"):
-        integral = state.integrals.get("mean", 0)
+        variance = config.get("objective", "band") == "variance"
+        integral = state.integrals.get("mean", 0) if variance else 0
         allocation, predicted = allocate(
             config,
             values,
@@ -1081,7 +1086,7 @@ def control(
         # Scale gain by lambda/(1+lambda) so balance-first settings also weaken
         # mean correction rather than quietly undoing the allocator trade-off.
         average_weight = config.get("average_weight", 1.0)
-        if dt and (state.setpoint + integral - predicted) * error <= 0.05:
+        if variance and dt and (state.setpoint + integral - predicted) * error <= 0.05:
             state.integrals["mean"] = clamp(
                 integral
                 + config.get("mean_integral_gain", 0.001)
@@ -1105,6 +1110,9 @@ def control(
         sources,
         allocation,
     )
+    for info in state.experiment_info.values():
+        if (reason := info.get("skip_reason")) and reason.startswith("reading beyond"):
+            notes.append(reason + ".")
     if state.excitation:
         for key, effort in state.excitation.get("others", {}).items():
             allocation[key] = effort
@@ -1188,10 +1196,7 @@ def control(
                     effort = previous
             if (effort > 0) != (previous > 0):
                 state.effort_switches[entity_id] = now
-            in_band = all(
-                abs(t - state.setpoint) <= config.get("comfort_band", 1) / 2
-                for t in values.values()
-            )
+            in_band = rooms_in_band(config, values, state.setpoint)
             low, high = effort_limits(
                 config, state, entity_id, now, in_band and not state.excitation
             )
@@ -1234,34 +1239,37 @@ def control(
                 for r in values
             }
             weights = {m["entity_id"]: m.get("weight", 1) for m in members}
-            total = sum(weights[r] for r in values)
-            named = [
-                r
-                for r in values
-                if weights[r] / total >= config.get("minor_weight_share", 0.05)
-            ]
+            named = counted_rooms(config, values)
+            center = (
+                state.setpoint if config.get("objective", "band") == "band" else house
+            )
+            reference = (
+                "the setpoint"
+                if config.get("objective", "band") == "band"
+                else "the average"
+            )
             helped = sorted(
-                (r for r in named if direction * (house - values[r]) > 0),
-                key=lambda r: weights[r] * reach[r] * abs(house - values[r]),
+                (r for r in named if direction * (center - values[r]) > 0),
+                key=lambda r: weights[r] * reach[r] * abs(center - values[r]),
                 reverse=True,
             )
             above = max(
                 named,
-                key=lambda r: weights[r] * direction * (values[r] - house),
+                key=lambda r: weights[r] * direction * (values[r] - center),
                 default=None,
             )
             action = "on" if effort > 0 else "low"
             notes.append(
                 f"{device.name or entity_id} {action} (effort {effort:.2f}): "
                 + (
-                    f"{'lifts' if mode == 'heat' else 'cools'} {', '.join(room_names[r] for r in helped)} toward the average; "
+                    f"{'lifts' if mode == 'heat' else 'cools'} {', '.join(room_names[r] for r in helped)} toward {reference}; "
                     if helped and effort > 0
                     else f"limits {'heat' if mode == 'heat' else 'cooling'} into {room_names[above]}; "
                     if above is not None
-                    else "balances the house average. "
+                    else f"balances rooms around {reference}. "
                 )
                 + (
-                    f"{room_names[above]} is {abs(values[above] - house):.2f} °C {'above' if mode == 'heat' else 'below'} the average."
+                    f"{room_names[above]} is {abs(values[above] - center):.2f} °C {'above' if mode == 'heat' else 'below'} {reference}."
                     if above is not None
                     else ""
                 )
@@ -1297,10 +1305,7 @@ def control(
             hold = cycling_hold(config, state, entity_id, now)
             if house is None and entity_id in state.unrequested_starts:
                 hold = False
-            in_band = bool(values) and all(
-                abs(t - state.setpoint) <= config.get("comfort_band", 1) / 2
-                for t in values.values()
-            )
+            in_band = rooms_in_band(config, values, state.setpoint)
             required = hold
             if required is None and in_band and not state.excitation:
                 required = state.demand_on(entity_id)

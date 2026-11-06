@@ -155,10 +155,7 @@ def test_excitation_conditions(reason):
     result = tick(parts, 7200, **kwargs)
     if reason == "disabled":
         assert not result.commands
-    if reason == "equal":
-        assert state.excitation  # Equality is eligible under the v0.5.9 safety gate.
-    else:
-        assert not state.excitation
+    assert not state.excitation  # In-band equality does not need a test.
 
 
 @pytest.mark.parametrize("mode,local,expected", [("heat", 26, 29), ("cool", 18, 15)])
@@ -208,6 +205,9 @@ def test_timeout_abort_retries_without_postponing_evidence_and_persistence():
     assert state.excitation
     readings["cold"] = Reading(25)
     tick(parts, 18700)
+    assert state.excitation
+    state.pending_start.clear()
+    tick(parts, 19200)
     assert not state.excitation
 
 
@@ -366,115 +366,26 @@ def test_late_sensor_two_day_regression():
 
 
 @pytest.mark.parametrize("mode", ["heat", "cool"])
-def test_safety_ignores_passive_drift_but_reports_test_heated_room(mode):
+def test_measured_drift_aborts_at_anchored_ceiling(mode):
     direction = 1 if mode == "heat" else -1
-    rooms = ["sensor.office", "sensor.warm", "sensor.cold"]
-    config = {
-        "systems": [{"entity_id": "unit"}],
-        "sensors": [{"entity_id": r} for r in rooms],
-    }
-    state = ControlState(
-        mode=mode, active_mode=mode, setpoint=22, test_observed_since={"unit": 0}
-    )
-    model = Learning(rooms, ["unit"])
-    for room, rate in zip(rooms, [0.007, 0.1, 0.1]):
-        row = model.rows[room]
-        row.counts = [1e9]
-        row.theta[1] = rate / 12
-    model.rows[rooms[0]].theta[-1] = direction * 0.36 / 12
-    devices = {"unit": Device(mode=mode, current_temperature=22, hvac_action="idle")}
-    values = dict(
-        zip(rooms, [22 + direction * 3.7, 22 + direction * 1.2, 22 - direction * 3])
-    )
-    excitation_target(
-        config,
-        state,
-        devices,
-        values,
-        22 - direction * 0.4,
-        mode,
-        7200,
-        model,
-        allocation={"unit": 0},
-    )
-    assert state.excitation["system"] == "unit"
-    assert state.experiment_info["unit"]["blocked_by"] is None
-    # Its observed independent drift can also carry it beyond the anchored
-    # ceiling during the test without attributing that movement to the unit.
-    values[rooms[0]] += direction * 0.4
-    excitation_target(
-        config,
-        state,
-        devices,
-        values,
-        22 - direction * 0.4,
-        mode,
-        7300,
-        model,
-        allocation={"unit": 0},
-    )
-    assert state.excitation["system"] == "unit"
-    # Still protect a room whose crossing is actually caused by this test.
-    state.excitation.clear()
-    model.rows[rooms[1]].theta[1] = 0.6 / 12
-    excitation_target(
-        config,
-        state,
-        devices,
-        values,
-        22 - direction * 0.4,
-        mode,
-        7500,
-        model,
-        allocation={"unit": 0},
-    )
+    config, state, model, devices, _ = setup(mode)
+    state.test_observed_since = dict.fromkeys(devices, 0)
+    values = {"warm": 22.5 + direction * 3.7, "cold": 22.5 - direction * 3}
+    excitation_target(config, state, devices, values, 22, mode, 7200, model)
+    key = state.excitation["system"]
+    # Even passive drift is measured against the fixed starting ceiling.
+    values["warm"] += direction * 0.4
+    excitation_target(config, state, devices, values, 22, mode, 7300, model)
+    assert state.excitation  # Minimum run first.
+    excitation_target(config, state, devices, values, 22, mode, 7800, model)
     assert not state.excitation
-    info = state.experiment_info["unit"]
-    assert info["blocked_by"] == rooms[1]
-    assert direction * (info["blocked_forecast"] - info["blocked_ceiling"]) > 0
-    assert rooms[1] in info["skip_reason"]
-    assert info["next_eligible"] == 7200
-    model.rows[rooms[1]].theta[1] = 0.1 / 12
-    excitation_target(
-        config,
-        state,
-        devices,
-        values,
-        22 - direction * 0.4,
-        mode,
-        7800,
-        model,
-        allocation={"unit": 0},
-    )
-    assert state.excitation["system"] == "unit"
-    # Abort is immediately retryable too, without resetting the evidence clock.
-    model.rows[rooms[1]].theta[1] = 0.6 / 12
-    excitation_target(
-        config,
-        state,
-        devices,
-        values,
-        22 - direction * 0.4,
-        mode,
-        8100,
-        model,
-        allocation={"unit": 0},
-    )
-    assert not state.excitation
-    assert state.experiment_info["unit"]["next_eligible"] == 7200
-    model.rows[rooms[1]].theta[1] = 0.1 / 12
-    excitation_target(
-        config,
-        state,
-        devices,
-        values,
-        22 - direction * 0.4,
-        mode,
-        8400,
-        model,
-        allocation={"unit": 0},
-    )
-    assert state.excitation["system"] == "unit"
+    info = state.experiment_info[key]
+    assert info["blocked_by"] == "warm"
+    assert info["blocked_reading"] == values["warm"]
+    assert info["blocked_ceiling"] == pytest.approx(22.5 + direction * 4)
+    assert info["next_eligible"] == 15000
+    excitation_target(config, state, {key: devices[key]}, values, 22, mode, 8100, model)
+    assert state.experiment_info[key]["skip_reason"] == "eligibility wait"
 
 
 @pytest.mark.parametrize("mode", ["heat", "cool"])
@@ -482,6 +393,7 @@ def test_balance_veto_cannot_starve_two_full_steady_tests(mode):
     direction = 1 if mode == "heat" else -1
     rooms = ["warm", "cold"]
     config = {
+        "objective": "variance",
         "systems": [{"entity_id": "unit"}],
         "sensors": [{"entity_id": r} for r in rooms],
         "average_weight": 0.01,
@@ -559,6 +471,7 @@ def test_november_5_1914_bryant_replay():
     rooms = [f"sensor.{r}" for r in temperatures]
     unit = "climate.home_zone_1"
     config = {
+        "objective": "variance",
         "systems": [{"entity_id": unit}],
         "sensors": [{"entity_id": r} for r in rooms],
         "average_weight": 0.01,
@@ -597,7 +510,7 @@ def test_november_5_1914_bryant_replay():
     assert "testing" in result.explanation
 
 
-def test_active_safety_uses_current_normal_allocation():
+def test_forecast_changes_do_not_abort_without_measured_crossing():
     config, state, model, devices, _ = setup()
     config["systems"] = [{"entity_id": "a"}]
     state.test_observed_since["a"] = 0
@@ -609,11 +522,9 @@ def test_active_safety_uses_current_normal_allocation():
         config, state, devices, values, 20, "heat", 7200, model, allocation={"a": 1}
     )
     assert state.excitation
-    # If normal control subsequently stops, the continuing test adds heat and
-    # must pass safety again, rather than keeping its initial exemption.
+    # A changed forecast/allocation cannot abort without a measured crossing.
     excitation_target(
         config, state, devices, values, 20, "heat", 7500, model, allocation={"a": 0}
     )
-    assert not state.excitation
-    assert state.experiment_info["a"]["blocked_by"] == "warm"
-    assert state.experiment_info["a"]["next_eligible"] == 7200
+    assert state.excitation
+    assert state.experiment_info["a"]["blocked_by"] is None

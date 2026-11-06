@@ -103,16 +103,26 @@ Every control interval, and immediately when the house setpoint or mode changes:
    keep the current mode; never switch sooner than the minimum time in a mode. Outdoor temperature
    vetoes nonsense: no cooling when outdoors is below 10 °C, no heating when above 24 °C
    (both tunable). Every system gets the same mode. `off` turns every system off.
-3. Joint allocation. The House setpoint S is the weighted house **average**. Minimize
-   each room's deviation from that average and the average's error from S together:
+3. Joint allocation. The House setpoint S is the explicit center of the default
+   `objective: "band"`. Count only reporting rooms in the active priority mode whose
+   weight share is at least `minor_weight_share` (default 5%). Let q_i = w_i / w_max
+   over those counted rooms, and n be their count. Minimize:
 
-   `J(u) = Σ_i w_i (T_hat_i − T_hat_mean)² + λ (T_hat_mean − S)²
+   `B(u) = max_i q_i |T_hat_i − S| + 0.1 × Σ_i q_i (T_hat_i − S)² / n
    + switch_penalty × Σ_j 1[on(u_j) ≠ committed_on_j]
    + effort_change_penalty × Σ_j |u_j − previous_u_j|`.
 
-   Normalize the active positive room weights to sum to one. Use `average_weight`
-   for λ (default 1, options 0.01–10), independently of the fan override. Lower λ
-   prioritizes spread and deliberately permits a mean below S in heating. `learning.forecast` propagates each interval model
+   The first term is the smallest weighted band centered on S that holds the counted
+   forecasts. The squared term breaks close ties; switching and effort movement
+   retain their existing costs. Minor rooms still contribute to house mean/spread
+   reporting and learning, but cannot widen this band or defeat the comfort hold.
+
+   Options also offer `objective: "variance"`, retaining the previous objective:
+   `J(u) = Σ_i w_i (T_hat_i − T_hat_mean)² + λ (T_hat_mean − S)²`
+   plus the same switching and movement costs. For J, normalize all active positive
+   weights to sum to one and use `average_weight` for λ (default 1, options 0.01–10).
+   Lower λ prioritizes spread and permits a mean below S in heating. The fan override
+   remains independent. `learning.forecast` propagates each interval model
    `ΔT_i = a_i Δ_i + Σ_j (b_ij + g_ij Δ_i) u_j + Σ_k (e_ik + g_ik Δ_i) source_k + c_i solar + d_i`
    to the horizon (default 45 minutes), holding current outdoor, source states and solar
    constant. Here Δ_i is outdoor minus the room temperature at the start of the horizon.
@@ -122,27 +132,31 @@ Every control interval, and immediately when the house setpoint or mode changes:
    each system's room effects. Without learning, use the same neutral b prior for every pair.
    No room mappings, individual room targets or overshoot ceilings enter the objective.
 
-   Solve the small constrained problem using up to 200 cyclic coordinate minimizations,
-   stopping when effort changes fall below 1e-9. Each coordinate evaluates zero, feasible
-   endpoints, the previous effort and the quadratic stationary points on either side of
-   the absolute-movement kink. The switch cost makes the objective nonconvex; this is a
-   coordinate solution, not a claim of global mixed-discrete optimality. Heat efforts are
-   0..1; cool efforts −1..0. Without control state, `allocate` retains the original pure
-   convex thermal objective for independent forecasting and grid validation.
+   Solve using up to 200 cyclic coordinate minimizations, stopping when effort
+   changes fall below 1e-9. Evaluate the band cost directly at candidate efforts.
+   On/off units consider 0 and 1; modulating units consider feasible endpoints,
+   previous effort, the existing quadratic stationary candidates and a 0.05 grid.
+   J retains its quadratic stationary points on either side of the movement kink.
+   The switch cost makes this a coordinate solution, not a claim of global
+   mixed-discrete optimality. Heat efforts are 0..1; cool efforts −1..0. Without
+   control state, switching/movement costs are absent; J retains its original
+   continuous convex forecasting path. Outage rollouts evaluate the selected
+   objective against each candidate's simulated thermostat trajectory.
 
    A commanded or reported running unit inside `min_run_minutes` has magnitude at least 0.001;
    an idle unit inside `min_off_minutes` or at `max_starts_per_hour` has magnitude zero.
-   Starts expire from the rolling window exactly one hour later. If every used,
-   positive-weight filtered reading is inside setpoint ± `comfort_band/2`, retain the
-   committed on/off state as another allocation bound. Otherwise leave state changes to J,
+   Starts expire from the rolling window exactly one hour later. If every counted
+   room's filtered reading is inside setpoint ± `comfort_band/2`, retain the
+   committed on/off state as another allocation bound. Otherwise leave state changes to the selected objective,
    even when the average itself is comfortable. This band never selects heat/cool mode.
    A system with a fine target step (<0.5 °C by default) can modulate; otherwise evaluate
    only full-on/off efforts. Per-system `modulating` overrides that heuristic.
    Unavailable systems have no variable. With no learned positive reach, the thermal objective cannot justify a new start;
    cycling/comfort holds and the state-change cost still apply to a running actuator.
 
-   A single persisted mean-error integral biases S by at most ±1 °C. Its separate
-   `mean_integral_gain` defaults to 0.001 per scheduled interval, multiplied by
+   Under `variance` only, a persisted mean-error integral biases S by at most ±1 °C.
+   The band objective neither applies nor updates this bias because S is explicit.
+   The variance objective's separate `mean_integral_gain` defaults to 0.001 per scheduled interval, multiplied by
    `average_weight / (1 + average_weight)`; immediate requests do not integrate.
    This smooth gain scaling weakens mean correction along with the mean objective
    (effective gain 0.0005 at λ=1, 0.000167 at λ=0.2). It does not alone eliminate
@@ -179,12 +193,13 @@ Every control interval, and immediately when the house setpoint or mode changes:
    from demand. Inactivity excitation still applies, bounded in effort/device space.
 
    `last_decision` names each system's on/low effort, the rooms its learned reach can lift/cool
-   toward the average, and the room above/below that average driving restraint. Room and device
+   toward the setpoint (the mean under `variance`), and the room above/below that
+   reference driving restraint. Room and device
    friendly names are used when available; the implementation contains no house-specific names.
    In v0.5.7, explanation room names use active-priority weights: rank the restraining
    room by weight × directional deviation, and helped rooms by weight × reach × deviation.
    Never name rooms whose share of the available objective weights is below
-   `minor_weight_share`. This changes text only, with no effect on allocation.
+   `minor_weight_share`. For the band objective these same counted rooms also determine allocation and comfort holds.
 4. Run the fan/vane scheduler described below, adding at most one changed fan/vane command.
    Write only what changed: `climate.set_hvac_mode`, then `climate.set_temperature`. For a system with a
    configured required preset, re-assert that preset if it has left it.
@@ -999,70 +1014,72 @@ The information score for system j is `Σ_i active_weight_i × std(b_ij + g_ij �
 Use the full posterior covariance, including cross terms, and omit rooms below
 `minor_weight_share`. As of v0.5.10, choose the highest score among eligible systems above
 `(1 - explore_threshold) × PRIOR_B`; the default threshold is 0.006 °C/interval.
-As of v0.5.14, only a qualifying steady normal run postpones eligibility. A short
-reported run or nonzero allocation cannot veto a due test. Prefer idle candidates when
-several are due, then rank by uncertainty. Check every candidate independently;
-unavailability, missing local temperature, cooldown, cycling holds, unsafe forecasts or device
-target limits on a higher-score unit never block an eligible lower-score unit.
-Increasing the existing exploration setting tolerates less remaining uncertainty;
-zero disables exploration. Whole-system runtime confidence does not gate tests.
-Rank named rooms by their contribution to this score and name the top two in `last_decision`.
-`sensor.house_learning.experiments` exposes each score, last qualifying steady test time,
-next eligible time, and current `skip_reason` (null for a selected/eligible system). Reasons
-include "cycling hold", "forecast above limit: <room entity ID>", "not uncertain enough",
-and "house above setpoint" ("house below setpoint" in cool). A qualifying allocator or experimental run is continuously observed
-matching HVAC action with effort stable within 0.05 for at least `excite_minutes` (default 60).
-Short runs never reset the test clock. With no prior test, the initial observation starts the
-eligibility wait. Store retains qualifying times; restarts clear open run endpoints.
+As of v0.5.18, qualifying steady normal runs and measured ceiling aborts postpone
+eligibility. A short reported run or nonzero allocation cannot veto a due test.
+Prefer idle candidates when several are due, then rank by uncertainty. Check each
+candidate independently; hand control, unavailability, missing local temperature,
+cycling protection, mode and device target limits still apply. Failed starts remain
+due on the next pass. Increasing the existing exploration setting tolerates less
+remaining uncertainty; zero disables exploration. Whole-system runtime confidence
+does not gate tests. Rank named rooms by their score contribution and name the top
+two in `last_decision`.
 
-Tests require the house mean at or below setpoint in heat (at or above in cool), including
-inside the comfort band. Forecast every interval of the proposed run against the unmodified
-baseline allocation, holding other systems' allocated effort for the run. Every non-minor room
-may reach setpoint + `test_overshoot` in heat (mirror below setpoint in cool).
-In v0.5.10, `test_overshoot` defaults to **1.5 °C**, tunable in options (0–5 °C).
-As of v0.5.14, compare the full-test forecast to the counterfactual with the tested unit
-at its current normal allocated effort, before test overrides. Other units, sources and passive drift are identical.
-Keep the original ceiling for a room within the limit; an initially overheated room's
-ceiling is its starting temperature plus 0.3 °C (mirror for cool). If the test forecast
-exceeds that ceiling, veto when the test causes a crossing from an otherwise safe baseline.
-For an initially overheated room, or one whose baseline is already beyond its ceiling,
-veto only when the test's own directional contribution exceeds 0.3 °C over the test.
-Thus unrelated drift and existing overshoot cannot veto a unit with negligible reach.
+Tests require a counted room outside setpoint ± `comfort_band/2` on the helpful side
+of the current mode: below the lower edge in heat, above the upper edge in cool.
+A comfortable mean cannot prevent a test for a cold/hot counted outlier. Inside the
+band, retain the committed on/off state without starting an experiment. Outside it,
+a due uncertain unit receives a full `excite_minutes` test (default 60 minutes) even
+when allocation is zero. The normal wait is `excite_after_minutes` (default 120).
+One global test runs at a time. A qualifying allocator or experimental run requires
+matching reported HVAC action with effort stable within 0.05 for the full duration.
+Short runs never reset that evidence clock. With no prior test, initial observation
+starts the wait. Restarts clear open run endpoints and retain eligibility clocks.
 
-At each pass, forecast every remaining interval, including the current endpoint. Compute
-the directional test increment using the full elapsed-plus-remaining horizon coefficient
-from the starting temperature, multiplied by full test effort minus the current normal
-allocation. This retains passive decay and delayed response across the elapsed/remaining
-boundary and prevents renewing the allowance each pass. Recheck against the current
-normal allocation so a start at full normal effort cannot retain an exemption after the
-allocator drops to zero. The forecast is affine in efforts; passive terms and all other
-efforts cancel in the counterfactual difference. Expose `blocked_by`
-(room entity ID), `blocked_forecast` and `blocked_ceiling` (absolute °C) in each system's
-`experiments` attributes, clearing them when no room blocks. Name the room in `skip_reason`.
+Forecasts cannot refuse a test start or abort an active test. Instead compare each
+counted room's **filtered measured reading** with its anchored ceiling on every pass.
+The heat ceiling is S + `test_overshoot` (default 1.5 °C); a room already above that
+at test start gets its starting reading + 0.3 °C. Mirror both rules for cooling.
+Only a strict measured crossing aborts, regardless of predicted contribution or
+passive drift. Do not abort before the unit's configured minimum run, including
+later reported starts and cycling protection. Stop the tested unit on the abort pass.
+After such an abort, record `last_test_attempt` separately from qualifying steady
+evidence and set `next_eligible = abort_time + excite_after_minutes`. This persisted
+clock prevents immediate repeat attempts. An unstarted test or other interruption
+without qualifying evidence remains due. The existing two-duration wall timeout
+bounds attempts without enough reported steady runtime. Learning continues to use
+reported action, including a thermostat finishing its own run after an off request.
+
+`sensor.house_learning.experiments` exposes each uncertainty score, last qualifying
+steady test, next eligible time and `skip_reason`. Measured aborts include `blocked_by`
+(room entity ID), `blocked_reading` (renamed from `blocked_forecast`) and
+`blocked_ceiling` (absolute °C). `skip_reason` and `last_decision` name the friendly
+room, for example “reading beyond test ceiling: Parent Room”. Other reasons include
+“cycling hold”, “not uncertain enough” and “no counted room needs heat” (cooling mirrored).
 
 Cycling constraints retain precedence. One global test runs at full steady effort, with no
-dither on any system and no mode selection caused by a test. A due test overrides balance
-allocation and comfort holds; hand control, availability, mode, house demand and safety
+dither on any system and no mode selection caused by a test. A due test outside the comfort band overrides balance
+allocation; hand control, availability, mode, house demand and safety
 still gate operation. Targets track the own sensor as needed to retain full effort.
 Complete after the configured observed steady duration; interrupted runtime does not
 accumulate across stops. A two-duration wall timeout bounds failed attempts.
 
-Eligibility is the last qualifying steady evidence time (or initial observation if none)
-plus `excite_after_minutes`. Legacy `last_excite` retry timestamps no longer affect it.
-Skipped, aborted, timed-out, disabled or restart-cancelled tests remain due, with a safety
-retry on the next pass. Only qualifying evidence earns a new full wait. No system or room
-identities enter this policy.
+Eligibility is the later of the last measured ceiling attempt and the last qualifying
+steady evidence time (or initial observation if none), plus `excite_after_minutes`.
+Legacy `last_excite` interruption timestamps do not affect it. Skipped, timed-out,
+disabled or restart-cancelled tests without qualifying evidence remain due. A measured
+ceiling abort after minimum run earns a new wait. No system or room identities enter
+this policy.
 
 The seeded delayed-house regression uses independent on/off efforts, a pure eight-interval
 (40-minute) transport delay, and true steady response 0.300 °C/h. After 12,000 five-minute
 samples, v0.5.8 same-interval RLS learns 0.01531 °C/h; v0.5.9 learns 0.29402 °C/h. Its
 120-minute forecast makes the allocator use A for D. Separate controller tests create repeated
 five-minute runs that never qualify, then verify a 60-minute constant experiment, increased D
-confidence, room safety in heat/cool, early forecast aborts, cycling, mode guards, source history,
+confidence, room safety in heat/cool, measured ceiling aborts, cycling, mode guards, source history,
 missing/restart coverage, horizon affinity and lossless main/challenger/library migration.
 
 
-### v0.5.10 validation
+### v0.5.10 validation (historical forecast gates, superseded by v0.5.18)
 
 Heat/cool live-shaped tests keep a higher-uncertainty M running under reported action or
 normal allocation while idle B starts with its room 1.2 °C beyond setpoint. At 2.0 °C beyond
@@ -1120,7 +1137,7 @@ Explicit House off remains an immediate override.
 
 The hysteresis rule is now stable across delayed reports: keep the committed
 command unless the forecast objective improves by more than `switch_penalty`
-(default 0.05 °C²) plus the L1 movement cost. If every weighted room is inside
+(default 0.05 °C²) plus the L1 movement cost. If every counted room is inside
 setpoint ± comfort_band/2, keep that command regardless of forecast preference.
 Run/off/quota constraints override both rules and are re-applied after excitation,
 feedback, dither and target rounding. No larger arbitrary switch penalty is needed.
@@ -1387,6 +1404,9 @@ and fan acceptance limits.
 
 ## v0.5.14: tests must supply evidence without unrelated room vetoes
 
+The forecast veto and immediate safety retry described here are historical;
+v0.5.18 replaces them with measured ceilings and attempt cooldowns above.
+
 Regression tests mirror safety checks in heat/cool: a room 3.7 °C beyond setpoint with
 0.007 °C/hour unit reach and independent upward drift permits a test, while a strongly
 warmed room crossing its ceiling records the room and forecast. Safety skips and aborts
@@ -1474,3 +1494,29 @@ one continuous run of at least ten minutes, no on/off/on, and refreshed 3 °C
 clearance. Further tests cover both modulating overrides, away rounding, device
 limits, steady-test targets and twenty minutes of protected run completion with
 unchanged start counts and no commands, followed by a true unrequested start.
+
+
+## v0.5.18: centered band and measured test ceilings
+
+The owner's rule is: "I want the lowest temperature range across the house centered on my chosen
+temperature. If we're there then fine, do nothing. Otherwise it has to test."
+The default objective is now `band`; the previous J remains selectable as `variance`.
+Counted rooms consistently govern the objective, comfort hold and experiment demand/safety.
+A minor Office reading cannot defeat the hold or block a test. Experiments start without
+forecast refusal, and measured ceiling aborts after minimum run consume that period's attempt.
+
+`tests/test_band.py` reconstructs the November 6 13:03 heat snapshot and its cool mirror.
+The supplied snapshot gives a confidence range, not individual counts, passive coefficients
+or lag history. The fixture explicitly assumes confidence 6/4/4/12/2/2% for
+Living/Downstairs/Guest/Parent/Annabelle/Wesley-Gabriel, zero passive/lag terms, and
+unobserved minor Office/own rows. It retains the existing optimistic system-mean blend.
+The 45-minute counted weighted maximum deviation is **1.67000 °C off** versus
+**1.56232 °C on**: band requests Bryant on; variance requests off. This is a conditional
+reconstruction, not the exact saved live forecast. Applying the supplied raw effects
+without confidence blending instead gives **2.01250 °C on**, so those raw rates alone
+do not imply the requested allocation. Another confidence assignment within the supplied
+2–12% range gives 1.86524 °C on and chooses off, confirming that the range alone cannot
+recover the live decision. Separate regressions record both distinctions.
+The due experiment starts in either case despite Parent's >23.5 °C forecast, waits
+through minimum run and aborts only on a filtered reading strictly past 23.5 °C
+(mirrored at 20.5 °C in cool), with another 120-minute wait.

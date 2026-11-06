@@ -127,6 +127,7 @@ def simulate(enabled=True):
     """
     rng = random.Random(742)
     config = {
+        "objective": "variance",
         # Keep this thermal-learning benchmark at its original effective mean gain:
         # lambda=1 now multiplies the configured gain by 1/2.
         "mean_integral_gain": 0.002,
@@ -281,7 +282,7 @@ def test_learned_error_uses_sensor_weights_and_preserves_safeguards():
     assert state.efforts["one"] > state.efforts["two"]
     assert state.offsets["one"] > 0
     assert state.offsets["two"] < 0
-    assert "lifts cold toward the average" in decision.explanation
+    assert "lifts cold toward the setpoint" in decision.explanation
     assert "warm is" in decision.explanation
     for step in range(1, 30):
         control(config, state, readings, devices, step * 300, learning=model)

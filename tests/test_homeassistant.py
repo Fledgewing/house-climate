@@ -304,6 +304,7 @@ async def complete_flow(
     average_weight=1.0,
     fan_reward_lambda=None,
     test_overshoot=1.5,
+    objective="band",
 ):
     result = await manager.async_configure(
         result["flow_id"], {"sensors": sensors, "systems": systems}
@@ -324,6 +325,9 @@ async def complete_flow(
         if k not in ("sensors", "systems", "extra_heat_sources") and v not in ("", None)
     }
     fields = {field.schema: field for field in result["data_schema"].schema}
+    assert fields["objective"].default() == "band"
+    objective_selector = result["data_schema"].schema[fields["objective"]]
+    assert objective_selector.config["options"] == ["band", "variance"]
     assert fields["on_margin"].default() == 3.0
     assert fields["off_margin"].default() == 3.0
     assert fields["stale_after"].default() == 720
@@ -334,6 +338,7 @@ async def complete_flow(
     assert window_selector.config == {"min": 15, "max": 240, "step": 1, "mode": "box"}
     tunables["stale_after"] = stale_after
     tunables["test_overshoot"] = test_overshoot
+    tunables["objective"] = objective
     tunables["average_weight"] = average_weight
     if fan_reward_lambda is not None:
         tunables["fan_reward_lambda"] = fan_reward_lambda
@@ -362,6 +367,7 @@ async def test_config_flow_creates_entry(hass):
                 "occupancy_sensor",
             )
         )
+        assert result["data"]["objective"] == "band"
         assert result["data"]["average_weight"] == 1.0
         assert result["data"]["fan_reward_lambda"] is None
         assert len(result["data"]["systems"]) == 3
@@ -386,6 +392,7 @@ async def test_options_add_remove_reweight(hass, settings):
         ["climate.third"],
         stale_after=180,
         test_overshoot=2.1,
+        objective="variance",
     )
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert entry.options["sensors"] == [
@@ -395,6 +402,7 @@ async def test_options_add_remove_reweight(hass, settings):
     assert entry.options["systems"] == [{"entity_id": "climate.third", "preset": ""}]
     assert entry.options["stale_after"] == 180
     assert entry.options["test_overshoot"] == 2.1
+    assert entry.options["objective"] == "variance"
 
 
 async def test_empty_selection(hass):
@@ -2913,6 +2921,25 @@ async def test_experiment_skip_reasons_exposed_in_learning_sensor(hass, installe
         assert info["skip_reason"] == c.state.experiment_info[key]["skip_reason"]
         assert info["skip_reason"] is not None
 
+    unit = "climate.ducted"
+    now = dt_util.utcnow().timestamp()
+    c.state.last_test_attempt[unit] = now
+    c.state.experiment_info[unit].update(
+        blocked_by="sensor.room",
+        blocked_reading=23.6,
+        blocked_ceiling=23.5,
+        skip_reason="reading beyond test ceiling: Room",
+    )
+    c.async_set_updated_data(c.data)
+    await hass.async_block_till_done()
+    info = hass.states.get("sensor.house_learning").attributes["experiments"][unit]
+    assert info["blocked_by"] == "sensor.room"
+    assert info["blocked_reading"] == 23.6
+    assert info["blocked_ceiling"] == 23.5
+    assert "Room" in info["skip_reason"]
+    assert "blocked_forecast" not in info
+    assert info["next_eligible"] == now + 7200
+
 
 async def test_unit_control_handoff_learning_and_restart(hass, installed, freezer):
     from custom_components.house_climate.coordinator import HouseCoordinator
@@ -2984,6 +3011,9 @@ async def test_heating_test_does_not_interrupt_either_fan_window(
     hass, installed, freezer, window_unit, early_stop
 ):
     c, bryant, _ = await prepare_fans(hass, installed)
+    # This fixture's adopted setpoint equals its member reading; supply demand
+    # outside the comfort band before opening the fan window.
+    await c.async_change(setpoint=c.state.setpoint + 2)
     mitsubishi = hass.data[DATA_COMPONENT].get_entity("climate.split")
     for unit in (bryant, mitsubishi):
         unit._attr_current_temperature = 24

@@ -20,6 +20,7 @@ DEFAULTS = {
     "occupancy_sensor": "",
     "interval": 5,
     "fan_hold_minutes": 30,
+    "objective": "band",
     "average_weight": 1.0,
     "fan_reward_lambda": None,
     "learn_exclude_modes": "auto",

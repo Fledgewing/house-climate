@@ -142,6 +142,7 @@ def simulate_pump(constant=False):
     temperature = 20.0
     errors, fixed_errors, output_differences = [], [], []
     config = {
+        "objective": "variance",
         "sensors": [{"entity_id": "room"}],
         "systems": [{"entity_id": "pump"}],
         "control_horizon_minutes": 5,

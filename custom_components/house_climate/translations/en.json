@@ -35,7 +35,7 @@
         "title": "Control settings",
         "data_description": {
           "learning_average_minutes": "Time-weighted trailing temperature mean (default 10 minutes). Inputs are aligned half this span earlier.",
-          "learning_window_minutes": "Integrate observations over 15–240 minutes (default 60). Changing this refills observation windows while preserving learned coefficients and covariances."
+          "learning_window_minutes": "Integrate observations over 15\u2013240 minutes (default 60). Changing this refills observation windows while preserving learned coefficients and covariances."
         },
         "description": "Temperatures are in \u00b0C. Solar power is converted to kW for online learning. PI integral gain is per control interval.",
         "data": {
@@ -96,7 +96,8 @@
           "max_starts_per_hour": "Maximum starts per hour",
           "switch_penalty": "Start/stop objective cost",
           "effort_change_penalty": "Effort movement objective cost",
-          "comfort_band": "Total comfort band (\u00b0C)"
+          "comfort_band": "Total comfort band (\u00b0C)",
+          "objective": "Temperature objective (band: centered on setpoint; variance: legacy average and spread)"
         }
       },
       "priority": {
@@ -163,7 +164,7 @@
         "title": "Control settings",
         "data_description": {
           "learning_average_minutes": "Time-weighted trailing temperature mean (default 10 minutes). Inputs are aligned half this span earlier.",
-          "learning_window_minutes": "Integrate observations over 15–240 minutes (default 60). Changing this refills observation windows while preserving learned coefficients and covariances."
+          "learning_window_minutes": "Integrate observations over 15\u2013240 minutes (default 60). Changing this refills observation windows while preserving learned coefficients and covariances."
         },
         "description": "Temperatures are in \u00b0C. Solar power is converted to kW for online learning. PI integral gain is per control interval.",
         "data": {
@@ -224,7 +225,8 @@
           "max_starts_per_hour": "Maximum starts per hour",
           "switch_penalty": "Start/stop objective cost",
           "effort_change_penalty": "Effort movement objective cost",
-          "comfort_band": "Total comfort band (\u00b0C)"
+          "comfort_band": "Total comfort band (\u00b0C)",
+          "objective": "Temperature objective (band: centered on setpoint; variance: legacy average and spread)"
         }
       },
       "priority": {

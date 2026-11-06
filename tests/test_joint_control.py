@@ -22,6 +22,9 @@ LOSSES = [bs[1] * 0.5 / 15.5 for bs in TRUTH]
 
 def replay(available=True, hours=12):
     config = {
+        "objective": "variance",
+        # Isolate the legacy allocation benchmark from mandatory experiments.
+        "explore_threshold": 0,
         "sensors": [{"entity_id": r, "weight": w} for r, w in zip(ROOMS, WEIGHTS)],
         "systems": [{"entity_id": s} for s in SYSTEMS],
     }
@@ -130,6 +133,7 @@ def test_bryant_unavailable_replay():
 @pytest.mark.parametrize("penalty", [0, 1, 4])
 def test_one_available_system_is_objective_minimum(mode, sign, penalty):
     config = {
+        "objective": "variance",
         "sensors": [{"entity_id": r, "weight": w} for r, w in zip(ROOMS, WEIGHTS)],
         "systems": [{"entity_id": s} for s in SYSTEMS],
         "average_weight": penalty,
@@ -175,6 +179,7 @@ def test_forecast_uses_losses_sources_solar_and_drift(mode, target, expected):
     model.rows["room"].theta = [0.01, 0.8, 0.1, 0, 0, 0, 0, 0.05, 0.1]
     model.rows["room"].counts = [80, 80]
     config = {
+        "objective": "variance",
         "sensors": [{"entity_id": "room"}],
         "systems": [{"entity_id": "system"}],
         "control_horizon_minutes": 5,
@@ -196,6 +201,7 @@ def test_forecast_uses_losses_sources_solar_and_drift(mode, target, expected):
 
 def test_joint_allocation_beats_every_two_system_grid_point():
     config = {
+        "objective": "variance",
         "sensors": [{"entity_id": r, "weight": w} for r, w in zip(ROOMS, WEIGHTS)],
         "systems": [{"entity_id": s} for s in SYSTEMS],
     }
@@ -295,6 +301,7 @@ def balance_replay(average_weight, integral_gain=0.001):
     """
     truth = [[0.83, 0.37], [0.03, 0.02], [0.09, 0.09]]
     config = {
+        "objective": "variance",
         "sensors": [{"entity_id": r, "weight": w} for r, w in zip(ROOMS, WEIGHTS)],
         "systems": [{"entity_id": s, "modulating": True} for s in SYSTEMS],
         "average_weight": average_weight,

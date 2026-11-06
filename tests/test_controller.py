@@ -122,6 +122,7 @@ def test_effort_switches_in_one_pass_despite_legacy_slew(config):
 
 
 def test_mean_integrates_once_per_interval(config):
+    config["objective"] = "variance"
     config["mean_integral_gain"] = 0.001
     state = ControlState(mode="heat")
     for i in range(3):
@@ -267,6 +268,7 @@ def test_outdoor_veto_thresholds_are_configurable(config):
 
 @pytest.mark.parametrize("weight", [1, 0.5, 0.2, 0.1])
 def test_mean_integral_respects_average_weight(config, weight):
+    config["objective"] = "variance"
     config.update(average_weight=weight, mean_integral_gain=0.001)
     state = ControlState(mode="heat")
     run(config, state, {"sensor.a": Reading(20.9)})

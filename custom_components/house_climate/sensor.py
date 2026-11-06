@@ -102,6 +102,7 @@ class LearningSensor(CoordinatorEntity, SensorEntity):
         state = coordinator.state
         diagnostics["experiments"] = {
             key: {
+                **state.experiment_info.get(key, {}),
                 "skip_reason": state.experiment_info.get(key, {}).get("skip_reason"),
                 "uncertainty_score": score,
                 "last_steady_test": state.last_steady_test.get(key),
@@ -109,7 +110,7 @@ class LearningSensor(CoordinatorEntity, SensorEntity):
                     state.last_steady_test.get(
                         key, state.test_observed_since.get(key, now)
                     ),
-                    state.last_excite.get(key, float("-inf")),
+                    state.last_test_attempt.get(key, float("-inf")),
                 )
                 + config.get("excite_after_minutes", 120) * 60,
             }

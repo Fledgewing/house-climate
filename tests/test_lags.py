@@ -184,14 +184,14 @@ def test_short_allocator_runs_trigger_full_steady_experiment_and_confidence_rise
         row.theta[2] = 0
         row.counts[1] = 1e30
     initial = model.confidence("D", "A")
-    start = control(config, state, {"D": Reading(20.5)}, devices, 7200, learning=model)
+    start = control(config, state, {"D": Reading(20.4)}, devices, 7200, learning=model)
     assert state.excitation["system"] == "A"
     assert "testing A for 60 min to learn its effect on D" in start.explanation
     targets = []
     for step in range(13):
         now = 7200 + step * 300
         devices["A"].hvac_action = "heating"
-        temperature = 20.5 + step * 0.01
+        temperature = 20.3 + step * 0.01
         result = control(
             config, state, {"D": Reading(temperature)}, devices, now, learning=model
         )
@@ -215,30 +215,29 @@ def test_short_allocator_runs_trigger_full_steady_experiment_and_confidence_rise
     assert state.experiment_info["A"]["last_steady_test"] == 10800
 
 
-@pytest.mark.parametrize(
-    "mode,temperature,drift", [("heat", 21, 0.2), ("cool", 21, -0.2)]
-)
-def test_experiment_safety_stops_early_cycling_mode_and_minor_rooms(
-    mode, temperature, drift
-):
+@pytest.mark.parametrize("mode,direction", [("heat", 1), ("cool", -1)])
+def test_experiment_measured_safety_cycling_mode_and_minor_rooms(mode, direction):
     config, state, devices, model = experiment_setup(mode)
     for key in devices:
         state.observe_action(key, "idle", 0)
-    values = {"D": temperature, "minor": 40 if mode == "heat" else 0}
-    excitation_target(config, state, devices, values, temperature, mode, 300, model)
+    values = {"D": 21 - direction, "minor": 40 if mode == "heat" else 0}
+    excitation_target(config, state, devices, values, 21, mode, 300, model)
     assert state.excitation["system"] == "A"
-    model.rows["D"].theta[-1] = drift
-    excitation_target(config, state, devices, values, temperature, mode, 600, model)
+    # No forecast veto; the minor room cannot abort the test.
+    model.rows["D"].theta[-1] = direction * 2
+    excitation_target(config, state, devices, values, 21, mode, 600, model)
+    assert state.excitation
+    values["D"] = 21 + direction * 1.6
+    excitation_target(config, state, devices, values, 21, mode, 900, model)
     assert not state.excitation
+    assert state.experiment_info["A"]["blocked_reading"] == values["D"]
     assert "A" not in state.last_steady_test
-    # Forecast also rejects a new experiment with unsafe drift.
-    excitation_target(config, state, devices, values, temperature, mode, 900, model)
-    assert not state.excitation
-    model.rows["D"].theta[-1] = 0
+    assert state.experiment_info["A"]["next_eligible"] == 960
     state.last_stop = {"A": 1000, "B": 1000}
-    excitation_target(config, state, devices, values, temperature, mode, 1001, model)
+    values["D"] = 21 - direction
+    excitation_target(config, state, devices, values, 21, mode, 1001, model)
     assert not state.excitation
-    excitation_target(config, state, devices, values, temperature, "off", 2000, model)
+    excitation_target(config, state, devices, values, 21, "off", 2000, model)
     assert not state.excitation
 
 
@@ -253,7 +252,7 @@ def test_information_ranking_uses_weighted_room_covariance_not_runtime_confidenc
     model.rows["D"].covariance[model.lag_index(1)][model.lag_index(1)] = 0.1
     model.rows["minor"].covariance[1][1] = 1e9
     excitation_target(
-        config, state, devices, {"D": 20.5, "minor": 40}, 20.5, "heat", 300, model
+        config, state, devices, {"D": 20.4, "minor": 40}, 20.5, "heat", 300, model
     )
     assert state.excitation["system"] == "B"
     assert state.excitation["rooms"] == ["D"]
@@ -270,7 +269,7 @@ def test_qualifying_allocator_run_counts_even_when_it_ends_between_passes():
     # A later short run must not erase the completed long run's evidence.
     state.observe_action("A", "heating", 4000)
     state.observe_action("A", "idle", 4100)
-    excitation_target(config, state, devices, {"D": 20.5}, 20.5, "off", 4200, model)
+    excitation_target(config, state, devices, {"D": 20.4}, 20.5, "off", 4200, model)
     assert state.last_steady_test["A"] == 3600
     assert state.experiment_info["A"]["next_eligible"] == 3660
 
@@ -346,7 +345,7 @@ def test_unavailable_unit_does_not_block_the_most_informative_available_test():
         state.observe_action(key, "idle", 0)
     devices["A"].available = False
     model.rows["D"].covariance[1][1] = 10000
-    excitation_target(config, state, devices, {"D": 20.5}, 20.5, "heat", 300, model)
+    excitation_target(config, state, devices, {"D": 20.4}, 20.5, "heat", 300, model)
     assert state.excitation["system"] == "B"
 
 
@@ -380,16 +379,16 @@ def test_transition_history_exact_partial_windows_and_restart():
     assert restored.to_dict() == model.to_dict()
 
 
-def test_experiment_allows_an_already_hot_room_forecast_to_cool():
+def test_experiment_requires_a_counted_room_the_mode_can_help():
     config, state, devices, model = experiment_setup()
     for key in devices:
         state.observe_action(key, "idle", 0)
-    # An already overheated room is eligible when the test does not heat it further.
+    # A passive cooling forecast does not create current heat demand.
     model.rows["D"].theta[0] = 0.1
     excitation_target(
         config, state, devices, {"D": 23}, 20.5, "heat", 300, model, outdoor=0
     )
-    assert state.excitation
+    assert not state.excitation
 
 
 @pytest.mark.parametrize("mode", ["heat", "cool"])
@@ -438,27 +437,29 @@ def test_live_steady_mitsubishi_leaves_idle_bryant_a_turn(monkeypatch, mode, run
         > state.experiment_info["B"]["uncertainty_score"]
     )
     assert state.experiment_info["M"]["skip_reason"] == "eligibility wait"
-    # A strong test contribution still vetoes a crossing during the experiment.
-    rise = 0.4
+    # A measured crossing waits for the protected run, then counts as an attempt.
     readings["b_room"] = Reading(22.5 + direction * 1.6)
+    devices["B"].hvac_action = "heating" if mode == "heat" else "cooling"
     control(config, state, readings, devices, 7500, learning=model)
+    assert state.excitation
+    control(config, state, readings, devices, 8100, learning=model)
     assert not state.excitation
-    assert state.experiment_info["B"]["skip_reason"] == "forecast above limit: b_room"
-    # Starting beyond the limit is allowed only with at most 0.3 C further rise.
-    state.last_excite.clear()
+    assert (
+        state.experiment_info["B"]["skip_reason"]
+        == "reading beyond test ceiling: b_room"
+    )
+    assert state.experiment_info["B"]["next_eligible"] == 15300
+    devices["B"].hvac_action = "idle"
+    state.observe_action("B", "idle", 8200)
+    # An initially overheated room gets a measured 0.3 C allowance, regardless of forecast.
     readings["b_room"] = Reading(22.5 + direction * 2)
-    state.last_steady_test["M"] = 15000
-    rise = 0.4
-    control(config, state, readings, devices, 15000, learning=model)
-    assert not state.excitation
-    assert state.experiment_info["B"]["skip_reason"] == "forecast above limit: b_room"
-    rise = 0.2
+    state.last_steady_test["M"] = 15300
     control(config, state, readings, devices, 15300, learning=model)
     assert state.excitation["system"] == "B"
-    # Preserve the modeled 0.3 C allowance across the whole test.
-    rise = 0.31
-    readings["b_room"] = Reading(22.5 + direction * 2.2)
-    control(config, state, readings, devices, 15600, learning=model)
+    devices["B"].hvac_action = "heating" if mode == "heat" else "cooling"
+    state.observe_action("B", devices["B"].hvac_action, 15300)
+    readings["b_room"] = Reading(22.5 + direction * 2.31)
+    control(config, state, readings, devices, 15900, learning=model)
     assert not state.excitation
 
 
@@ -467,13 +468,10 @@ def test_live_steady_mitsubishi_leaves_idle_bryant_a_turn(monkeypatch, mode, run
     [
         ("cooldown", "eligibility wait"),
         ("cycling", "cycling hold"),
-        ("forecast", "forecast above limit: D"),
         ("target", "target at device limit"),
     ],
 )
-def test_ineligible_high_score_never_blocks_lower_eligible(
-    monkeypatch, blocked, expected
-):
+def test_ineligible_high_score_never_blocks_lower_eligible(blocked, expected):
     config, state, devices, model = experiment_setup()
     state.test_observed_since = {"A": 0, "B": 0}
     model.rows["D"].covariance[1][1] *= 10
@@ -483,20 +481,11 @@ def test_ineligible_high_score_never_blocks_lower_eligible(
         state.last_stop["A"] = 299
     elif blocked == "target":
         devices["A"].maximum = devices["A"].current_temperature
-    else:
-        monkeypatch.setattr(
-            model,
-            "forecast",
-            lambda room, temperature, systems, step, *args: (
-                temperature,
-                [3 if key == "A" else 0 for key in systems],
-            ),
-        )
-    excitation_target(config, state, devices, {"D": 20.5}, 20.5, "heat", 300, model)
+    excitation_target(config, state, devices, {"D": 20.4}, 20.5, "heat", 300, model)
     assert state.excitation["system"] == "B"
     assert state.experiment_info["A"]["skip_reason"] == expected
     # Reasons for other systems remain current while an experiment is active.
-    excitation_target(config, state, devices, {"D": 20.5}, 20.5, "heat", 301, model)
+    excitation_target(config, state, devices, {"D": 20.4}, 20.5, "heat", 301, model)
     assert state.experiment_info["B"]["skip_reason"] is None
     if blocked in ("cooldown", "cycling"):
         assert state.experiment_info["A"]["skip_reason"] == expected
@@ -509,9 +498,9 @@ def test_experiment_house_and_uncertainty_skip_reasons(mode, confident):
     state.test_observed_since = dict.fromkeys(devices, 0)
     direction = 1 if mode == "heat" else -1
     house = 21 + direction * 0.1
-    expected = "house above setpoint" if mode == "heat" else "house below setpoint"
+    expected = "no counted room needs " + ("heat" if mode == "heat" else "cooling")
     if confident:
-        house = 21
+        house = 21 - direction
         expected = "not uncertain enough"
         for row in model.rows.values():
             row.covariance = [[0] * len(row.theta) for _ in row.theta]

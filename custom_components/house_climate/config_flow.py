@@ -343,6 +343,11 @@ class HouseSteps:
                     ),
                 )
             ] = entities(domain, device_class=device_class)
+        fields[
+            vol.Required("objective", default=self.settings.get("objective", "band"))
+        ] = selector.SelectSelector(
+            selector.SelectSelectorConfig(options=["band", "variance"])
+        )
         for key, low, high, step in [
             ("disturbance_sigma", 0, 20, 0.1),
             ("disturbance_intervals", 1, 100, 1),
