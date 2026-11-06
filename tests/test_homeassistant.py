@@ -2869,21 +2869,30 @@ async def test_interaction_diagnostics_include_zero_weight_rooms_and_device_rows
         row.counts = [100, 100, 100]
     c.learning_enabled = False
     await c.async_tick(record=False)
-    attrs = hass.states.get("sensor.house_learning").attributes
+    sensor = hass.states.get("sensor.house_learning")
+    assert float(sensor.state) == pytest.approx(c.learning.confidence_percent, abs=0.05)
+    assert sensor.attributes["unit_of_measurement"] == "%"
+    attrs = sensor.attributes
+    assert attrs["units"] == {
+        "effects": "°C per hour of full effort",
+        "confidence": "%",
+    }
     assert "sensor.ignored" not in c.data.readings
     assert attrs["systems"]["climate.ducted"]["sensor.room"][
         "effective_effect"
-    ] == pytest.approx(0.16)
+    ] == pytest.approx(0.16 * 12)
     assert attrs["systems"]["climate.ducted"]["sensor.ignored"][
         "effective_effect"
-    ] == pytest.approx(0.15)
+    ] == pytest.approx(0.15 * 12)
     assert attrs["systems"]["climate.ducted"]["climate.ducted"][
         "effective_effect"
-    ] == pytest.approx(0.13)
-    assert attrs["sources"]["switch.fan"]["sensor.ignored"]["g"] == 0.02
+    ] == pytest.approx(0.13 * 12)
+    assert attrs["sources"]["switch.fan"]["sensor.ignored"]["g"] == pytest.approx(
+        0.02 * 12
+    )
     assert attrs["sources"]["switch.fan"]["sensor.ignored"][
         "effective_effect"
-    ] == pytest.approx(-0.29)
+    ] == pytest.approx(-0.29 * 12)
 
 
 async def test_experiment_skip_reasons_exposed_in_learning_sensor(hass, installed):

@@ -254,9 +254,14 @@ ID. Config-entry version 2 migrates existing data and options by removing obsole
 retaining the other settings and existing Store. Pre-learning Store files start at neutral priors.
 
 `sensor.house_learning` reports the mean confidence across all system/room pairs, as a percentage.
-Its `systems[system_entity][sensor_entity]` attributes expose raw fixed `b`, interaction `g`,
-`h` (delayed effect), `blended_b` (blended fixed part plus g × current Δ plus h), clamped `effective_effect`, normalized
-`influence`, confidence percent and `effective_samples`. Its `sensors[sensor_entity]` attributes
+System/source diagnostic effects are converted only for reporting by `60 / interval_minutes`: ×12
+at five minutes and ×15 at four minutes. The top-level `units` attribute is
+`{"effects": "°C per hour of full effort", "confidence": "%"}`. Internal coefficients,
+persisted storage and control maths keep their existing interval units; decision text is unchanged.
+Its `systems[system_entity][sensor_entity]` attributes expose fixed `b` (°C/h), interaction `g`
+(°C/h per °C of outdoor-minus-room temperature), `steady_std` (°C/h),
+`h` (delayed effect, °C/h), `blended_b` (blended fixed part plus g × current Δ plus h, °C/h),
+clamped `effective_effect` (°C/h), dimensionless normalized `influence` (sums to 1 for positive reach), confidence percent and `effective_samples`. Its `sensors[sensor_entity]` attributes
 expose `a` (heat loss), `c` (sun gain), `d`, `fit_error` (forgetting-weighted RMS prediction error
 in °C), and `samples` (valid updates). Press `button.house_reset_learning` to reset the model and
 confidence to neutral priors; house target, mode and control state remain in place.
@@ -544,8 +549,8 @@ column to neutral priors, including challenger and saved regime rows. Other colu
 remain intact. Old Store models default to `on_off`.
 `sensor.house_learning.sources[source][room]` exposes `e`, confidence percent and
 `effective_samples`; `sources[source]` also exposes `response` and current `effort`
-(0/1 or kW, null for unknown). Coefficient units are °C per full-on interval or °C per
-kW per interval. Overall confidence remains the HVAC-pair mean used previously.
+(0/1 or kW, null for unknown). Reported `e`, `h` and signed `effective_effect` units are °C/h at full-on or °C/h per
+kW; the stored coefficients remain per interval. Overall confidence remains the HVAC-pair mean used previously.
 
 For each available row interval, calculate the prediction residual before updating.
 Normalize residual and fit error to one configured interval; delayed intervals scale
@@ -902,8 +907,8 @@ Unknown outdoor or room context omits the interaction, preserving the fixed-effe
 Source effects remain signed: a fan can cool with colder outdoor air and warm with hotter air.
 `sensor.house_learning.sources[source][room]` exposes fixed `e`, slope `g`, and signed
 `effective_effect`; systems expose `b`, `g` and clamped blended `effective_effect`. Diagnostics use
-the current outdoor sensor/weather fallback and current filtered room readings. Slope units are
-°C per interval per input unit per °C difference; fixed/effective units match the input's existing
+the current outdoor sensor/weather fallback and current filtered room readings. Reported slope units are
+°C/h per input unit per °C of outdoor-minus-room difference; fixed/effective units match the input's existing
 on/off, signed runtime, or kW units. Missing context evaluates the interaction as zero.
 
 Loading v0.5.7 Store rows inserts zero-mean interaction columns before solar/drift, using the

@@ -272,9 +272,13 @@ def test_current_effects_forecast_affinity_diagnostics_outage_and_heat_clamp():
         "pump", outdoor=10, temperatures={"room": 20, "other": 10}
     ) == pytest.approx({"room": 0.4, "other": 0.6})
     diag = model.diagnostics(10, {"room": 20})
-    assert diag["systems"]["pump"]["room"]["g"] == 0.01
-    assert diag["systems"]["pump"]["room"]["effective_effect"] == pytest.approx(0.2)
-    assert diag["sources"]["fan"]["room"]["effective_effect"] == pytest.approx(-0.18)
+    assert diag["systems"]["pump"]["room"]["g"] == pytest.approx(0.01 * 12)
+    assert diag["systems"]["pump"]["room"]["effective_effect"] == pytest.approx(
+        0.2 * 12
+    )
+    assert diag["sources"]["fan"]["room"]["effective_effect"] == pytest.approx(
+        -0.18 * 12
+    )
     assert model.forecast("room", 20, ["pump"], 9, -20)[1] == [0]
     assert model.forecast("room", 20, ["pump"], 9)[1] == pytest.approx([9 * 0.3])
     # Clamp the combined effect, allowing a negative fixed part offset by g.

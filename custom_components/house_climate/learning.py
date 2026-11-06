@@ -930,20 +930,22 @@ class Learning:
         return (0.5 if phase < 0.5 else -0.5) * (1 - confidence / threshold)
 
     def diagnostics(self, outdoor=None, temperatures=None):
+        """Report hourly effects without changing the interval-based model."""
+        per_hour = 60 / self.interval_minutes
         return {
+            "units": {"effects": "°C per hour of full effort", "confidence": "%"},
             "systems": {
                 j: {
                     s: {
-                        "b": row.theta[k + 1],
-                        "g": row.theta[self.interaction_index(k)],
-                        "h": row.theta[self.lag_index(k)],
-                        "steady_std": self.steady_std(
-                            s, j, outdoor, (temperatures or {}).get(s)
-                        ),
-                        "blended_b": self.blended(
-                            s, j, outdoor, (temperatures or {}).get(s)
-                        ),
-                        "effective_effect": max(
+                        "b": per_hour * row.theta[k + 1],
+                        "g": per_hour * row.theta[self.interaction_index(k)],
+                        "h": per_hour * row.theta[self.lag_index(k)],
+                        "steady_std": per_hour
+                        * self.steady_std(s, j, outdoor, (temperatures or {}).get(s)),
+                        "blended_b": per_hour
+                        * self.blended(s, j, outdoor, (temperatures or {}).get(s)),
+                        "effective_effect": per_hour
+                        * max(
                             0, self.blended(s, j, outdoor, (temperatures or {}).get(s))
                         ),
                         "influence": self.influences(
@@ -959,10 +961,13 @@ class Learning:
             "sources": {
                 source: {
                     sensor: {
-                        "e": row.theta[1 + len(self.systems) + k],
-                        "h": row.theta[self.lag_index(len(self.systems) + k)],
-                        "g": row.theta[self.interaction_index(len(self.systems) + k)],
-                        "effective_effect": self.source_effect(
+                        "e": per_hour * row.theta[1 + len(self.systems) + k],
+                        "h": per_hour
+                        * row.theta[self.lag_index(len(self.systems) + k)],
+                        "g": per_hour
+                        * row.theta[self.interaction_index(len(self.systems) + k)],
+                        "effective_effect": per_hour
+                        * self.source_effect(
                             sensor, source, outdoor, (temperatures or {}).get(sensor)
                         ),
                         "confidence": 100

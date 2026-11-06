@@ -77,11 +77,11 @@ def test_simulated_evening_source():
     _, unprotected_error, _, _ = simulate_source(protection=False)
     effects = [measured.diagnostics()["sources"]["source"][r]["e"] for r in ROOMS]
     print(
-        f"\nSource simulation: HVAC mean absolute coefficient error measured={measured_error:.6f}, detected={detected_error:.6f}, protection off={unprotected_error:.6f} C/interval; source effects={effects}; disturbed source-on intervals={flags}/{count}; measured flags={measured_flags}"
+        f"\nSource simulation: HVAC mean absolute coefficient error measured={measured_error:.6f}, detected={detected_error:.6f}, protection off={unprotected_error:.6f} C/interval; source effects={effects} °C/h; disturbed source-on intervals={flags}/{count}; measured flags={measured_flags}"
     )
     for i, room in enumerate(ROOMS):
         assert measured.rows[room].theta[1:3] == pytest.approx(TRUTH_B[i], abs=0.003)
-    assert effects == pytest.approx(TRUTH_E, abs=0.005)
+    assert effects == pytest.approx([e * 12 for e in TRUTH_E], abs=0.005 * 12)
     assert measured_flags == dict.fromkeys(ROOMS, 0)
     assert flags["living"] > count * 0.85
     assert flags["guest"] > count * 0.85

@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.12 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.16 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 The setpoint is the weighted **house average**. Each pass jointly chooses how much every available system should run to bring that average to the setpoint and reduce each room's deviation from it. A 45-minute prediction uses the learned room responses, outdoor losses, extra heat sources, solar gain and drift. There are no configured room mappings or individual room targets. A shared comfort band holds starts and stops only when every weighted room is comfortable.
 
@@ -173,9 +173,9 @@ outage thermostat predictions. The steady effect is `b + g × Δ + h` (or `e + g
 for sources); system heating effects retain the nonnegative clamp. Bounded effort history
 survives restarts; gaps contribute zero lag feature and no lag learning credit. The v0.5.11 evidence migration described above also applies to saved regimes.
 
-Read `sensor.house_learning` for overall confidence percent (the mean across room/system pairs). Under its attributes:
+Read `sensor.house_learning` for overall confidence percent (the mean across room/system pairs). Reported system/source effects are in **°C/h**, scaled by `60 / interval_minutes` (×12 at 5 minutes, ×15 at 4 minutes). Internal coefficients, storage and control remain per interval. The top-level `units` attribute is `{"effects": "°C per hour of full effort", "confidence": "%"}`. Under its attributes:
 
-- `systems` → system entity → room sensor: `b` is the fixed effect in °C per full-running interval; `g` is its learned temperature slope; `h` is its delayed effect; `steady_std` is posterior uncertainty in the steady effect; `blended_b` includes the fixed-part prior blend, temperature interaction and delayed effect; `effective_effect` also applies the nonnegative heat clamp; `influence` is the nonnegative normalized control weight; `confidence` is percent; `effective_samples` is the activity count.
+- `systems` → system entity → room sensor: `b` is the fixed effect in °C/h at full effort; `g` is its learned slope in °C/h per °C of outdoor-minus-room temperature; `h` is its delayed effect in °C/h; `steady_std` is posterior uncertainty in the steady effect in °C/h; `blended_b` (°C/h) includes the fixed-part prior blend, temperature interaction and delayed effect; `effective_effect` also applies the nonnegative heat clamp; `influence` is the dimensionless nonnegative normalized control weight (sums to 1 per system when reach is positive); `confidence` is percent; `effective_samples` is the activity count.
 - `experiments` → system entity: `uncertainty_score`, `last_steady_test`, `next_eligible` (Unix timestamps for the latter two), `skip_reason` (for example "cycling hold", "forecast above limit: sensor.room", "not uncertain enough", or "house above setpoint"; null when selected/eligible), and `blocked_by` (room entity ID), `blocked_forecast` / `blocked_ceiling` (°C; null when no room blocks).
 - `sensors` → room sensor: `a` is heat loss, `c` sun gain in °C/interval/kW, `d` background drift, `fit_error` is the forgetting-weighted RMS prediction error in °C, and `samples` counts valid updates.
 
@@ -200,8 +200,9 @@ effects because their units change.
 Each source adds a learned effect `e` for every room, starting at zero with broad
 covariance. Its input is the fraction of the interval it was on, or the time-weighted
 mean kW for proportional sources, including power changes between control passes. `sensor.house_learning` exposes `sources → source entity → room`
-with fixed `e` (°C per full-on interval, or °C per kW per interval), temperature slope `g`,
-signed `effective_effect` at current outdoor/filtered room temperatures, confidence percent and
+with fixed `e` and delayed `h` (°C/h at full-on, or °C/h per kW), temperature slope `g`
+(°C/h per °C of outdoor-minus-room temperature, additionally per kW for proportional sources),
+signed `effective_effect` (°C/h, additionally per kW for proportional sources) at current outdoor/filtered room temperatures, confidence percent and
 effective samples. Each source also exposes its `response` and current `effort` (0/1
 or kW; null when unknown). Configured
 sources are part of the thermal prediction: their operation does not itself discard

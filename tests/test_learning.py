@@ -3,6 +3,7 @@
 import json
 import math
 import random
+from copy import deepcopy
 
 import pytest
 
@@ -362,5 +363,59 @@ def test_varying_proportional_source_learns_positive_effect():
         )
         temperature = after
     assert model.diagnostics()["sources"]["server"]["room"]["e"] == pytest.approx(
-        0.8, abs=0.02
+        0.8 * 12, abs=0.02 * 12
     )
+
+
+@pytest.mark.parametrize("interval_minutes, scale", [(5, 12), (4, 15)])
+def test_diagnostics_hourly_effects_preserve_model_and_storage(interval_minutes, scale):
+    model = Learning(
+        ["room", "other"], ["heat"], sources=["fan"], interval_minutes=interval_minutes
+    )
+    for row in model.rows.values():
+        row.theta = [0.01, 0.3, 0.02, 0.01, 0.02, 0.04, -0.03, 0.05, -0.01]
+        row.counts = [24, 12]
+        row.samples = 36
+    model.rows["other"].theta[1] = -0.3
+    temperatures = {"room": 20, "other": 20}
+    stored = deepcopy(model.to_dict())
+    theta = deepcopy(model.rows["room"].theta)
+    report = model.diagnostics(10, temperatures)
+    assert report["units"] == {
+        "effects": "°C per hour of full effort",
+        "confidence": "%",
+    }
+    system = report["systems"]["heat"]["room"]
+    assert system["b"] == pytest.approx(0.3 * scale)
+    assert system["g"] == pytest.approx(0.01 * scale)
+    assert system["h"] == pytest.approx(0.04 * scale)
+    assert system["steady_std"] == pytest.approx(
+        model.steady_std("room", "heat", 10, 20) * scale
+    )
+    assert system["blended_b"] == pytest.approx(
+        model.blended("room", "heat", 10, 20) * scale
+    )
+    assert system["effective_effect"] == pytest.approx(system["blended_b"])
+    assert report["systems"]["heat"]["other"]["blended_b"] < 0
+    assert report["systems"]["heat"]["other"]["effective_effect"] == 0
+    # Influence is a dimensionless share, confidence a percentage, counts unscaled.
+    assert system["influence"] == 1
+    assert report["systems"]["heat"]["other"]["influence"] == 0
+    assert system["confidence"] == 100 * model.confidence("room", "heat")
+    assert system["effective_samples"] == 24
+    source = report["sources"]["fan"]["room"]
+    assert source["e"] == pytest.approx(0.02 * scale)
+    assert source["g"] == pytest.approx(0.02 * scale)
+    assert source["h"] == pytest.approx(-0.03 * scale)
+    assert source["effective_effect"] == pytest.approx(-0.21 * scale)
+    assert source["confidence"] == pytest.approx(100 * 12 / (12 + model.n0))
+    assert source["effective_samples"] == 12
+    assert report["sensors"]["room"]["a"] == theta[0]
+    assert report["sensors"]["room"]["c"] == theta[-2]
+    assert report["sensors"]["room"]["d"] == theta[-1]
+    assert model.rows["room"].theta == theta
+    assert model.to_dict() == stored
+    restored = Learning.from_dict(json.loads(json.dumps(stored)))
+    assert restored.to_dict() == stored
+    assert restored.diagnostics(10, temperatures) == report
+    assert restored.to_dict() == stored
