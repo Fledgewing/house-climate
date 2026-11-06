@@ -142,19 +142,25 @@ While a system's least-confident active, weighted room is below `explore_thresho
 Steady learning runs are selected by **room-level posterior uncertainty**, weighted by the
 active priority mode. Short allocator runs do not postpone them. After `excite_after_minutes`
 (default **120**) without a steady test, the most uncertain eligible system can run at full,
-constant effort for `excite_minutes` (default **60**). Units already heating/cooling or
-allocated nonzero effort supply steady-test evidence through normal operation and are skipped.
-Each candidate is checked independently, so an ineligible higher-score unit does not block
-the others. The other systems retain their allocated
-efforts for the experiment; dither is suspended. Only one test runs at a time, with the normal
-cycling and House mode guards. The house must be at/below setpoint in heat (at/above in cool).
-Tests are allowed inside the comfort band, but every forecast step must keep every non-minor
-room at/below setpoint + `test_overshoot` (default **1.5 °C**, configurable in options),
-mirrored below setpoint for cooling. A room already beyond that limit vetoes the start only
-if the forecast raises it further by more than **0.3 °C**; that allowance stays anchored to
-its starting temperature during the run. A current or forecast breach stops
-the test early, subject to minimum-run protection. Interrupted runs do not count as steady tests.
-A failed attempt waits the retry interval; a restart cancels a test and never credits downtime.
+constant effort for `excite_minutes` (default **60**). A completed steady normal run
+supplies the same evidence; a short normal run or nonzero allocation cannot postpone a due
+test. An idle unit gets first turn when several are due. Each candidate is checked independently.
+The other systems retain their allocated efforts; dither is suspended. A due test overrides
+balance restraint and the comfort-band hold, while cycling protection, hand control,
+availability and House mode still apply. The house must be at/below setpoint in heat
+(at/above in cool).
+
+Safety compares the forecast with the test against the tested unit's current normal allocated
+effort, keeping other inputs unchanged. Every non-minor room has a ceiling of setpoint +
+`test_overshoot` (default **1.5 °C**), mirrored for cooling. For a room already beyond that
+limit, its starting temperature + **0.3 °C** is the ceiling. A room crossing its ceiling
+because of the test still blocks it. A room already overheated, or forecast beyond its
+ceiling without the test, blocks only if the test itself adds more than **0.3 °C** over the
+run. Passive drift and other units' heat do not spend that allowance. The modeled test
+contribution includes elapsed and remaining time, so successive passes cannot renew it.
+Unsafe tests stop early, subject to minimum-run protection. Interrupted runs do not count as
+steady tests and remain due on the next control pass, including after restart or hand control.
+Only qualifying steady evidence starts another `excite_after_minutes` wait.
 A test times out after twice its configured duration if observed steady runtime never completes.
 `explore_threshold=0` disables exploration. The decision explains
 “testing <unit> for <n> min to learn its effect on <rooms>”.
@@ -170,7 +176,7 @@ survives restarts; gaps contribute zero lag feature and no lag learning credit. 
 Read `sensor.house_learning` for overall confidence percent (the mean across room/system pairs). Under its attributes:
 
 - `systems` → system entity → room sensor: `b` is the fixed effect in °C per full-running interval; `g` is its learned temperature slope; `h` is its delayed effect; `steady_std` is posterior uncertainty in the steady effect; `blended_b` includes the fixed-part prior blend, temperature interaction and delayed effect; `effective_effect` also applies the nonnegative heat clamp; `influence` is the nonnegative normalized control weight; `confidence` is percent; `effective_samples` is the activity count.
-- `experiments` → system entity: `uncertainty_score`, `last_steady_test`, `next_eligible` (Unix timestamps for the latter two), and `skip_reason` (for example "running steadily", "cycling hold", "forecast above limit", "not uncertain enough", or "house above setpoint"; null when selected/eligible).
+- `experiments` → system entity: `uncertainty_score`, `last_steady_test`, `next_eligible` (Unix timestamps for the latter two), `skip_reason` (for example "cycling hold", "forecast above limit: sensor.room", "not uncertain enough", or "house above setpoint"; null when selected/eligible), and `blocked_by` (room entity ID), `blocked_forecast` / `blocked_ceiling` (°C; null when no room blocks).
 - `sensors` → room sensor: `a` is heat loss, `c` sun gain in °C/interval/kW, `d` background drift, `fit_error` is the forgetting-weighted RMS prediction error in °C, and `samples` counts valid updates.
 
 Press `button.house_reset_learning` to clear the model and confidence back to neutral priors. It retains the house target, mode and control state and starts learning again. Adding a sensor can restart exploration while that room learns. Confidence measures runtime evidence; learning needs distinct system operation to identify separate effects.
@@ -472,3 +478,15 @@ effects are 1.275 and 1.659 °C/hour, versus independent references 1.344 and 1.
 Tests also cover a flagged/excluded 3 °C ten-minute spike, a discarded thirty-minute
 excursion, quantized last-value averaging, alignment, and old filter state loading.
 See DESIGN.md for timing, masks, noise-scale adaptation and acceptance details.
+
+
+## v0.5.14 experiment safety and evidence
+
+Steady tests judge the unit's added heat/cooling against its baseline allocation, so an
+already warm room with negligible unit reach cannot veto learning through unrelated drift.
+Room-specific blocker diagnostics explain real safety vetoes. Due tests override balance
+allocation, including brief normal operation; failed or aborted attempts retry on the next
+pass instead of resetting the evidence deadline. Regressions cover both heat and cool,
+two successive 60-minute tests under balance restraint, and the supplied November 5
+19:14 room temperatures. The replay uses representative under-learned effects and drift
+because the live fitted model and priority weights were not supplied.

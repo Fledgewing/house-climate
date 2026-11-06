@@ -36,6 +36,7 @@ class ControlState:
     offsets: dict[str, float] = field(default_factory=dict)
     last_update: float | None = None
     last_run: dict[str, float] = field(default_factory=dict)
+    # Legacy retry timestamps remain loadable; only steady evidence gates tests.
     last_excite: dict[str, float] = field(default_factory=dict)
     last_steady_test: dict[str, float] = field(default_factory=dict)
     steady_runs: dict[str, dict] = field(default_factory=dict)
@@ -347,18 +348,18 @@ def excitation_target(
     wait = config.get("excite_after_minutes", 120) * 60
     for key, (score, _) in scores.items():
         last = state.last_steady_test.get(key)
+        # Only qualifying evidence postpones a test, never a failed attempt.
         eligible = (
-            max(
-                last if last is not None else state.test_observed_since.get(key, now),
-                state.last_excite.get(key, float("-inf")),
-            )
-            + wait
-        )
+            last if last is not None else state.test_observed_since.get(key, now)
+        ) + wait
         state.experiment_info[key] = {
             "uncertainty_score": score,
             "last_steady_test": last,
             "next_eligible": eligible,
             "skip_reason": None,
+            "blocked_by": None,
+            "blocked_forecast": None,
+            "blocked_ceiling": None,
         }
     helps = house is not None and (
         (mode == "heat" and house <= state.setpoint)
@@ -375,7 +376,12 @@ def excitation_target(
         for other, device in devices.items():
             if not device.available:
                 efforts[other] = state.reported_efforts.get(other, 0)
+        baseline_effort = (allocation if allocation is not None else state.efforts).get(
+            key, 0
+        )
         efforts[key] = direction
+        systems = list(efforts)
+        tested_index = systems.index(key)
         rooms = scores.get(key, (0, []))[1]
         limit = config.get("test_overshoot", 1.5)
         initial = state.excitation.get("initial_values", values)
@@ -388,19 +394,54 @@ def excitation_target(
             )
             for room in rooms
         }
-        if any(
-            direction * (values[room] - state.setpoint) > ceilings[room]
-            for room in rooms
-        ):
-            return False
+        # Account for the test's predicted contribution so far as well as its
+        # remaining contribution. This keeps the 0.3 C allowance per test rather
+        # than renewing it on every pass, while unrelated drift cancels out.
+        elapsed_steps = max(
+            0,
+            ceil(
+                (now - state.excitation.get("started", now))
+                / (config.get("interval", 5) * 60)
+            ),
+        )
         steps = max(1, ceil(remaining / config.get("interval", 5)))
-        for step in range(1, steps + 1):
+        for step in range(steps + 1):
             for room in rooms:
                 base, effects = learning.forecast(
-                    room, values[room], list(efforts), step, outdoor, solar, sources
+                    room, values[room], systems, step, outdoor, solar, sources
                 )
                 predicted = base + sum(b * u for b, u in zip(effects, efforts.values()))
-                if direction * (predicted - state.setpoint) > ceilings[room]:
+                # Full-horizon effort coefficient retains passive decay and
+                # delayed response across the elapsed/remaining boundary.
+                _, test_effects = learning.forecast(
+                    room,
+                    initial.get(room, values[room]),
+                    systems,
+                    elapsed_steps + step,
+                    outdoor,
+                    solar,
+                    sources,
+                )
+                increment = (
+                    direction
+                    * test_effects[tested_index]
+                    * (direction - baseline_effort)
+                )
+                forecast = direction * (predicted - state.setpoint)
+                without_test = forecast - increment
+                if forecast > ceilings[room] and (
+                    (
+                        direction * (initial.get(room, values[room]) - state.setpoint)
+                        <= limit
+                        and without_test <= ceilings[room]
+                    )
+                    or increment > 0.3
+                ):
+                    state.experiment_info[key].update(
+                        blocked_by=room,
+                        blocked_forecast=predicted,
+                        blocked_ceiling=state.setpoint + direction * ceilings[room],
+                    )
                     return False
         return bool(rooms)
 
@@ -416,12 +457,6 @@ def excitation_target(
             device.current_temperature
         ):
             reason = "missing local temperature"
-        elif (
-            device.hvac_action in ("heating", "cooling")
-            or abs(allocated.get(key, 0)) > 0
-        ):
-            # A continuing normal allocation supplies the same steady-run evidence.
-            reason = "running steadily"
         elif house is None:
             reason = "missing house data"
         elif mode not in ("heat", "cool"):
@@ -441,7 +476,8 @@ def excitation_target(
         elif state.excitation:
             reason = "another experiment running"
         elif not safe(key, minutes):
-            reason = "forecast above limit"
+            room = state.experiment_info[key]["blocked_by"]
+            reason = f"forecast above limit: {room}" if room else "no test rooms"
         state.experiment_info[key]["skip_reason"] = reason
         if reason is None:
             candidates.append(key)
@@ -466,15 +502,30 @@ def excitation_target(
             or unsafe
         )
         if finished:
-            # Aborts get a retry delay, but never masquerade as successful tests.
-            state.last_excite[key] = now
-            state.experiment_info[key]["next_eligible"] = now + wait
+            # An abort remains due on the next pass. Only steady evidence earns
+            # another full eligibility period.
+            if active["runtime"] >= minutes * 60:
+                state.last_steady_test[key] = now
+                state.experiment_info[key]["last_steady_test"] = now
+                state.experiment_info[key]["next_eligible"] = now + wait
+            room = state.experiment_info[key]["blocked_by"]
             state.experiment_info[key]["skip_reason"] = (
-                "forecast above limit" if unsafe else "eligibility wait"
+                f"forecast above limit: {room}"
+                if unsafe and room
+                else "eligibility wait"
             )
             state.excitation = {}
         return
-    for key in sorted(candidates, key=lambda k: scores[k][0], reverse=True):
+    # Prefer an idle unit when several are due, but a short normal allocation
+    # cannot indefinitely replace the promised full steady test.
+    for key in sorted(
+        candidates,
+        key=lambda k: (
+            devices[k].hvac_action in ("heating", "cooling")
+            or abs(allocated.get(k, 0)) > 0,
+            -scores[k][0],
+        ),
+    ):
         device = devices[key]
         target = clamp(
             floor(

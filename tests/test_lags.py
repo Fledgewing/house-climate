@@ -416,6 +416,8 @@ def test_live_steady_mitsubishi_leaves_idle_bryant_a_turn(monkeypatch, mode, run
         "custom_components.house_climate.controller.allocate",
         lambda *args: ({"M": direction if running == "allocated" else 0, "B": 0}, 22.5),
     )
+    # This unit's continuing normal run has already supplied qualifying evidence.
+    state.last_steady_test["M"] = 7200
     rise = 0.2
     monkeypatch.setattr(
         model,
@@ -435,23 +437,26 @@ def test_live_steady_mitsubishi_leaves_idle_bryant_a_turn(monkeypatch, mode, run
         state.experiment_info["M"]["uncertainty_score"]
         > state.experiment_info["B"]["uncertainty_score"]
     )
-    assert state.experiment_info["M"]["skip_reason"] == "running steadily"
-    # A room initially inside the limit cannot cross it during the experiment.
+    assert state.experiment_info["M"]["skip_reason"] == "eligibility wait"
+    # A strong test contribution still vetoes a crossing during the experiment.
+    rise = 0.4
     readings["b_room"] = Reading(22.5 + direction * 1.6)
     control(config, state, readings, devices, 7500, learning=model)
     assert not state.excitation
-    assert state.experiment_info["B"]["skip_reason"] == "forecast above limit"
+    assert state.experiment_info["B"]["skip_reason"] == "forecast above limit: b_room"
     # Starting beyond the limit is allowed only with at most 0.3 C further rise.
     state.last_excite.clear()
     readings["b_room"] = Reading(22.5 + direction * 2)
+    state.last_steady_test["M"] = 15000
     rise = 0.4
     control(config, state, readings, devices, 15000, learning=model)
     assert not state.excitation
-    assert state.experiment_info["B"]["skip_reason"] == "forecast above limit"
+    assert state.experiment_info["B"]["skip_reason"] == "forecast above limit: b_room"
     rise = 0.2
     control(config, state, readings, devices, 15300, learning=model)
     assert state.excitation["system"] == "B"
-    # Preserve the initial 0.3 C allowance across passes, without ratcheting it.
+    # Preserve the modeled 0.3 C allowance across the whole test.
+    rise = 0.31
     readings["b_room"] = Reading(22.5 + direction * 2.2)
     control(config, state, readings, devices, 15600, learning=model)
     assert not state.excitation
@@ -462,7 +467,7 @@ def test_live_steady_mitsubishi_leaves_idle_bryant_a_turn(monkeypatch, mode, run
     [
         ("cooldown", "eligibility wait"),
         ("cycling", "cycling hold"),
-        ("forecast", "forecast above limit"),
+        ("forecast", "forecast above limit: D"),
         ("target", "target at device limit"),
     ],
 )
@@ -473,7 +478,7 @@ def test_ineligible_high_score_never_blocks_lower_eligible(
     state.test_observed_since = {"A": 0, "B": 0}
     model.rows["D"].covariance[1][1] *= 10
     if blocked == "cooldown":
-        state.last_excite["A"] = 299
+        state.last_steady_test["A"] = 299
     elif blocked == "cycling":
         state.last_stop["A"] = 299
     elif blocked == "target":

@@ -986,8 +986,9 @@ The information score for system j is `Σ_i active_weight_i × std(b_ij + g_ij �
 Use the full posterior covariance, including cross terms, and omit rooms below
 `minor_weight_share`. As of v0.5.10, choose the highest score among eligible systems above
 `(1 - explore_threshold) × PRIOR_B`; the default threshold is 0.006 °C/interval.
-Exclude systems already reporting heating/cooling or receiving nonzero allocated effort:
-their continuing normal runs supply steady-test evidence. Check every candidate independently;
+As of v0.5.14, only a qualifying steady normal run postpones eligibility. A short
+reported run or nonzero allocation cannot veto a due test. Prefer idle candidates when
+several are due, then rank by uncertainty. Check every candidate independently;
 unavailability, missing local temperature, cooldown, cycling holds, unsafe forecasts or device
 target limits on a higher-score unit never block an eligible lower-score unit.
 Increasing the existing exploration setting tolerates less remaining uncertainty;
@@ -995,7 +996,7 @@ zero disables exploration. Whole-system runtime confidence does not gate tests.
 Rank named rooms by their contribution to this score and name the top two in `last_decision`.
 `sensor.house_learning.experiments` exposes each score, last qualifying steady test time,
 next eligible time, and current `skip_reason` (null for a selected/eligible system). Reasons
-include "running steadily", "cycling hold", "forecast above limit", "not uncertain enough",
+include "cycling hold", "forecast above limit: <room entity ID>", "not uncertain enough",
 and "house above setpoint" ("house below setpoint" in cool). A qualifying allocator or experimental run is continuously observed
 matching HVAC action with effort stable within 0.05 for at least `excite_minutes` (default 60).
 Short runs never reset the test clock. With no prior test, the initial observation starts the
@@ -1006,18 +1007,38 @@ inside the comfort band. Forecast every interval of the proposed run against the
 baseline allocation, holding other systems' allocated effort for the run. Every non-minor room
 may reach setpoint + `test_overshoot` in heat (mirror below setpoint in cool).
 In v0.5.10, `test_overshoot` defaults to **1.5 °C**, tunable in options (0–5 °C).
-A room starting above that limit vetoes a start only if any forecast step would raise it
-further by more than **0.3 °C** over the run (mirror for cool). For these rooms, retain
-the starting temperature plus 0.3 °C as the ceiling throughout the test so the allowance
-cannot grow on successive passes. Rooms initially within the limit must remain within it.
-Use these same per-room ceilings for the start check, current readings and forecasts on
-every pass over the remaining run; skip/abort on breach, missing house data, mode change
-or unavailable unit. The house-average condition is unchanged.
+As of v0.5.14, compare the full-test forecast to the counterfactual with the tested unit
+at its current normal allocated effort, before test overrides. Other units, sources and passive drift are identical.
+Keep the original ceiling for a room within the limit; an initially overheated room's
+ceiling is its starting temperature plus 0.3 °C (mirror for cool). If the test forecast
+exceeds that ceiling, veto when the test causes a crossing from an otherwise safe baseline.
+For an initially overheated room, or one whose baseline is already beyond its ceiling,
+veto only when the test's own directional contribution exceeds 0.3 °C over the test.
+Thus unrelated drift and existing overshoot cannot veto a unit with negligible reach.
+
+At each pass, forecast every remaining interval, including the current endpoint. Compute
+the directional test increment using the full elapsed-plus-remaining horizon coefficient
+from the starting temperature, multiplied by full test effort minus the current normal
+allocation. This retains passive decay and delayed response across the elapsed/remaining
+boundary and prevents renewing the allowance each pass. Recheck against the current
+normal allocation so a start at full normal effort cannot retain an exemption after the
+allocator drops to zero. The forecast is affine in efforts; passive terms and all other
+efforts cancel in the counterfactual difference. Expose `blocked_by`
+(room entity ID), `blocked_forecast` and `blocked_ceiling` (absolute °C) in each system's
+`experiments` attributes, clearing them when no room blocks. Name the room in `skip_reason`.
+
 Cycling constraints retain precedence. One global test runs at full steady effort, with no
-dither on any system and no mode selection caused by a test. Targets track the own sensor as
-needed to retain full effort. Complete after the configured observed steady duration; interrupted
-runtime does not accumulate across stops. A two-duration wall timeout bounds failed attempts.
-Aborts get a retry delay but do not become successful steady tests.
+dither on any system and no mode selection caused by a test. A due test overrides balance
+allocation and comfort holds; hand control, availability, mode, house demand and safety
+still gate operation. Targets track the own sensor as needed to retain full effort.
+Complete after the configured observed steady duration; interrupted runtime does not
+accumulate across stops. A two-duration wall timeout bounds failed attempts.
+
+Eligibility is the last qualifying steady evidence time (or initial observation if none)
+plus `excite_after_minutes`. Legacy `last_excite` retry timestamps no longer affect it.
+Skipped, aborted, timed-out, disabled or restart-cancelled tests remain due, with a safety
+retry on the next pass. Only qualifying evidence earns a new full wait. No system or room
+identities enter this policy.
 
 The seeded delayed-house regression uses independent on/off efforts, a pure eight-interval
 (40-minute) transport delay, and true steady response 0.300 °C/h. After 12,000 five-minute
@@ -1349,3 +1370,24 @@ a physically continuous temperature trajectory so averaging has meaningful time
 endpoints. The older defrost replay admits smaller movements inside the new
 jitter floor while continuing to flag its large excursions and preserve control
 and fan acceptance limits.
+
+
+## v0.5.14: tests must supply evidence without unrelated room vetoes
+
+Regression tests mirror safety checks in heat/cool: a room 3.7 °C beyond setpoint with
+0.007 °C/hour unit reach and independent upward drift permits a test, while a strongly
+warmed room crossing its ceiling records the room and forecast. Safety skips and aborts
+retry immediately once safe. With house error 0.4 °C and balance allocation zero, two
+successive 60-minute tests complete, with the next start due 120 minutes after qualifying
+evidence. Short reported/allocated operation cannot suppress a due test.
+
+The November 5 19:14 replay uses all seven supplied temperatures and only the Bryant
+`climate.home_zone_1`. Priority weights and the fitted live model were not supplied:
+weights reproduce the stated 21.6 °C mean, representative under-learned effects leave the
+balance allocator at zero, and Office drift is 0.3 °C/hour with the supplied 0.007 °C/hour
+Bryant reach. `Learning.forecast` yields 26.007 °C after 60 minutes versus the old 26.0 °C
+ceiling, demonstrating an Office veto under the old code and a test start with the fix.
+This is a conditional reconstruction, not a claim to recover the exact live forecast.
+At the supplied 25.7 °C starting temperature, the old Office gate would block whenever
+its one-hour baseline drift plus test effect exceeded 0.3 °C (approximately baseline
+rise >0.293 °C using the stated reach and no passive-retention/lag correction).
