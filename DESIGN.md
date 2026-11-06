@@ -47,7 +47,7 @@ by domain and, for temperature, power and occupancy sources, device class.
   occupancy sensor.
 - Tunables with defaults: control interval 5 min, mode-switch deadband 1.0 °C, minimum time in a
   mode 60 min, sensor stale after 720 min (12 h), frozen after 4 h, median window `filter_minutes` 15 min, maximum sensor rate
-  `max_rate` 0.5 °C/min, prediction horizon 45 min, own-sensor `run_margin` 1 °C,
+  `max_rate` 0.5 °C/min, prediction horizon 45 min, own-sensor `run_margin` 1 °C, fixed `off_margin` 3 °C,
   effort hysteresis 0.05 and effort on/off dwell 5 min, reported minimum run 10 min,
   minimum off 5 min, maximum starts 3/hour, comfort band 1 °C total, switching cost 0.05
   and effort movement cost 0.005. Cycling limits have optional per-system overrides;
@@ -152,7 +152,7 @@ Every control interval, and immediately when the house setpoint or mode changes:
    gains or room errors to the joint objective.
 
    Translate positive effort magnitude q to `own_current_temperature + direction × run_margin × q`.
-   Zero effort requests `own_current_temperature − direction × run_margin`. Thus low continuous
+   Zero effort requests `own_current_temperature − direction × off_margin` (default 3 °C, fixed and never learned). Thus low continuous
    output sits close to the local sensor. If the own sensor is missing, explicitly report
    using the house mean as a proxy. Retain effort hysteresis and legacy demand dwell as
    additional smoothing, with cycling and comfort bounds taking precedence. Round to the
@@ -168,7 +168,8 @@ Every control interval, and immediately when the house setpoint or mode changes:
    remainder into later scheduled passes so coarse target steps do not create a permanent
    effort bias. Repeated immediate calls reuse the same rounding adjustment. A held excitation
    keeps its exact target and suspends this remainder until normal allocation resumes.
-   Normal dither and inactivity excitation still apply, bounded in effort/device space.
+   Dither applies only to positive effort; off targets discard rounding carry and round away
+   from demand. Inactivity excitation still applies, bounded in effort/device space.
 
    `last_decision` names each system's on/low effort, the rooms its learned reach can lift/cool
    toward the average, and the room above/below that average driving restraint. Room and device
@@ -1391,3 +1392,39 @@ This is a conditional reconstruction, not a claim to recover the exact live fore
 At the supplied 25.7 °C starting temperature, the old Office gate would block whenever
 its one-hour baseline drift plus test effect exceeded 0.3 °C (approximately baseline
 rise >0.293 °C using the stated reach and no passive-retention/lag correction).
+
+
+## v0.5.15: fixed off margin and unexpected starts
+
+An off target was relative to the own sensor with only `run_margin` clearance and a
+final one-step off edge. A hot own sensor falling between passes could cross that
+old target and start the thermostat without any House demand transition. The
+November 5 22:13–22:28 sequence exposed this gap. Dither already could not promote
+zero effort, but the instantaneous edge did not protect against later sensor movement.
+
+`off_margin` is a Tunable, default 3 °C, placed below the own reading for heat and
+above for cool. It is fixed, never learned. Off targets ignore dither and rounding
+carry, round away from demand, and clamp to device limits; if the target cannot be
+strictly on the off side, use HVAC off. Positive-effort targets retain `run_margin`.
+The margin protects against normal between-pass own-sensor movement; device limits
+and movement beyond the margin remain physical constraints.
+
+A reported start while the command is off counts in the rolling start quota and
+is marked separately from a commanded start. The coordinator requests an immediate
+control pass on that action transition. A start inside the previous minimum off
+period is stopped regardless of current allocation. Otherwise allocation decides
+whether to adopt it; an unwanted start receives the fixed off target and the note
+“unrequested start stopped”. It never receives an unwanted minimum-run hold.
+Adoption does not double count the observed start. The marker survives Store state
+and clears on a known stop or adoption. Pending commanded starts with known idle action reports retain their on
+hold until acknowledged, then minimum run is timed from the later reported start.
+Explicit House off and outdoor veto retain precedence.
+
+Regressions replay the four own readings at five-minute passes in heat and cool,
+with a thermostat comparing target against own and reporting one pass late. They
+check no unintended demand, injected unwanted/too-soon starts and counting, device
+limits, and commanded-start lags of five and fifteen minutes. The existing noisy
+cycling and November 4 recorder replay enforce runs >=10 minutes, off periods
+>=5 minutes and <=3 starts per rolling hour.
+
+Devices without known action reports retain command-clock minimum-run protection.

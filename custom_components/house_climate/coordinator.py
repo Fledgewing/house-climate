@@ -534,6 +534,10 @@ class HouseCoordinator(DataUpdateCoordinator):
                 self.fans.invalidate(f"{entity_id} mode or fan/vane setting changed")
         if self.lock.locked() or self.data is None or old is None or new is None:
             return
+        if entity_id in self.state.unrequested_starts and old.attributes.get(
+            "hvac_action"
+        ) != new.attributes.get("hvac_action"):
+            self.hass.async_create_task(self.async_tick(record=False))
         for action in ("fan", "swing"):
             commanded = self.last_fan_commands.get((entity_id, action))
             if commanded and old.attributes.get(f"{action}_mode") != new.attributes.get(

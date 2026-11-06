@@ -413,3 +413,139 @@ def test_reported_hour_quota_outlives_earlier_command_quota():
         state.observe_action("unit", "idle", start + 850)
     assert cycling_hold(config, state, "unit", 3600) is False
     assert cycling_hold(config, state, "unit", 3840) is None
+
+
+@pytest.mark.parametrize("mode,direction", [("heat", 1), ("cool", -1)])
+def test_off_target_margin_survives_falling_own_sensor_and_late_reports(
+    mode, direction
+):
+    """22:13–22:28: hot own sensor cools after an ended test; no new call."""
+    config, state, devices = setup(mode)
+    config["explore_threshold"] = 0.8
+    model = Learning(["a", "b"], ["unit"])
+    device = devices["unit"]
+    action = "heating" if direction == 1 else "cooling"
+    state.command_demand("unit", True, -3600)
+    state.observe_action("unit", action, -3600)
+    device.hvac_action = action
+    reported_running = True
+    for i, heat_own in enumerate([24.5, 23.0, 23.5, 23.0]):
+        own = heat_own if direction == 1 else 42 - heat_own
+        device.current_temperature = own
+        # The thermostat reacts to its previous target before HC's next pass.
+        if i:
+            assert direction * (device.temperature - own) < 0
+        device.hvac_action = action if reported_running else "idle"
+        state.rounding_errors["unit"] = direction * 0.25
+        decision = control(
+            config,
+            state,
+            {"a": Reading(25 if direction == 1 else 17)},
+            devices,
+            i * 300,
+            learning=model,
+        )
+        for _, service, data in decision.commands:
+            if service == "set_temperature":
+                device.temperature = data["temperature"]
+        reported_running = direction * (device.temperature - own) > 0
+        assert not reported_running
+        assert direction * (own - device.temperature) == 3
+        assert not state.commanded["unit"]
+        assert "dither" not in decision.explanation
+    assert state.starts["unit"] == []
+
+
+@pytest.mark.parametrize("mode,action", [("heat", "heating"), ("cool", "cooling")])
+@pytest.mark.parametrize("wanted,stop", [(False, -600), (True, -60)])
+def test_unrequested_start_is_counted_and_stopped(mode, action, wanted, stop):
+    config, state, devices = setup(mode)
+    state.observe_action("unit", "idle", stop)
+    state.command_demand("unit", False, stop)
+    device = devices["unit"]
+    device.hvac_action = action
+    # Event listener records the transition before the next control pass.
+    state.observe_action("unit", action, 0)
+    state = ControlState(**deepcopy(asdict(state)))
+    temp = (18 if wanted else 25) if mode == "heat" else (24 if wanted else 17)
+    decision = control(config, state, {"a": Reading(temp)}, devices, 60)
+    target = next(
+        data["temperature"]
+        for _, service, data in decision.commands
+        if service == "set_temperature"
+    )
+    assert abs(target - device.current_temperature) == 3
+    assert (target < device.current_temperature) is (mode == "heat")
+    assert not state.commanded["unit"]
+    assert "unrequested start stopped" in decision.explanation
+    assert state.starts["unit"] == [0]
+    assert state.reported_starts["unit"] == [0]
+    assert state.cycling_status("unit", 60)["starts_last_hour"] == 1
+    state.observe_action("unit", "idle", 120)
+    assert cycling_hold(config, state, "unit", 419) is False
+
+
+@pytest.mark.parametrize("lag", [300, 900])
+def test_commanded_start_waits_for_report_then_runs_full_minimum(lag):
+    config, state, devices = setup()
+    device = devices["unit"]
+    device.hvac_action = "idle"
+    state.observe_action("unit", "idle", -600)
+    control(config, state, {"a": Reading(18)}, devices, 0)
+    for now in range(300, lag, 300):
+        control(config, state, {"a": Reading(25)}, devices, now)
+        assert state.commanded["unit"]
+    device.hvac_action = "heating"
+    for now in [lag, lag + 300, lag + 599]:
+        control(config, state, {"a": Reading(25)}, devices, now)
+        assert state.commanded["unit"]
+    control(config, state, {"a": Reading(25)}, devices, lag + 600)
+    assert not state.commanded["unit"]
+    assert state.last_start["unit"] == lag
+    assert state.starts["unit"] == [0]
+
+
+@pytest.mark.parametrize("mode,own,limit", [("heat", 8, 7), ("cool", 34, 35)])
+def test_off_margin_clamps_to_device_limits(mode, own, limit):
+    config, state, devices = setup(mode)
+    config["off_margin"] = 4
+    device = devices["unit"]
+    device.current_temperature = own
+    decision = control(
+        config, state, {"a": Reading(25 if mode == "heat" else 17)}, devices, 0
+    )
+    assert ("unit", "set_temperature", {"temperature": limit}) in decision.commands
+
+
+def test_wanted_unrequested_start_is_adopted_once_with_reported_run_clock():
+    config, state, devices = setup()
+    state.observe_action("unit", "idle", -600)
+    state.command_demand("unit", False, -600)
+    state.observe_action("unit", "heating", 0)
+    devices["unit"].hvac_action = "heating"
+    decision = control(config, state, {"a": Reading(18)}, devices, 60)
+    assert state.commanded["unit"]
+    assert not state.unrequested_starts
+    assert state.starts["unit"] == [0]
+    assert "unrequested start stopped" not in decision.explanation
+    assert cycling_hold(config, state, "unit", 599) is True
+    assert cycling_hold(config, state, "unit", 600) is None
+
+
+@pytest.mark.parametrize("own", [None, 21])
+def test_unrequested_start_without_room_sensors_is_stopped(own):
+    config, state, devices = setup()
+    state.observe_action("unit", "idle", -600)
+    state.command_demand("unit", False, -600)
+    device = devices["unit"]
+    device.current_temperature = own
+    device.hvac_action = "heating"
+    decision = control(config, state, {}, devices, 0)
+    assert "unrequested start stopped" in decision.explanation
+    assert not state.commanded["unit"]
+    expected = (
+        ("unit", "set_hvac_mode", {"hvac_mode": "off"})
+        if own is None
+        else ("unit", "set_temperature", {"temperature": 18})
+    )
+    assert expected in decision.commands

@@ -4,7 +4,7 @@ A Home Assistant custom integration that makes several HVAC systems act as one h
 
 The setpoint is the weighted **house average**. Each pass jointly chooses how much every available system should run to bring that average to the setpoint and reduce each room's deviation from it. A 45-minute prediction uses the learned room responses, outdoor losses, extra heat sources, solar gain and drift. There are no configured room mappings or individual room targets. A shared comfort band holds starts and stops only when every weighted room is comfortable.
 
-Each target is relative to that system's **own temperature sensor**: full heat requests its reading +1 °C and zero heat its reading −1 °C, mirrored for cooling. A warm living-room sensor therefore cannot silently disable the system best able to heat colder rooms. For modulating systems, positive effort q requests the own reading + q × run margin in heat, mirrored in cool: low output stays close to the own sensor instead of bursting on/off. Zero effort requests the opposite side of the own reading to stop demand. Coarse-target systems allocate on/off output; the per-system **Modulating target** option overrides the default inference (target step below 0.5 °C). Rounding cannot reverse the allocated on/off decision. Reported action, rather than requested targets, drives cycling protection. Device limits, target steps, effort hysteresis, dwell, shared mode selection and outdoor vetoes remain. Only changed commands are sent, including required hold presets. `last_decision` names which systems run or stay low and the rooms driving that choice.
+Each target is relative to that system's **own temperature sensor**: full heat requests its reading +1 °C and zero heat its reading −3 °C, mirrored for cooling. A warm living-room sensor therefore cannot silently disable the system best able to heat colder rooms. For modulating systems, positive effort q requests the own reading + q × run margin in heat, mirrored in cool: low output stays close to the own sensor instead of bursting on/off. Zero effort uses the fixed **off margin** (`off_margin`, default 3 °C), below the own reading for heat and above for cool, to prevent a cooling/heating own sensor from crossing the off target between passes. This margin is tunable, never learned, and clamped to device limits. Off targets receive no dither or rounding carry. Coarse-target systems allocate on/off output; the per-system **Modulating target** option overrides the default inference (target step below 0.5 °C). Rounding cannot reverse the allocated on/off decision. Reported action, rather than requested targets, drives cycling protection. Device limits, target steps, effort hysteresis, dwell, shared mode selection and outdoor vetoes remain. Only changed commands are sent, including required hold presets. `last_decision` names which systems run or stay low and the rooms driving that choice.
 
 ## Install
 
@@ -28,9 +28,9 @@ Automatic mode retains its 1 °C deadband and 60-minute heat/cool dwell. Cooling
 ## Steady operation and cycling protection
 
 Defaults are `min_run_minutes=10`, `min_off_minutes=5` and `max_starts_per_hour=3`.
-Options expose global defaults and optional per-system overrides. The timers start from
-**reported `hvac_action` transitions**, including changes between control passes; sending
-a target never counts as a compressor start. Store retains start/stop clocks and the rolling
+Options expose global defaults and optional per-system overrides. Commands reserve starts immediately; **reported `hvac_action` transitions**, including
+changes between control passes, confirm them without double counting. With known idle action reports, pending starts
+keep demand on until acknowledged, then minimum run counts from the later report. Store retains start/stop clocks and the rolling
 hour of starts. Recorder history seeds them before control, and a reload keeps those clocks.
 Without evidence, the first known action begins a conservative observation period.
 
@@ -41,7 +41,7 @@ rounding obey the same protection. Physical units can still stop themselves; the
 constrains its demand commands using the action evidence it receives.
 
 `comfort_band=1` means ±0.5 °C about the House setpoint. When **every available,
-positive-weight filtered room reading** lies inside that band, each unit keeps its reported
+positive-weight filtered room reading** lies inside that band, each unit keeps its commanded
 on/off state and can only modulate. If even one room is outside, the objective may start or
 stop units to improve balance—even if the house average is already in band. This is
 separate from the heat/cool mode `deadband`.
@@ -490,3 +490,16 @@ pass instead of resetting the evidence deadline. Regressions cover both heat and
 two successive 60-minute tests under balance restraint, and the supplied November 5
 19:14 room temperatures. The replay uses representative under-learned effects and drift
 because the live fitted model and priority weights were not supplied.
+
+
+## v0.5.15 off targets and delayed starts
+
+Off demand now uses a fixed, configurable `off_margin=3.0` °C relative to each
+unit's own sensor, mirrored for cooling, without dither. If device limits cannot
+produce an off-side target, House Climate sends HVAC off. On targets are unchanged.
+A reported start while commanded off is counted and evaluated immediately: if it
+violates minimum off time or is unwanted, House Climate sends a holding off target
+and reports “unrequested start stopped”. A commanded start reported late receives
+its full minimum run from that report. Tests include the November 5 22:13–22:28
+own-sensor replay and five/fifteen-minute acknowledgement delays, alongside the
+November 4 recorder and noisy cycling regressions.

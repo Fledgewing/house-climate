@@ -69,6 +69,9 @@ class ControlState:
     command_stop: dict[str, float] = field(default_factory=dict)
     pending_start: dict[str, bool] = field(default_factory=dict)
 
+    # Reported starts while demand was explicitly off, awaiting a decision.
+    unrequested_starts: dict[str, float] = field(default_factory=dict)
+
     def demand_on(self, key):
         return self.commanded.get(key, self.actions.get(key) in ("heating", "cooling"))
 
@@ -77,12 +80,16 @@ class ControlState:
         previous = self.demand_on(key)
         self.commanded[key] = on
         if on != previous:
-            if on:
+            if on and key in self.unrequested_starts:
+                # Adopt an observed start without counting it twice.
+                self.unrequested_starts.pop(key)
+            elif on:
                 self.command_start[key] = now
                 self.starts.setdefault(key, []).append(now)
                 self.pending_start[key] = True
             else:
                 self.command_stop[key] = now
+                self.pending_start.pop(key, None)
 
     def observe_report(self, system, device, config):
         """Retain reported actuator input separately from unknown runtime."""
@@ -217,6 +224,8 @@ class ControlState:
         known = action in ("heating", "cooling", "idle", "off", "fan", "drying")
         if known:
             if running and (not was_running or system not in self.last_start):
+                if self.commanded.get(system) is False:
+                    self.unrequested_starts[system] = now
                 self.last_start[system] = now
                 self.reported_starts.setdefault(system, []).append(now)
                 if not self.pending_start.pop(system, False):
@@ -229,6 +238,8 @@ class ControlState:
                 self.last_stop[system] = now
             elif not running:
                 self.last_stop.setdefault(system, now)
+        if known and not running:
+            self.unrequested_starts.pop(system, None)
         self.starts[system] = [t for t in self.starts.get(system, []) if t > now - 3600]
         self.reported_starts[system] = [
             t for t in self.reported_starts.get(system, []) if t > now - 3600
@@ -257,6 +268,20 @@ def cycling_hold(config, state, key, now):
         **config,
         **next((s for s in config["systems"] if s["entity_id"] == key), {}),
     }
+    if key in state.unrequested_starts:
+        # Never grant an unwanted start a minimum-run hold. A start inside
+        # the previous off delay must stop even if allocation now wants it.
+        start = state.unrequested_starts[key]
+        stop = max(
+            state.last_stop.get(key, float("-inf")),
+            state.command_stop.get(key, float("-inf")),
+        )
+        if start - stop < settings.get("min_off_minutes", 5) * 60 or max(
+            sum(now - 3600 < t <= now for t in clocks.get(key, []))
+            for clocks in (state.starts, state.reported_starts)
+        ) > settings.get("max_starts_per_hour", 3):
+            return False
+        return None
     running = state.demand_on(key)
     start = max(
         state.last_start.get(key, float("-inf")),
@@ -271,7 +296,10 @@ def cycling_hold(config, state, key, now):
     if not state.pending_start.get(key) and stop > start:
         running = False
     if running:
-        if now - start < settings.get("min_run_minutes", 10) * 60:
+        if (
+            state.pending_start.get(key)
+            and state.actions.get(key) in ("idle", "off", "fan", "drying")
+        ) or now - start < settings.get("min_run_minutes", 10) * 60:
             return True
     elif now - stop < settings.get("min_off_minutes", 5) * 60 or max(
         sum(now - 3600 < t <= now for t in clocks.get(key, []))
@@ -1129,9 +1157,8 @@ def control(
             if 0 < effort < 1:
                 effort = clamp(effort + state.drive_bias.get(entity_id, 0), 0.001, 1)
             margin = config.get("run_margin", 1)
-            if dither:
-                if effort > 0:
-                    effort = clamp(effort + direction * dither / (2 * margin), 0.001, 1)
+            if dither and effort > 0:
+                effort = clamp(effort + direction * dither / (2 * margin), 0.001, 1)
                 notes.append(f"{entity_id}: exploring ({dither:+.2f} °C dither).")
             previous = (
                 abs(state.efforts[entity_id]) if entity_id in state.efforts else None
@@ -1168,7 +1195,9 @@ def control(
                 notes.append(
                     f"{device.name or entity_id}: own sensor missing; using house mean as target reference."
                 )
-            target = own + direction * margin * (effort if effort > 0 else -1)
+            target = own + direction * (
+                margin * effort if effort > 0 else -config.get("off_margin", 3.0)
+            )
             if state.excitation.get("system") == entity_id and high > 0:
                 target = (
                     max(state.excitation["target"], target)
@@ -1250,6 +1279,8 @@ def control(
             if own is None or not isfinite(own):
                 own = house
             hold = cycling_hold(config, state, entity_id, now)
+            if house is None and entity_id in state.unrequested_starts:
+                hold = False
             in_band = bool(values) and all(
                 abs(t - state.setpoint) <= config.get("comfort_band", 1) / 2
                 for t in values.values()
@@ -1269,14 +1300,18 @@ def control(
                     )
                     target = max(target, edge) if direction == 1 else min(target, edge)
                 else:
-                    edge = (
-                        (ceil(own / device.step) - 1) * device.step
+                    # Round the fixed off margin away from demand, discarding
+                    # dither and rounding-error carry for this off target.
+                    edge = own - direction * config.get("off_margin", 3.0)
+                    target = (
+                        floor(edge / device.step) * device.step
                         if direction == 1
-                        else (floor(own / device.step) + 1) * device.step
+                        else ceil(edge / device.step) * device.step
                     )
-                    target = min(target, edge) if direction == 1 else max(target, edge)
+                    state.rounding_errors.pop(entity_id, None)
+                    state.target_adjustments.pop(entity_id, None)
                 target = clamp(target, device.minimum, device.maximum)
-                if hold is False and direction * (target - own) > 0:
+                if required is False and direction * (target - own) >= 0:
                     command_mode = "off"
                 if hold is not None and was_on != hold:
                     notes.append(
@@ -1296,6 +1331,10 @@ def control(
                         target = device.temperature
                 else:
                     command_mode = "off"
+        if entity_id in state.unrequested_starts and (
+            command_mode == "off" or required is False
+        ):
+            notes.append(f"{device.name or entity_id}: unrequested start stopped.")
         offset = target - state.setpoint
         if command_mode == "off":
             state.command_demand(entity_id, False, now)

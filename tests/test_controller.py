@@ -118,7 +118,7 @@ def test_effort_switches_in_one_pass_despite_legacy_slew(config):
     result = run(config, state, device=device)
     assert result.commands[-1][2] == {"temperature": 26}
     result = run(config, state, {"sensor.a": Reading(26)}, device, now=10600)
-    assert result.commands[-1][2] == {"temperature": 24}
+    assert result.commands[-1][2] == {"temperature": 22}
 
 
 def test_mean_integrates_once_per_interval(config):
@@ -154,12 +154,17 @@ def test_device_limits(config, setpoint, reading, expected):
         {"sensor.a": Reading(reading)},
         Device(minimum=10, maximum=30, current_temperature=reading),
     )
-    assert result.commands[-1][2] == {"temperature": expected}
+    if reading < 10:
+        # A clamped target above own cannot satisfy off demand.
+        assert not result.commands  # Device is already HVAC off.
+        assert not state.commanded["climate.a"]
+    else:
+        assert result.commands[-1][2] == {"temperature": expected}
 
 
 def test_preset_reassert_and_changed_only(config):
     device = Device(
-        mode="heat", temperature=20, current_temperature=21, preset="schedule"
+        mode="heat", temperature=18, current_temperature=21, preset="schedule"
     )
     result = run(config, readings={"sensor.a": Reading(21)}, device=device)
     assert result.commands == [

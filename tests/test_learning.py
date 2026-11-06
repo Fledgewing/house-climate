@@ -284,7 +284,7 @@ def test_learned_error_uses_sensor_weights_and_preserves_safeguards():
     assert "warm is" in decision.explanation
     for step in range(1, 30):
         control(config, state, readings, devices, step * 300, learning=model)
-        assert all(20 <= 21 + offset <= 22 for offset in state.offsets.values())
+        assert all(18 <= 21 + offset <= 22 for offset in state.offsets.values())
 
 
 def test_exploration_is_effort_bounded_and_observe_only():
@@ -298,18 +298,18 @@ def test_exploration_is_effort_bounded_and_observe_only():
     readings = {"room": Reading(21)}
     devices = {s: Device(mode="heat", current_temperature=21) for s in model.systems}
     decision = control(config, state, readings, devices, 0, learning=model)
-    assert "exploring" in decision.explanation
+    assert "exploring" not in decision.explanation
     assert state.offsets == {
-        "one": -1,
-        "two": -1,
+        "one": -3,
+        "two": -3,
     }  # All rooms in band: dither cannot start a unit.
     control(config, state, readings, devices, 1, learning=model)
     assert state.offsets == {
-        "one": -1,
-        "two": -1,
+        "one": -3,
+        "two": -3,
     }  # All rooms in band: dither cannot start a unit.
     control(config, state, readings, devices, 3600, learning=model)
-    assert all(-1 <= offset <= 1 for offset in state.offsets.values())
+    assert all(offset == -3 for offset in state.offsets.values())
     assert not control(
         config, state, readings, devices, 3900, enabled=False, learning=model
     ).commands

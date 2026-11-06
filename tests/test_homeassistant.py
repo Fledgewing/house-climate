@@ -324,6 +324,7 @@ async def complete_flow(
         if k not in ("sensors", "systems", "extra_heat_sources") and v not in ("", None)
     }
     fields = {field.schema: field for field in result["data_schema"].schema}
+    assert fields["off_margin"].default() == 3.0
     assert fields["stale_after"].default() == 720
     assert fields["learning_average_minutes"].default() == 10
     average_selector = result["data_schema"].schema[fields["learning_average_minutes"]]
@@ -423,7 +424,7 @@ async def test_external_changes_are_explained_and_reasserted(hass, installed):
         await hass.services.async_call(
             "climate",
             "set_temperature",
-            {"entity_id": "climate.ducted", "temperature": 16},
+            {"entity_id": "climate.ducted", "temperature": 15},
             blocking=True,
         )
         await hass.async_block_till_done()
@@ -3154,3 +3155,34 @@ async def test_jitter_completes_averaged_windows_without_transient_text(
                 await c.async_tick()
                 assert "sensor transient ignored" not in c.data.explanation
     assert c.learning.rows["sensor.room"].samples >= 3
+
+
+async def test_unrequested_action_event_stops_without_waiting_for_interval(
+    hass, installed
+):
+    entry, calls = installed
+    coordinator = entry.runtime_data
+    await coordinator.async_change(mode="heat", setpoint=19)
+    key = "climate.ducted"
+    assert coordinator.state.commanded[key] is False
+    calls.clear()
+    device = hass.states.get(key)
+    hass.states.async_set(
+        key,
+        "heat",
+        {
+            **device.attributes,
+            "hvac_action": "heating",
+            "current_temperature": 24.5,
+            "temperature": 23.5,
+        },
+    )
+    await hass.async_block_till_done()
+    assert "unrequested start stopped" in coordinator.data.explanation
+    assert coordinator.state.commanded[key] is False
+    assert len(coordinator.state.starts[key]) == 1
+    assert len(coordinator.state.reported_starts[key]) == 1
+    assert any(
+        entity == key and service == "set_temperature" and data["temperature"] <= 21.5
+        for entity, service, data in calls
+    )
