@@ -549,3 +549,166 @@ def test_unrequested_start_without_room_sensors_is_stopped(own):
         else ("unit", "set_temperature", {"temperature": 18})
     )
     assert expected in decision.commands
+
+
+@pytest.mark.parametrize("mode,direction", [("heat", 1), ("cool", -1)])
+def test_november_6_rising_own_sensor_with_one_pass_late_reports(mode, direction):
+    """02:44–03:10: the own sensor moves 1 °C/pass, with cloud reports late."""
+    config, state, devices = setup(mode)
+    device = devices["unit"]
+    device.hvac_action = "idle"
+    state.observe_action("unit", "idle", -600)
+    own = 22.5 if direction == 1 else 19.5
+    device.temperature = own - direction * 3
+    device.current_temperature = own
+    running = False
+    starts, stops = [], []
+    for now in range(0, 1501, 300):
+        # The physical thermostat compares the old command to its newer sensor
+        # before HC sees the delayed reading/action and chooses another target.
+        if now:
+            own += direction * int(running)
+            if running:
+                assert direction * (device.temperature - own) > 0
+        device.current_temperature = own - direction * int(running)
+        device.hvac_action = (
+            ("heating" if direction == 1 else "cooling") if running else "idle"
+        )
+        decision = control(
+            config,
+            state,
+            {"a": Reading((18 if direction == 1 else 24) if now < 900 else 21)},
+            devices,
+            now,
+        )
+        for _, service, data in decision.commands:
+            if service == "set_temperature":
+                device.temperature = data["temperature"]
+        on = direction * (device.temperature - own) > 0
+        if on != running:
+            (starts if on else stops).append(now)
+        running = on
+        assert state.commanded["unit"]  # Comfortable rooms retain command on.
+        assert direction * (device.temperature - device.current_temperature) == 3
+    assert starts == [0]
+    assert not stops
+    assert state.starts["unit"] == [0]
+    assert running and 1500 - starts[0] >= 600
+
+
+@pytest.mark.parametrize("mode,direction", [("heat", 1), ("cool", -1)])
+@pytest.mark.parametrize(
+    "step,modulating", [(0.5, False), (0.1, False), (0.5, True), (0.1, True)]
+)
+def test_on_clearance_rounds_away_and_honors_modulating_override(
+    mode, direction, step, modulating
+):
+    config, state, devices = setup(mode, modulating=modulating)
+    config["on_margin"] = 3.0
+    device = devices["unit"]
+    device.step = step
+    device.current_temperature = 21.23
+    decision = control(
+        config, state, {"a": Reading(18 if direction == 1 else 24)}, devices, 0
+    )
+    target = next(
+        data["temperature"]
+        for _, service, data in decision.commands
+        if service == "set_temperature"
+    )
+    gap = direction * (target - device.current_temperature)
+    if modulating:
+        assert gap == pytest.approx(1, abs=step / 2)
+    else:
+        assert 3 <= gap < 3 + step
+
+
+@pytest.mark.parametrize("mode,own,limit", [("heat", 34, 35), ("cool", 8, 7)])
+def test_on_margin_clamps_to_device_limits(mode, own, limit):
+    config, state, devices = setup(mode)
+    device = devices["unit"]
+    device.current_temperature = own
+    decision = control(
+        config, state, {"a": Reading(18 if mode == "heat" else 24)}, devices, 0
+    )
+    assert ("unit", "set_temperature", {"temperature": limit}) in decision.commands
+
+
+@pytest.mark.parametrize(
+    "mode,action,direction", [("heat", "heating", 1), ("cool", "cooling", -1)]
+)
+def test_unit_finishes_twenty_minute_protection_without_more_commands(
+    mode, action, direction
+):
+    config, state, devices = setup(mode)
+    device = devices["unit"]
+    device.name = "Unit"
+    device.hvac_action = action
+    state.command_demand("unit", True, -1200)
+    state.observe_action("unit", action, -1200)
+    decision = control(
+        config, state, {"a": Reading(25 if direction == 1 else 17)}, devices, 0
+    )
+    for _, service, data in decision.commands:
+        if service == "set_temperature":
+            device.temperature = data["temperature"]
+    off_target = device.temperature
+    assert not state.commanded["unit"]
+    starts = deepcopy(state.starts)
+    reported_starts = deepcopy(state.reported_starts)
+    for now in (300, 600, 900, 1200):
+        device.current_temperature += direction * 0.5
+        state = ControlState(**deepcopy(asdict(state)))
+        decision = control(
+            config, state, {"a": Reading(25 if direction == 1 else 17)}, devices, now
+        )
+        assert decision.commands == []
+        assert device.temperature == off_target
+        assert state.off_targets["unit"][1] == off_target
+        assert "Unit finishing its own run" in decision.explanation
+        assert "unrequested start" not in decision.explanation
+        assert not state.commanded["unit"]
+        assert state.starts == starts
+        assert state.reported_starts == reported_starts
+        assert state.reported_efforts["unit"] == direction
+    state.observe_action("unit", "idle", 1260)
+    state.observe_action("unit", action, 1500)
+    assert state.unrequested_starts["unit"] == 1500
+    assert state.starts["unit"] == starts["unit"] + [1500]
+
+
+@pytest.mark.parametrize("commanded", [False, True])
+def test_hysteresis_uses_command_even_when_report_and_effort_disagree(
+    monkeypatch, commanded
+):
+    config, state, devices = setup()
+    config.update(effort_dwell_minutes=30, comfort_band=0)
+    device = devices["unit"]
+    device.hvac_action = "idle" if commanded else "heating"
+    state.observe_action("unit", device.hvac_action, -3600)
+    state.commanded["unit"] = commanded
+    state.efforts["unit"] = 0 if commanded else 1
+    state.effort_switches["unit"] = -60
+    monkeypatch.setattr(
+        "custom_components.house_climate.controller.allocate",
+        lambda *args: ({"unit": 0 if commanded else 1}, state.setpoint),
+    )
+    control(config, state, {"a": Reading(18)}, devices, 0)
+    assert state.commanded["unit"] is commanded
+    assert (state.efforts["unit"] > 0) is commanded
+
+
+@pytest.mark.parametrize("mode,direction", [("heat", 1), ("cool", -1)])
+def test_modulating_required_on_has_a_full_step_clearance(mode, direction):
+    config, state, devices = setup(mode, modulating=True)
+    config.update(comfort_band=0, switch_penalty=0, effort_change_penalty=0)
+    device = devices["unit"]
+    device.current_temperature = 21.04
+    decision = control(config, state, {"a": Reading(21 - direction * 0.05)}, devices, 0)
+    assert 0 < abs(state.efforts["unit"]) < 0.5
+    target = next(
+        data["temperature"]
+        for _, service, data in decision.commands
+        if service == "set_temperature"
+    )
+    assert direction * (target - device.current_temperature) >= device.step

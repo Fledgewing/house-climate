@@ -68,6 +68,7 @@ class ControlState:
     command_start: dict[str, float] = field(default_factory=dict)
     command_stop: dict[str, float] = field(default_factory=dict)
     pending_start: dict[str, bool] = field(default_factory=dict)
+    off_targets: dict[str, tuple[str, float]] = field(default_factory=dict)
 
     # Reported starts while demand was explicitly off, awaiting a decision.
     unrequested_starts: dict[str, float] = field(default_factory=dict)
@@ -223,8 +224,13 @@ class ControlState:
         was_running = previous in ("heating", "cooling")
         known = action in ("heating", "cooling", "idle", "off", "fan", "drying")
         if known:
-            if running and (not was_running or system not in self.last_start):
-                if self.commanded.get(system) is False:
+            if running and not was_running:
+                if self.commanded.get(system) is False and previous in (
+                    "idle",
+                    "off",
+                    "fan",
+                    "drying",
+                ):
                     self.unrequested_starts[system] = now
                 self.last_start[system] = now
                 self.reported_starts.setdefault(system, []).append(now)
@@ -341,6 +347,20 @@ def excitation_scores(config, state, values, learning, outdoor=None):
             ranked,
         )
     return scores
+
+
+def on_target(config, system, device, own, direction):
+    """Full test/binary demand, with clearance rounded away from the reading."""
+    modulating = system.get("modulating", device.step < 0.5)
+    margin = config.get("run_margin", 1) if modulating else config.get("on_margin", 3.0)
+    raw = own + direction * margin
+    rounded = (
+        floor(raw / device.step + 0.5) * device.step
+        if modulating
+        else (ceil(raw / device.step) if direction > 0 else floor(raw / device.step))
+        * device.step
+    )
+    return clamp(rounded, device.minimum, device.maximum)
 
 
 def excitation_target(
@@ -555,15 +575,9 @@ def excitation_target(
         ),
     ):
         device = devices[key]
-        target = clamp(
-            floor(
-                (device.current_temperature + direction * config.get("run_margin", 1))
-                / device.step
-                + 0.5
-            )
-            * device.step,
-            device.minimum,
-            device.maximum,
+        system = next(s for s in config["systems"] if s["entity_id"] == key)
+        target = on_target(
+            config, system, device, device.current_temperature, direction
         )
         if direction * (target - device.current_temperature) <= 0:
             state.experiment_info[key]["skip_reason"] = "target at device limit"
@@ -1161,20 +1175,18 @@ def control(
                 effort = clamp(effort + direction * dither / (2 * margin), 0.001, 1)
                 notes.append(f"{entity_id}: exploring ({dither:+.2f} °C dither).")
             previous = (
-                abs(state.efforts[entity_id]) if entity_id in state.efforts else None
+                max(0.001, abs(state.efforts.get(entity_id, 1)))
+                if state.demand_on(entity_id)
+                else 0
             )
-            if (
-                not state.excitation
-                and previous is not None
-                and (effort > 0) != (previous > 0)
-            ):
+            if not state.excitation and (effort > 0) != (previous > 0):
                 if (
                     0 < effort < config.get("effort_hysteresis", 0.05)
                     or now - state.effort_switches.get(entity_id, float("-inf"))
                     < config.get("effort_dwell_minutes", 5) * 60
                 ):
                     effort = previous
-            if previous is None or (effort > 0) != (previous > 0):
+            if (effort > 0) != (previous > 0):
                 state.effort_switches[entity_id] = now
             in_band = all(
                 abs(t - state.setpoint) <= config.get("comfort_band", 1) / 2
@@ -1195,8 +1207,12 @@ def control(
                 notes.append(
                     f"{device.name or entity_id}: own sensor missing; using house mean as target reference."
                 )
-            target = own + direction * (
-                margin * effort if effort > 0 else -config.get("off_margin", 3.0)
+            target = (
+                own + direction * margin * effort
+                if effort > 0 and system.get("modulating", device.step < 0.5)
+                else on_target(config, system, device, own, direction)
+                if effort > 0
+                else own - direction * config.get("off_margin", 3.0)
             )
             if state.excitation.get("system") == entity_id and high > 0:
                 target = (
@@ -1293,12 +1309,19 @@ def control(
             if own is not None and required is not None:
                 was_on = direction * (target - own) > 0
                 if required:
-                    edge = (
-                        (floor(own / device.step) + 1) * device.step
-                        if direction == 1
-                        else (ceil(own / device.step) - 1) * device.step
-                    )
-                    target = max(target, edge) if direction == 1 else min(target, edge)
+                    if system.get("modulating", device.step < 0.5):
+                        edge = (
+                            ceil((own + device.step) / device.step) * device.step
+                            if direction == 1
+                            else floor((own - device.step) / device.step) * device.step
+                        )
+                        target = (
+                            max(target, edge) if direction == 1 else min(target, edge)
+                        )
+                    else:
+                        target = on_target(config, system, device, own, direction)
+                        state.rounding_errors.pop(entity_id, None)
+                        state.target_adjustments.pop(entity_id, None)
                 else:
                     # Round the fixed off margin away from demand, discarding
                     # dither and rounding-error carry for this off target.
@@ -1335,12 +1358,36 @@ def control(
             command_mode == "off" or required is False
         ):
             notes.append(f"{device.name or entity_id}: unrequested start stopped.")
+        finishing = (
+            mode in ("heat", "cool")
+            and required is False
+            and state.commanded.get(entity_id) is False
+            and device.hvac_action in ("heating", "cooling")
+            and entity_id not in state.unrequested_starts
+        )
+        if finishing:
+            previous_off = state.off_targets.get(entity_id)
+            if previous_off and previous_off[0] == mode:
+                target = previous_off[1]
+                command_mode = mode
+            elif device.temperature is not None:
+                target = device.temperature
+            keep_target = True
+            notes.append(f"{device.name or entity_id} finishing its own run.")
+        if mode in ("heat", "cool") and required is False and command_mode != "off":
+            state.off_targets[entity_id] = (mode, target)
         offset = target - state.setpoint
         if command_mode == "off":
             state.command_demand(entity_id, False, now)
         elif mode in ("heat", "cool") and own is not None:
-            state.command_demand(entity_id, direction * (target - own) > 0, now)
+            state.command_demand(
+                entity_id,
+                required if required is not None else direction * (target - own) > 0,
+                now,
+            )
         state.offsets[entity_id] = offset
+        if finishing:
+            continue
         if device.mode != command_mode:
             notes.append(f"{entity_id}: mode differs; re-asserting {command_mode}.")
             commands.append((entity_id, "set_hvac_mode", {"hvac_mode": command_mode}))

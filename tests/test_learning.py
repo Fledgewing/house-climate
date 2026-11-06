@@ -285,7 +285,7 @@ def test_learned_error_uses_sensor_weights_and_preserves_safeguards():
     assert "warm is" in decision.explanation
     for step in range(1, 30):
         control(config, state, readings, devices, step * 300, learning=model)
-        assert all(18 <= 21 + offset <= 22 for offset in state.offsets.values())
+        assert all(18 <= 21 + offset <= 24 for offset in state.offsets.values())
 
 
 def test_exploration_is_effort_bounded_and_observe_only():

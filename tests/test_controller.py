@@ -116,7 +116,7 @@ def test_effort_switches_in_one_pass_despite_legacy_slew(config):
     state = ControlState(mode="heat", setpoint=22.5, offsets={"climate.a": -3})
     device = Device(mode="heat", current_temperature=25)
     result = run(config, state, device=device)
-    assert result.commands[-1][2] == {"temperature": 26}
+    assert result.commands[-1][2] == {"temperature": 28}
     result = run(config, state, {"sensor.a": Reading(26)}, device, now=10600)
     assert result.commands[-1][2] == {"temperature": 22}
 
@@ -215,11 +215,11 @@ def test_multiroom_with_four_quiet_sensors_raises_whole_house_offset():
     result = control(config, state, readings, devices, 10000)
     assert result.readings == dict(zip(sensors, values, strict=True))
     assert result.temperature == pytest.approx(20.0166666667)
-    assert state.offsets[config["systems"][0]["entity_id"]] == 2.5
+    assert state.offsets[config["systems"][0]["entity_id"]] == 4.5
     assert (
         "climate.ducted",
         "set_temperature",
-        {"temperature": 23.5},
+        {"temperature": 25.5},
     ) in result.commands
 
 
@@ -254,7 +254,7 @@ def test_one_unavailable_system_does_not_block_others(config):
 def test_missing_room_uses_available_house_mean(config):
     result = run(config, readings={"sensor.a": Reading(19)})
     assert result.temperature == 19
-    assert result.commands[-1][2] == {"temperature": 20}
+    assert result.commands[-1][2] == {"temperature": 22}
 
 
 def test_outdoor_veto_thresholds_are_configurable(config):

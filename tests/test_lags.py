@@ -209,7 +209,7 @@ def test_short_allocator_runs_trigger_full_steady_experiment_and_confidence_rise
             assert state.excitation["system"] == "A"
             assert state.efforts["A"] == 1
     assert not state.excitation
-    assert set(targets) == {22}
+    assert set(targets) == {24}
     assert state.last_steady_test["A"] == 10800
     assert model.confidence("D", "A") > initial
     assert state.experiment_info["A"]["last_steady_test"] == 10800

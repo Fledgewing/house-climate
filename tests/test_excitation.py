@@ -73,17 +73,18 @@ def test_excitation_waits_then_holds_local_target_and_one_system():
     assert not state.excitation
     result = tick(parts, 7200)
     assert state.excitation["system"] == "a"
-    assert state.excitation["target"] == 25
+    assert state.excitation["target"] == 27
     assert (
         "testing A for 30 min to learn its effect on cold, warm" in result.explanation
     )
-    assert ("a", "set_temperature", {"temperature": 25}) in result.commands
+    assert ("a", "set_temperature", {"temperature": 27}) in result.commands
     assert len(state.excitation) > 0
     devices["a"].current_temperature = 24.5
     devices["a"].hvac_action = "heating"
-    tick(parts, 7500)
+    result = tick(parts, 7500)
+    assert ("a", "set_temperature", {"temperature": 27.5}) in result.commands
     assert state.excitation["runtime"] == 0
-    assert state.excitation["target"] == 25
+    assert state.excitation["target"] == 27
     # Transition between ticks: only actual heating seconds count.
     state.observe_action("a", "idle", 8100)
     tick(parts, 8400)
@@ -160,7 +161,7 @@ def test_excitation_conditions(reason):
         assert not state.excitation
 
 
-@pytest.mark.parametrize("mode,local,expected", [("heat", 26, 27), ("cool", 18, 17)])
+@pytest.mark.parametrize("mode,local,expected", [("heat", 26, 29), ("cool", 18, 15)])
 def test_excitation_clamp_cooling_and_device_limits(mode, local, expected):
     parts = setup(mode)
     _, state, _, devices, readings = parts

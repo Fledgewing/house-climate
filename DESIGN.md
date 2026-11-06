@@ -47,7 +47,7 @@ by domain and, for temperature, power and occupancy sources, device class.
   occupancy sensor.
 - Tunables with defaults: control interval 5 min, mode-switch deadband 1.0 °C, minimum time in a
   mode 60 min, sensor stale after 720 min (12 h), frozen after 4 h, median window `filter_minutes` 15 min, maximum sensor rate
-  `max_rate` 0.5 °C/min, prediction horizon 45 min, own-sensor `run_margin` 1 °C, fixed `off_margin` 3 °C,
+  `max_rate` 0.5 °C/min, prediction horizon 45 min, own-sensor `run_margin` 1 °C, fixed `on_margin` and `off_margin` 3 °C,
   effort hysteresis 0.05 and effort on/off dwell 5 min, reported minimum run 10 min,
   minimum off 5 min, maximum starts 3/hour, comfort band 1 °C total, switching cost 0.05
   and effort movement cost 0.005. Cycling limits have optional per-system overrides;
@@ -151,7 +151,13 @@ Every control interval, and immediately when the house setpoint or mode changes:
    integrals remain loadable but are unused. This keeps upgrades from applying old PI
    gains or room errors to the joint objective.
 
-   Translate positive effort magnitude q to `own_current_temperature + direction × run_margin × q`.
+   For modulating systems, translate positive effort magnitude q to
+   `own_current_temperature + direction × run_margin × q`, at least one device step
+   past the reading when required on. For non-modulating systems, use the fixed
+   `own_current_temperature + direction × on_margin` (default 3 °C), rounded away
+   from the reading to the device step and clamped to device limits. Recompute it
+   each pass while commanded on, including steady tests; a minimum-run allocation
+   floor never shrinks that clearance.
    Zero effort requests `own_current_temperature − direction × off_margin` (default 3 °C, fixed and never learned). Thus low continuous
    output sits close to the local sensor. If the own sensor is missing, explicitly report
    using the house mean as a proxy. Retain effort hysteresis and legacy demand dwell as
@@ -167,7 +173,8 @@ Every control interval, and immediately when the house setpoint or mode changes:
    immediate requests and held excitation do not train it. Carry the bounded target-rounding
    remainder into later scheduled passes so coarse target steps do not create a permanent
    effort bias. Repeated immediate calls reuse the same rounding adjustment. A held excitation
-   keeps its exact target and suspends this remainder until normal allocation resumes.
+   suspends this remainder until normal allocation resumes. Non-modulating tests
+   refresh the same fixed on margin each pass.
    Dither applies only to positive effort; off targets discard rounding carry and round away
    from demand. Inactivity excitation still applies, bounded in effort/device space.
 
@@ -1433,3 +1440,37 @@ cycling and November 4 recorder replay enforce runs >=10 minutes, off periods
 >=5 minutes and <=3 starts per rolling hour.
 
 Devices without known action reports retain command-clock minimum-run protection.
+
+
+## v0.5.17: on clearance and units finishing their own runs
+
+The November 6 02:49–03:09 reports exposed insufficient on clearance: normal
+positive effort used `run_margin × effort`, and the final required-on edge only
+kept a target just past the current own reading. A cloud-polled thermostat whose
+sensor rose about 1 °C per pass could reach an older target and stop itself before
+House Climate's ten-minute minimum run elapsed. Non-modulating targets now use
+fixed `on_margin=3.0` °C, configurable beside `off_margin`, in normal allocation,
+cycling holds and steady tests. Round away from the reading, clamp to device limits,
+and refresh every pass. Targets that already match need no duplicate service call.
+Modulating targets retain effort scaling and rounding feedback, with at least one
+step of required-on clearance. Device limits can still prevent full clearance;
+between-pass movement beyond the margin remains a physical constraint.
+
+Commanded demand determines hysteresis, comfort holds and start reservations;
+reported transitions extend minimum-run timing. Reaching the target does not
+change commanded demand: allocation or a hold chooses whether to stop.
+
+A continuing reported heating/cooling action after an off command is the unit
+finishing its own protected run, even twenty minutes later. It earns no new start
+or minimum-run hold, receives no extra commands, and retains its off target while
+House demand remains off. `last_decision` says “<unit> finishing its own run”.
+Persist the off target across reloads. Learning continues to use reported action.
+The v0.5.15 unrequested-start marker applies to a new known idle/off-to-active
+transition while commanded off, not a continuing active report.
+
+Regressions replay 02:44–03:10 in heat and cool at five-minute intervals with
+one-pass-late reports and 1 °C own-sensor movement per heating/cooling pass:
+one continuous run of at least ten minutes, no on/off/on, and refreshed 3 °C
+clearance. Further tests cover both modulating overrides, away rounding, device
+limits, steady-test targets and twenty minutes of protected run completion with
+unchanged start counts and no commands, followed by a true unrequested start.

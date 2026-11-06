@@ -324,6 +324,7 @@ async def complete_flow(
         if k not in ("sensors", "systems", "extra_heat_sources") and v not in ("", None)
     }
     fields = {field.schema: field for field in result["data_schema"].schema}
+    assert fields["on_margin"].default() == 3.0
     assert fields["off_margin"].default() == 3.0
     assert fields["stale_after"].default() == 720
     assert fields["learning_average_minutes"].default() == 10
@@ -1784,7 +1785,7 @@ async def test_excitation_dispatch_between_tick_runtime_and_restart(hass, instal
     assert any(
         key == "climate.ducted"
         and service == "set_temperature"
-        and data["temperature"] == 25
+        and data["temperature"] == 27
         for key, service, data in calls
     )
     assert (

@@ -1,10 +1,10 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.16 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.17 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 The setpoint is the weighted **house average**. Each pass jointly chooses how much every available system should run to bring that average to the setpoint and reduce each room's deviation from it. A 45-minute prediction uses the learned room responses, outdoor losses, extra heat sources, solar gain and drift. There are no configured room mappings or individual room targets. A shared comfort band holds starts and stops only when every weighted room is comfortable.
 
-Each target is relative to that system's **own temperature sensor**: full heat requests its reading +1 °C and zero heat its reading −3 °C, mirrored for cooling. A warm living-room sensor therefore cannot silently disable the system best able to heat colder rooms. For modulating systems, positive effort q requests the own reading + q × run margin in heat, mirrored in cool: low output stays close to the own sensor instead of bursting on/off. Zero effort uses the fixed **off margin** (`off_margin`, default 3 °C), below the own reading for heat and above for cool, to prevent a cooling/heating own sensor from crossing the off target between passes. This margin is tunable, never learned, and clamped to device limits. Off targets receive no dither or rounding carry. Coarse-target systems allocate on/off output; the per-system **Modulating target** option overrides the default inference (target step below 0.5 °C). Rounding cannot reverse the allocated on/off decision. Reported action, rather than requested targets, drives cycling protection. Device limits, target steps, effort hysteresis, dwell, shared mode selection and outdoor vetoes remain. Only changed commands are sent, including required hold presets. `last_decision` names which systems run or stay low and the rooms driving that choice.
+Each target is relative to that system's **own temperature sensor**: non-modulating heat requests its reading +3 °C and zero heat its reading −3 °C, mirrored for cooling. A warm living-room sensor therefore cannot silently disable the system best able to heat colder rooms. For modulating systems, positive effort q requests the own reading + q × run margin in heat, mirrored in cool: low output stays close to the own sensor instead of bursting on/off. Zero effort uses the fixed **off margin** (`off_margin`, default 3 °C), below the own reading for heat and above for cool, to prevent a cooling/heating own sensor from crossing the off target between passes. This margin is tunable, never learned, and clamped to device limits. Off targets receive no dither or rounding carry. Coarse-target systems allocate on/off output; the per-system **Modulating target** option overrides the default inference (target step below 0.5 °C). Non-modulating on targets use fixed **on margin** (`on_margin`, default 3 °C), rounded away from the reading and refreshed each pass, including steady tests. Modulating on targets retain at least one step of clearance. Rounding cannot reverse the allocated on/off decision. Commanded demand reserves cycling transitions; reported action confirms starts and extends protection. Device limits, target steps, effort hysteresis, dwell, shared mode selection and outdoor vetoes remain. Only changed commands are sent, including required hold presets. `last_decision` names which systems run or stay low and the rooms driving that choice.
 
 ## Install
 
@@ -21,7 +21,7 @@ Alternatively, manually copy `custom_components/house_climate` from this reposit
 
 Use the integration's **Configure** options to add or remove sensors and systems, change weights or required presets, and edit tunables. Added sensors count in the house mean immediately, start with neutral learning priors, and learn independently; removed sensors lose their model rows. Removing a system stops controlling it and leaves its last device settings in place.
 
-Defaults: 5-minute control interval, 45-minute prediction horizon, 1 °C own-sensor run margin, effort hysteresis 0.05 and 5-minute effort on/off dwell. The mean-error integral gain is 0.001 per interval, with anti-windup and a ±1 °C bias limit. The allocator uses `average_weight` (λ, default 1, range 0.01–10) to balance weighted room variance against squared mean error. Lower it when keeping rooms even matters more than reaching the average setpoint; the average may remain below setpoint in heat. The fan learner follows this weight unless `fan_reward_lambda` is explicitly set (clear that optional field to follow again). The mean integral gain is multiplied by λ/(1+λ): 0.5 at λ=1 and 1/6 at λ=0.2, with the existing predicted-reachability anti-windup check retained. Legacy PI gains, house offset clamps and slew settings are retained for compatibility and are unused by the new allocator; the new mean integral has its own setting so upgrades use its small default.
+Defaults: 5-minute control interval, 45-minute prediction horizon, 1 °C modulating run margin, fixed 3 °C non-modulating on and off margins, effort hysteresis 0.05 and 5-minute effort on/off dwell. The mean-error integral gain is 0.001 per interval, with anti-windup and a ±1 °C bias limit. The allocator uses `average_weight` (λ, default 1, range 0.01–10) to balance weighted room variance against squared mean error. Lower it when keeping rooms even matters more than reaching the average setpoint; the average may remain below setpoint in heat. The fan learner follows this weight unless `fan_reward_lambda` is explicitly set (clear that optional field to follow again). The mean integral gain is multiplied by λ/(1+λ): 0.5 at λ=1 and 1/6 at λ=0.2, with the existing predicted-reachability anti-windup check retained. Legacy PI gains, house offset clamps and slew settings are retained for compatibility and are unused by the new allocator; the new mean integral has its own setting so upgrades use its small default.
 
 Automatic mode retains its 1 °C deadband and 60-minute heat/cool dwell. Cooling is vetoed below 10 °C outdoors; heating above 24 °C. Explicit heat/cool requests take effect immediately, subject to the outdoor veto. Starts and stops obey cycling protection on scheduled and immediate passes. Explicit House off and outdoor vetoes still stop operation.
 
@@ -504,3 +504,21 @@ and reports “unrequested start stopped”. A commanded start reported late rec
 its full minimum run from that report. Tests include the November 5 22:13–22:28
 own-sensor replay and five/fifteen-minute acknowledgement delays, alongside the
 November 4 recorder and noisy cycling regressions.
+
+
+## v0.5.17 on targets and protected run completion
+
+Non-modulating units now receive their own reading plus `on_margin=3.0` °C for
+heat (minus for cool), rounded away to the target step and clamped to device limits.
+Each pass refreshes that clearance while House Climate wants the unit on, including
+minimum-run holds and steady tests. This prevents ordinary own-sensor movement
+between cloud reports from ending a run early. Modulating units retain their
+proportional targets, with at least one device step of required-on clearance.
+Both margins are configurable under Tunables.
+
+A unit still heating/cooling after House Climate's off command can be completing
+its own minimum run or protection. House Climate keeps its off target, sends no
+extra commands, and explains “<unit> finishing its own run”. This continuation
+counts no new start; learning still uses the reported heating/cooling. A new
+idle-to-heating/cooling transition while commanded off remains an unrequested start.
+Commanded state governs hysteresis and comfort holds.

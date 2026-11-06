@@ -373,6 +373,7 @@ class HouseSteps:
             ("effort_change_penalty", 0, 1, 0.001),
             ("comfort_band", 0, 5, 0.1),
             ("run_margin", 0.5, 5, 0.5),
+            ("on_margin", 0.5, 10, 0.5),
             ("off_margin", 0.5, 10, 0.5),
             ("thermostat_hysteresis", 0, 3, 0.1),
             ("control_horizon_minutes", 5, 120, 5),
