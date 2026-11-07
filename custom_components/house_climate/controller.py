@@ -423,14 +423,21 @@ def excitation_target(
             )
             + wait
         )
+        previous = state.experiment_info.get(key, {})
         state.experiment_info[key] = {
             "uncertainty_score": score,
             "last_steady_test": last,
             "next_eligible": eligible,
             "skip_reason": None,
-            "blocked_by": None,
-            "blocked_reading": None,
-            "blocked_ceiling": None,
+            **{
+                field: previous.get(field)
+                for field in (
+                    "blocked_by",
+                    "blocked_reading",
+                    "blocked_ceiling",
+                    "blocked_at",
+                )
+            },
         }
     rooms = counted_rooms(config, values)
     direction = 1 if mode == "heat" else -1
@@ -449,13 +456,8 @@ def excitation_target(
             start = direction * (initial.get(room, values[room]) - state.setpoint)
             ceiling = max(limit, start + 0.3) if start > limit else limit
             if direction * (values[room] - state.setpoint) > ceiling:
-                state.experiment_info[key].update(
-                    blocked_by=room,
-                    blocked_reading=values[room],
-                    blocked_ceiling=state.setpoint + direction * ceiling,
-                )
-                return True
-        return False
+                return room, values[room], state.setpoint + direction * ceiling
+        return None
 
     threshold = (1 - config.get("explore_threshold", 0.8)) * 0.03
     candidates = []
@@ -524,6 +526,13 @@ def excitation_target(
         )
         if finished:
             if unsafe and can_stop:
+                room, reading, ceiling = unsafe
+                state.experiment_info[key].update(
+                    blocked_by=room,
+                    blocked_reading=reading,
+                    blocked_ceiling=ceiling,
+                    blocked_at=now,
+                )
                 state.last_test_attempt[key] = now
                 state.experiment_info[key]["next_eligible"] = now + wait
                 if allocation is not None:
@@ -558,6 +567,9 @@ def excitation_target(
         if direction * (target - device.current_temperature) <= 0:
             state.experiment_info[key]["skip_reason"] = "target at device limit"
             continue
+        state.experiment_info[key].update(
+            blocked_by=None, blocked_reading=None, blocked_ceiling=None, blocked_at=None
+        )
         state.excitation = {
             "system": key,
             "mode": mode,
@@ -1354,8 +1366,8 @@ def control(
                     f"{device.name or entity_id}: held {'on' if hold else 'off'} for cycling protection; no temperature reference."
                 )
                 if hold:
-                    keep_target = True
-                    if device.temperature is not None:
+                    keep_target = device.mode == mode
+                    if keep_target and device.temperature is not None:
                         target = device.temperature
                 else:
                     command_mode = "off"
@@ -1365,6 +1377,7 @@ def control(
             notes.append(f"{device.name or entity_id}: unrequested start stopped.")
         finishing = (
             mode in ("heat", "cool")
+            and device.mode == mode
             and required is False
             and state.commanded.get(entity_id) is False
             and device.hvac_action in ("heating", "cooling")
@@ -1393,14 +1406,15 @@ def control(
         state.offsets[entity_id] = offset
         if finishing:
             continue
-        if device.mode != command_mode:
+        mode_changed = device.mode != command_mode
+        if mode_changed:
             notes.append(f"{entity_id}: mode differs; re-asserting {command_mode}.")
             commands.append((entity_id, "set_hvac_mode", {"hvac_mode": command_mode}))
         if command_mode != "off":
             preset = system.get("preset")
             if preset and device.preset != preset:
                 commands.append((entity_id, "set_preset_mode", {"preset_mode": preset}))
-            if device.temperature != target and not keep_target:
+            if mode_changed or (device.temperature != target and not keep_target):
                 notes.append(
                     f"{entity_id}: target differs; setting {target:.1f} °C (offset {offset:+.2f})."
                 )

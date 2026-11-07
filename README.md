@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.18 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.19 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 The setpoint is the center of the smallest predicted temperature band across the counted rooms.
 The default `objective: "band"` minimizes the largest priority-scaled room deviation from it,
@@ -193,7 +193,7 @@ survives restarts; gaps contribute zero lag feature and no lag learning credit. 
 Read `sensor.house_learning` for overall confidence percent (the mean across room/system pairs). Reported system/source effects are in **°C/h**, scaled by `60 / interval_minutes` (×12 at 5 minutes, ×15 at 4 minutes). Internal coefficients, storage and control remain per interval. The top-level `units` attribute is `{"effects": "°C per hour of full effort", "confidence": "%"}`. Under its attributes:
 
 - `systems` → system entity → room sensor: `b` is the fixed effect in °C/h at full effort; `g` is its learned slope in °C/h per °C of outdoor-minus-room temperature; `h` is its delayed effect in °C/h; `steady_std` is posterior uncertainty in the steady effect in °C/h; `blended_b` (°C/h) includes the fixed-part prior blend, temperature interaction and delayed effect; `effective_effect` also applies the nonnegative heat clamp; `influence` is the dimensionless nonnegative normalized control weight (sums to 1 per system when reach is positive); `confidence` is percent; `effective_samples` is the activity count.
-- `experiments` → system entity: `uncertainty_score`, `last_steady_test`, `next_eligible` (Unix timestamps for the latter two), `skip_reason` (for example "cycling hold", "reading beyond test ceiling: Parent Room", "not uncertain enough", or "no counted room needs heat"; null when selected/eligible), and `blocked_by` (room entity ID), `blocked_reading` / `blocked_ceiling` (°C; null when no room blocks).
+- `experiments` → system entity: `uncertainty_score`, `last_steady_test`, `next_eligible` (Unix timestamps for the latter two), `skip_reason` (for example "cycling hold", "reading beyond test ceiling: Parent Room", "not uncertain enough", or "no counted room needs heat"; null when selected/eligible), and `blocked_by` (room entity ID), `blocked_reading` / `blocked_ceiling` (°C), and `blocked_at` (Unix timestamp). The last ceiling-stop record stays available until that unit starts its next test; these fields are null before a stop or after a new test starts.
 - `sensors` → room sensor: `a` is heat loss, `c` sun gain in °C/interval/kW, `d` background drift, `fit_error` is the forgetting-weighted RMS prediction error in °C, and `samples` counts valid updates.
 
 Press `button.house_reset_learning` to clear the model and confidence back to neutral priors. It retains the house target, mode and control state and starts learning again. Adding a sensor can restart exploration while that room learns. Confidence measures runtime evidence; learning needs distinct system operation to identify separate effects.
@@ -555,3 +555,15 @@ predict **2.01250 °C** on. DESIGN.md and `tests/test_band.py` record both cases
 Tests cover the cool mirror, minor hot Office comfort hold, no helpful counted room,
 forecast-independent test starts, minimum-run measured aborts and persistent retry timing.
 The November 4 replay and cycling checks retain their original acceptance limits.
+
+
+## v0.5.19 mode changes and test-stop history
+
+Every non-off unit mode command is followed by its target in the same pass,
+including immediate House mode/setpoint changes. This handles thermostats with
+separate stored heat/cool targets even when the old reported target matches the
+new target. A delayed mode acknowledgement with the old target does not produce
+a “changed outside house control” note.
+
+The learning sensor's `experiments` attribute retains the last room ceiling stop
+(room, reading, ceiling and `blocked_at` Unix timestamp) until the unit's next test starts.

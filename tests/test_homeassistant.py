@@ -2928,6 +2928,7 @@ async def test_experiment_skip_reasons_exposed_in_learning_sensor(hass, installe
         blocked_by="sensor.room",
         blocked_reading=23.6,
         blocked_ceiling=23.5,
+        blocked_at=now,
         skip_reason="reading beyond test ceiling: Room",
     )
     c.async_set_updated_data(c.data)
@@ -2936,7 +2937,14 @@ async def test_experiment_skip_reasons_exposed_in_learning_sensor(hass, installe
     assert info["blocked_by"] == "sensor.room"
     assert info["blocked_reading"] == 23.6
     assert info["blocked_ceiling"] == 23.5
-    assert "Room" in info["skip_reason"]
+    assert info["blocked_at"] == now
+    await c.async_tick()
+    await hass.async_block_till_done()
+    info = hass.states.get("sensor.house_learning").attributes["experiments"][unit]
+    assert info["blocked_by"] == "sensor.room"
+    assert info["blocked_reading"] == 23.6
+    assert info["blocked_ceiling"] == 23.5
+    assert info["blocked_at"] == now
     assert "blocked_forecast" not in info
     assert info["next_eligible"] == now + 7200
 
@@ -3226,3 +3234,34 @@ async def test_unrequested_action_event_stops_without_waiting_for_interval(
         entity == key and service == "set_temperature" and data["temperature"] <= 21.5
         for entity, service, data in calls
     )
+
+
+@pytest.mark.parametrize("delay", [10, 180])
+async def test_mode_echo_with_old_target_is_not_an_outside_change(
+    hass, installed, delay
+):
+    entry, _ = installed
+    c = entry.runtime_data
+    # Both services succeed while the cloud device keeps reporting its old mode/target.
+    with (
+        patch.object(MockSystem, "async_set_hvac_mode", return_value=None),
+        patch.object(MockSystem, "async_set_temperature", return_value=None),
+    ):
+        await c.async_change(mode="heat", setpoint=21)
+    mode, target, sent_at = c.last_commands["climate.ducted"]
+    assert hass.states.get("climate.ducted").attributes["temperature"] != target
+    with patch(
+        "custom_components.house_climate.coordinator.dt_util.utcnow",
+        return_value=sent_at + timedelta(seconds=delay),
+    ):
+        # The mode acknowledgement arrives first, still carrying the old-mode target.
+        await hass.services.async_call(
+            "climate",
+            "set_hvac_mode",
+            {"entity_id": "climate.ducted", "hvac_mode": mode},
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+        assert "changed outside house control" not in c.data.explanation
+        await c.async_tick(record=False)
+        assert "changed outside house control" not in c.data.explanation

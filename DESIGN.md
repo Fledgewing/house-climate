@@ -201,12 +201,16 @@ Every control interval, and immediately when the house setpoint or mode changes:
    Never name rooms whose share of the available objective weights is below
    `minor_weight_share`. For the band objective these same counted rooms also determine allocation and comfort holds.
 4. Run the fan/vane scheduler described below, adding at most one changed fan/vane command.
-   Write only what changed: `climate.set_hvac_mode`, then `climate.set_temperature`. For a system with a
+   Write only what changed, except that every non-off `climate.set_hvac_mode` command
+   is followed in the same pass by `climate.set_temperature`, even if the reported target
+   matches: that report belongs to the old mode. This also applies to immediate House
+   mode/setpoint requests; finishing-run and target holds apply only within the same mode. For a system with a
    configured required preset, re-assert that preset if it has left it.
 5. Track each system's last successfully commanded mode and target. Report an outside change
    in `last_decision` only when the reported mode/target differs from that command and more
    than 2 minutes have passed since it, suppressing delayed device echoes. The next interval
-   re-asserts (the House thermostat is the one control).
+   re-asserts (the House thermostat is the one control). Check changed fields independently:
+   an acknowledgement of the commanded mode with a stale old-mode target is not an outside change.
 6. Fallbacks: if no member sensor is available, every system gets the house setpoint, subject
    to reported cycling holds. Without any local/house reference, retain an on-held target or
    use HVAC off for an off hold. If target limits prevent an off hold, also use HVAC off. If a system is unavailable, issue it no commands and keep controlling the others. Simulate its local thermostat as a fixed input at each horizon step (v0.5.5), with the normal objective weights unchanged.
@@ -1520,3 +1524,19 @@ recover the live decision. Separate regressions record both distinctions.
 The due experiment starts in either case despite Parent's >23.5 °C forecast, waits
 through minimum run and aborts only on a filtered reading strictly past 23.5 °C
 (mirrored at 20.5 °C in cool), with another 120-minute wait.
+
+
+## v0.5.19: mode targets and retained test stops
+
+A device can retain separate heat/cool setpoints. Comparing its old-mode target
+with the new target could skip the temperature command after a mode switch,
+leaving the device at its stored setpoint until the next pass. Every non-off
+mode command now includes the computed target afterward, including immediate
+House changes. Same-mode finishing runs keep their existing protection; an old
+mode's target cannot suppress or replace the new target. Delayed mode
+acknowledgements carrying an unchanged old target do not count as outside edits.
+
+Measured ceiling stops retain `blocked_by`, `blocked_reading`, `blocked_ceiling`
+and `blocked_at` (epoch seconds at the actual stop) in `experiments` across later
+passes and state roundtrips. These diagnostics clear only when that unit starts
+its next test. Current eligibility and skip reasons continue to refresh each pass.

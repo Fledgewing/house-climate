@@ -273,3 +273,57 @@ def test_mean_integral_respects_average_weight(config, weight):
     state = ControlState(mode="heat")
     run(config, state, {"sensor.a": Reading(20.9)})
     assert state.integrals["mean"] == pytest.approx(0.001 * 0.1 * weight / (1 + weight))
+
+
+@pytest.mark.parametrize(
+    "old_mode,new_mode", [("heat", "cool"), ("cool", "heat"), ("off", "heat")]
+)
+@pytest.mark.parametrize("immediate", [False, True])
+@pytest.mark.parametrize("effort", [0, 1])
+def test_mode_change_always_sends_target(config, old_mode, new_mode, immediate, effort):
+    from unittest.mock import patch
+
+    direction = 1 if new_mode == "heat" else -1
+    own = 21.5 - direction * 3 if effort else 21.5 + direction * 3
+    state = ControlState(
+        mode="heat_cool",
+        active_mode=old_mode,
+        setpoint=21,
+        last_update=10000 if immediate else None,
+        commanded={"climate.a": False},
+        actions={"climate.a": "heating" if effort == 0 else "idle"},
+        last_stop={"climate.a": 9000},
+    )
+    device = Device(
+        mode=old_mode,
+        temperature=21.5,
+        current_temperature=own,
+        preset="manual",
+        # Exercise finishing-run suppression as well as ordinary idle reports.
+        hvac_action="heating" if effort == 0 else "idle",
+    )
+    readings = {"sensor.a": Reading(19 if new_mode == "heat" else 22.9)}
+    with patch(
+        "custom_components.house_climate.controller.allocate",
+        return_value=({"climate.a": direction * effort}, 21),
+    ):
+        result = run(config, state, readings, device, now=10001)
+        assert result.commands == [
+            ("climate.a", "set_hvac_mode", {"hvac_mode": new_mode}),
+            ("climate.a", "set_temperature", {"temperature": 21.5}),
+        ]
+        device.mode = new_mode
+        result = run(config, state, readings, device, now=10301)
+        assert result.commands == []
+
+
+def test_mode_change_does_not_keep_old_target_without_temperature_reference(config):
+    state = ControlState(
+        mode="heat", commanded={"climate.a": True}, command_start={"climate.a": 9999}
+    )
+    device = Device(mode="cool", temperature=30, preset="manual")
+    result = run(config, state, readings={}, device=device)
+    assert result.commands == [
+        ("climate.a", "set_hvac_mode", {"hvac_mode": "heat"}),
+        ("climate.a", "set_temperature", {"temperature": 21}),
+    ]

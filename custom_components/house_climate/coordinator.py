@@ -559,8 +559,18 @@ class HouseCoordinator(DataUpdateCoordinator):
             if commanded is None:
                 return
             mode, target, sent_at = commanded
-            if (dt_util.utcnow() - sent_at).total_seconds() <= 120 or (
-                new.state == mode and new.attributes.get("temperature") == target
+            # Judge only changed fields. A mode acknowledgement can still
+            # carry the previous mode's target until the target echo arrives.
+            mode_changed = old.state != new.state
+            outside_mode = mode_changed and new.state != mode
+            outside_target = (
+                not mode_changed
+                and old.attributes.get("temperature")
+                != new.attributes.get("temperature")
+                and new.attributes.get("temperature") != target
+            )
+            if (dt_util.utcnow() - sent_at).total_seconds() <= 120 or not (
+                outside_mode or outside_target
             ):
                 return
             note = f" {new.entity_id} changed outside house control; next interval will re-assert."

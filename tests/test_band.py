@@ -215,6 +215,7 @@ def test_1303_test_ignores_forecast_aborts_on_reading_after_min_run(mode, direct
     assert info["blocked_by"] == "parent"
     assert info["blocked_reading"] == readings["parent"].value
     assert info["blocked_ceiling"] == 22 + direction * 1.5
+    assert info["blocked_at"] == start + 600
     assert "blocked_forecast" not in info
     assert "Parent Room" in info["skip_reason"]
     assert "Parent Room" in result.explanation
@@ -229,8 +230,14 @@ def test_1303_test_ignores_forecast_aborts_on_reading_after_min_run(mode, direct
     control(config, state, readings, devices, start + 900, learning=model)
     assert not state.excitation
     assert state.experiment_info[UNIT]["next_eligible"] == start + 600 + 120 * 60
+    for elapsed in (1200, 3600, 7200):
+        control(config, state, readings, devices, start + elapsed, learning=model)
+        for field in ("blocked_by", "blocked_reading", "blocked_ceiling", "blocked_at"):
+            assert state.experiment_info[UNIT][field] == info[field]
     control(config, state, readings, devices, start + 600 + 120 * 60, learning=model)
     assert state.excitation["system"] == UNIT
+    for field in ("blocked_by", "blocked_reading", "blocked_ceiling", "blocked_at"):
+        assert state.experiment_info[UNIT][field] is None
 
 
 def test_never_started_due_test_retries_after_cycling_hold():
