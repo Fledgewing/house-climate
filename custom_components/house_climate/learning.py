@@ -280,6 +280,11 @@ class Learning:
                 frozen = set().union(*(s[4] for s in segments))
                 duration = 1
             error = end - start - sum(a * b for a, b in zip(row.theta, x))
+            evidence_weight = (
+                min(1, self.interval_minutes * interval_duration / self.window_minutes)
+                if self.window_minutes
+                else 1
+            )
             self.score_regimes(sensor, x, end - start, activity, duration, local_hour)
             challenger = state["challenger"]
             innovation = end - start - sum(a * b for a, b in zip(challenger.theta, x))
@@ -289,6 +294,9 @@ class Learning:
             state["surprises"] = state.get("surprises", 0) + 1 if surprise else 0
             if state["surprises"] >= 2 and challenger.samples >= 24:
                 challenger.covariance = self.neutral_row().covariance
+                # Scores earned before reopening uncertainty cannot qualify the
+                # newly unidentified candidate for promotion.
+                state["blocks"] = []
                 state["surprises"] = 0
                 state["identified_since"] = self.clock
             self.fit_row(
@@ -299,6 +307,7 @@ class Learning:
                 duration,
                 exp(-duration * self.interval_minutes / 1440),
                 frozen,
+                evidence_weight,
             )
             if self.choose_regime(sensor):
                 continue
@@ -343,11 +352,6 @@ class Learning:
                     continue
                 state["disturbed_since"] = None
                 error = max(-limit * duration, min(limit * duration, error))
-            evidence_weight = (
-                min(1, self.interval_minutes * interval_duration / self.window_minutes)
-                if self.window_minutes
-                else 1
-            )
             self.fit_row(
                 row,
                 x,
@@ -544,7 +548,10 @@ class Learning:
             for b in blocks
             if b["errors"].get(candidate, float("inf"))
             < (1 - self.regime_margin) * b["errors"]["active"]
-            and b["errors"]["active"] > 1e-5 * b["seconds"]
+            # Tiny correlated window/rounding errors cannot justify replacing
+            # an established fit with a fast, less certain model.
+            and b["errors"]["active"] - b["errors"].get(candidate, float("inf"))
+            > 0.001 * self.interval_minutes * b["seconds"]
         ]
         if len(wins) < 0.8 * count:
             return False
@@ -998,6 +1005,10 @@ class Learning:
 
     def to_dict(self):
         return {
+            "learning_version": 2,
+            "residuals": dict(self.residuals),
+            "streaks": {s: list(v) for s, v in self.streaks.items()},
+            "disturbed": dict(self.disturbed),
             "interaction_prior": self.interaction_prior,
             "lag_prior": self.lag_prior,
             "lag_minutes": self.lag_minutes,
@@ -1097,6 +1108,28 @@ class Learning:
             for item in state["saved"]:
                 item["row"] = load_row(item["row"])
             model.regimes[sensor] = state
+        model.residuals = dict(saved.get("residuals", {}))
+        model.streaks = {s: tuple(v) for s, v in saved.get("streaks", {}).items()}
+        model.disturbed = dict(saved.get("disturbed", {}))
+        if saved.get("learning_version", 0) < 2:
+            for sensor, state in model.regimes.items():
+                # An archived fit is recoverable only when retained observations
+                # already establish its superiority. Never guess lost means from
+                # the neutral prior or select a library row by coefficient size.
+                for candidate in sorted(
+                    state["saved"], key=lambda item: item["last_fit"], reverse=True
+                ):
+                    if model.evidence(
+                        sensor, candidate["id"], model.regime_return_hours, False
+                    ):
+                        model.promote(sensor, candidate["id"])
+                        break
+                # Legacy challenger scores may predate covariance resets and
+                # counted overlapping windows as independent evidence.
+                state["challenger"] = deepcopy(model.rows[sensor])
+                state["blocks"] = []
+                state["identified_since"] = model.clock
+                state["surprises"] = 0
         return model
 
 
@@ -1115,8 +1148,23 @@ class EffortTracker:
         self.started = None
         self.segments = {}
         self.finished_segments = {}
+        self.modes = {}
 
-    def change(self, system, action, now):
+    def change(self, system, action, now, *, mode=None, commanded_mode=None):
+        """Observe signed action, withholding mode transitions from learning."""
+        if mode is not None:
+            if system in self.modes and self.modes[system] != mode:
+                self.missing.add(system)
+            self.modes[system] = mode
+            if (
+                commanded_mode is not None
+                and mode != commanded_mode
+                or action == "heating"
+                and mode == "cool"
+                or action == "cooling"
+                and mode == "heat"
+            ):
+                action = None
         if system in self.times:
             elapsed = max(0, now - self.times[system])
             previous = self.actions[system]
@@ -1141,9 +1189,15 @@ class EffortTracker:
         )
         self.times[system] = now
 
-    def finish(self, actions, now):
+    def finish(self, actions, now, *, modes=None, commanded_modes=None):
         for system, action in actions.items():
-            self.change(system, action, now)
+            self.change(
+                system,
+                action,
+                now,
+                mode=(modes or {}).get(system),
+                commanded_mode=(commanded_modes or {}).get(system),
+            )
         duration = now - self.started if self.started is not None else 0
         result = {
             s: self.totals.get(s, 0) / duration
@@ -1153,6 +1207,11 @@ class EffortTracker:
         }
         self.started = now
         self.finished_segments = self.segments
+        for system, value in result.items():
+            if value is None and duration > 0:
+                # Integrated/lagged windows must see the same invalid interval
+                # as the immediate fit, including a mode change between ticks.
+                self.finished_segments[system] = [[self.started - duration, now, None]]
         self.segments = {}
         self.totals = {}
         self.missing.clear()

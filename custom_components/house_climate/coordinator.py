@@ -496,6 +496,10 @@ class HouseCoordinator(DataUpdateCoordinator):
             if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
             else None,
             dt_util.utcnow().timestamp(),
+            mode=new.state if new else None,
+            commanded_mode=self.pending_commands.get(entity_id, {}).get(
+                "hvac_mode", self.last_commands.get(entity_id, (None,))[0]
+            ),
         )
         if not self.system_control.get(entity_id, True):
             self.state.reported_efforts[entity_id] = 0
@@ -786,6 +790,10 @@ class HouseCoordinator(DataUpdateCoordinator):
                         for key, device in devices.items()
                     },
                     now.timestamp(),
+                    modes={key: device.mode for key, device in devices.items()},
+                    commanded_modes={
+                        key: command[0] for key, command in self.last_commands.items()
+                    },
                 )
                 for key in efforts:
                     if not self.system_control.get(key, True):
@@ -1020,6 +1028,12 @@ class HouseCoordinator(DataUpdateCoordinator):
                     continue
                 try:
                     self.pending_commands[entity_id] = data
+                    if service == "set_hvac_mode":
+                        # Mark uncertainty before service callbacks can report
+                        # either the old action or a delayed mode acknowledgement.
+                        self.effort.change(
+                            entity_id, None, dt_util.utcnow().timestamp()
+                        )
                     await self.hass.services.async_call(
                         "climate",
                         service,

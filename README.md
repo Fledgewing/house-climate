@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.19 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.20 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 The setpoint is the center of the smallest predicted temperature band across the counted rooms.
 The default `objective: "band"` minimizes the largest priority-scaled room deviation from it,
@@ -43,6 +43,16 @@ unless `fan_reward_lambda` is explicitly set; this remains independent of object
 Legacy PI gains, house offset clamps and slew settings remain readable and unused.
 
 Automatic mode retains its 1 °C deadband and 60-minute heat/cool dwell. Cooling is vetoed below 10 °C outdoors; heating above 24 °C. Explicit heat/cool requests take effect immediately, subject to the outdoor veto. Starts and stops obey cycling protection on scheduled and immediate passes. Explicit House off and outdoor vetoes still stop operation.
+
+Version 0.5.20 preserves thermal learning through automatic heat/cool switches.
+Intervals with an old-mode action or pending mode acknowledgement are withheld from
+learning, including integrated and lagged windows. Same-mode units finishing their runs
+retain signed runtime evidence. Challenger resets cannot reuse old comparison scores;
+a replacement needs sustained varied evidence and a meaningful prediction improvement.
+Restart storage retains fitted coefficients, covariance, counts and disturbance evidence.
+On upgrade, an archived fit can be restored when retained observations establish that it
+is better; overwritten or evicted learning cannot be reconstructed. Ordinary operation
+continues learning, including persistent changes in room response.
 
 ## Steady operation and cycling protection
 

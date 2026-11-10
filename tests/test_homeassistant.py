@@ -989,8 +989,9 @@ async def test_real_house_transient_replay(hass, installed):
     # Proportional efforts alternate adjacent target steps to avoid rounding bias.
     assert max(targets) - min(targets) <= 0.5
     # Warmup and small jitter learn; the large excursions are still withheld.
-    assert c.learning.rows["sensor.room"].samples == 5
-    assert c.learning.rows["sensor.other"].samples == 8
+    # The initial off-to-heat transition also withholds one interval.
+    assert c.learning.rows["sensor.room"].samples == 4
+    assert c.learning.rows["sensor.other"].samples == 7
     attrs = hass.states.get("climate.house").attributes
     assert attrs["raw_sensor_readings"]["sensor.room"]["value"] == 22
     assert attrs["filtered_sensor_readings"] == c.data.readings
@@ -1062,6 +1063,16 @@ async def prepare_fans(hass, installed):
     system.async_write_ha_state()
     await hass.async_block_till_done()
     await c.async_change(mode="heat")
+    # Tests below supply clean post-command baselines; consume the uncertain
+    # startup transition before starting their observation windows.
+    c.effort.finish(
+        {
+            key: hass.states.get(key).attributes.get("hvac_action")
+            for key in c.learning.systems
+        },
+        dt_util.utcnow().timestamp(),
+        modes={key: hass.states.get(key).state for key in c.learning.systems},
+    )
     return c, system, calls
 
 
@@ -3265,3 +3276,32 @@ async def test_mode_echo_with_old_target_is_not_an_outside_change(
         assert "changed outside house control" not in c.data.explanation
         await c.async_tick(record=False)
         assert "changed outside house control" not in c.data.explanation
+
+
+async def test_mode_replay_through_real_store_restart(hass, settings):
+    from test_mode_learning import RATES, UNIT, mode_replay
+
+    from custom_components.house_climate.coordinator import HouseCoordinator
+
+    replay = mode_replay()
+    fitted = next(replay)  # November 6, 23:22 PT, during the mode switch.
+    settings["systems"] = [{"entity_id": UNIT}]
+    settings["sensors"] = [
+        {"entity_id": key, "weight": 1} for key in RATES if key != UNIT
+    ]
+    settings["learning_window_minutes"] = 60
+    entry = MockConfigEntry(domain=DOMAIN, data=settings)
+    entry.add_to_hass(hass)
+    coordinator = HouseCoordinator(hass, entry)
+    saved_model = fitted.to_dict()
+    await coordinator.store.async_save(
+        {"state": asdict(ControlState(mode="heat_cool")), "learning": saved_model}
+    )
+    restored = HouseCoordinator(hass, entry)
+    await restored.async_load()
+    assert restored.learning.to_dict() == saved_model
+    assert restored.learning.rows == fitted.rows
+    assert restored.learning.regimes == fitted.regimes
+    assert not restored.learning.windows  # No inferred observations during downtime.
+    final = replay.send(restored.learning)
+    assert final.confidence_percent >= fitted.confidence_percent - 0.5

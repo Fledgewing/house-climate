@@ -674,7 +674,9 @@ least 80% of blocks over `regime_hours` (default 24). Winning blocks must cover
 local day (06:00–18:00), night, and each system both running and idle. The 80% win
 requirement also applies within each of those contexts, preventing a few nighttime
 wins or losses from being hidden by the daytime majority. A negligible active
-error (≤0.00001 °C/interval) cannot establish a win. Evidence horizons round up
+error cannot establish a win: as of v0.5.20, each winning block also needs an
+absolute improvement greater than 0.001 × interval_minutes °C/interval
+(0.005 °C at five minutes). Evidence horizons round up
 to complete two-hour blocks.
 
 Library rows receive identical pre-update scores but never train. A proven saved
@@ -1540,3 +1542,72 @@ Measured ceiling stops retain `blocked_by`, `blocked_reading`, `blocked_ceiling`
 and `blocked_at` (epoch seconds at the actual stop) in `experiments` across later
 passes and state roundtrips. These diagnostics clear only when that unit starts
 its next test. Current eligibility and skip reasons continue to refresh each pass.
+
+
+## v0.5.20: learning survives heat/cool transitions
+
+House `heat_cool` is a permanent operating mode, not a learning reset. Reported
+heating remains positive effort and cooling negative effort. The controller's
+reported effort and thermostat latch follow actual action; they are control
+estimates, separate from the thermal learner's evidence eligibility. A same-mode
+unit finishing an off request still supplies valid signed runtime.
+
+The coordinator now supplies reported and last commanded device modes to the
+runtime integrator, including callbacks under the command lock. An actual mode
+change invalidates that interval. Before sending a mode command, mark runtime
+unknown; until the reported mode acknowledges it, or while heating is reported in
+cool mode/cooling in heat mode, withhold learning. Both the aggregate effort and
+the entire interval's transition history are missing, so integrated observations
+and lag features cannot silently reuse invalid spans. No coefficients, covariance
+or counts are changed by missing evidence. Integrated windows refill with clean
+observations; unknown lag columns remain frozen until their own history refills.
+
+Previously these contexts entered ordinary RLS and challenger scores. A sign
+change alone is physically valid and does not reproduce the live collapse in a
+clean first-order simulation. The supplied rates/times do not include the saved
+model or full room readings, so the exact live numerical trajectory cannot be
+reconstructed. The regression states its physical assumptions explicitly.
+
+A challenger covariance reset retains its means but now clears all comparison
+blocks. Identification still requires a full stable evidence horizon. Fractional
+activity counts for overlapping windows now use the same evidence weight as the
+main row; the challenger retains its one-day elapsed-time forgetting horizon so
+persistent physical changes remain learnable. Main forgetting is unchanged and
+never runs on excluded intervals. Confidence in the integrated estimator depends
+on the squared steady effect relative to posterior variance, as well as runtime;
+a near-zero fitted effect can have very low confidence despite nonzero counts.
+
+Relative prediction wins alone previously allowed tiny correlated averaging or
+rounding errors to justify a switch to a fast fit with much greater uncertainty.
+A winning block must now improve mean absolute error by more than
+0.001 × interval_minutes °C per configured interval (0.005 °C at five minutes),
+as well as the configured relative margin. Existing full
+coverage, day/night, on/off, stable-time and sustained-win requirements remain.
+Promotion archives the full established row, including covariance and counts;
+resetting a challenger never changes the main row. Large persistent changes can
+still qualify a replacement, and all clean ordinary operation continues fitting.
+
+Store schema `learning_version=2` adds residuals and disturbance streak/status to
+the existing exact row/challenger/library persistence. Runtime baselines, integrated
+windows and context observations deliberately restart, with no inferred downtime.
+Legacy upgrades retain all main and archived rows. If retained four-hour (or
+configured return-horizon) prediction evidence already qualifies an archived row,
+restore it immediately on load. Otherwise retain the active fit. Seed the legacy
+challenger from the retained active fit and clear legacy comparison evidence;
+those scores used different activity weighting and may straddle a covariance
+reset. This migration is one-time; subsequent Store roundtrips preserve learning
+exactly. There is no hidden alternate main row: a replaced row is recoverable only
+if it remains in the bounded library, and automatically selecting it requires
+observational support. Evicted or overwritten coefficients cannot be recovered.
+
+`tests/test_mode_learning.py` fits eight rooms with the supplied Bryant rates,
+then replays 22:11/23:22/00:05/01:23 PT transitions at five-minute intervals (split
+at the exact event times), a Store restart at 23:22, and 2.5 days of two-hour
+heating/idle cycles plus 60-minute tests every 120 minutes. Effects stay within
+20% of pre-switch values and mean confidence loses at most 0.5 percentage points.
+This synthetic replay includes a small transitional coasting load, not recorded
+room temperatures. Separate tests halve effects for eight days, check both
+signed actions, between-tick mode changes, covariance resets, insignificant
+challenger wins, disturbance roundtrips and conditional legacy recovery.
+`test_mode_replay_through_real_store_restart` exercises HA Store save/load and
+coordinator reconciliation with exactly equal saved learning state.
