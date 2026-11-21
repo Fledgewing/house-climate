@@ -176,6 +176,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             window_minutes=self.config.get(
                 "learning_window_minutes", DEFAULTS["learning_window_minutes"]
             ),
+            drift_noise=self.config.get("learning_drift", DEFAULTS["learning_drift"]),
         )
 
     async def async_load(self):
@@ -265,6 +266,9 @@ class HouseCoordinator(DataUpdateCoordinator):
                         ),
                         "interaction_prior": self.config.get(
                             "interaction_prior", 0.0001
+                        ),
+                        "drift_noise": self.config.get(
+                            "learning_drift", DEFAULTS["learning_drift"]
                         ),
                     }
                 )

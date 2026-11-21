@@ -58,6 +58,7 @@ DEFAULTS = {
     "learning_average_minutes": 10,
     "learning_forgetting": 0.998,
     "learning_n0": 24,
+    "learning_drift": 0.0,
     "interaction_prior": 0.0001,
     "lag_minutes": 60,
     "lag_prior": 0.01,

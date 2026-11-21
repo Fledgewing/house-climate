@@ -581,6 +581,7 @@ async def test_config_flow_empty_defaults_and_selector_filters(hass):
         "test_overshoot": 1.5,
         "lag_minutes": 60,
         "lag_prior": 0.01,
+        "learning_drift": 0.0,
     }.items():
         field, value = fields[key]
         assert field.default() == default

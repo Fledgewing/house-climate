@@ -11,6 +11,10 @@ INTERACTION_PRIOR = 0.0001
 LAG_PRIOR = 0.01
 BACKGROUND_PRIOR = 0.0001
 SOURCE_PRIOR = 0.01
+# Integrated rows may treat background drift as a local level (random walk):
+# per learning window its variance grows by this many RLS units. Zero keeps a
+# constant background, as before v0.5.21.
+DRIFT_NOISE = 0.0
 
 
 @dataclass
@@ -49,6 +53,7 @@ class Learning:
         lag_prior=LAG_PRIOR,
         window_minutes=0,
         average_minutes=10,
+        drift_noise=DRIFT_NOISE,
     ):
         if not 0 < forgetting <= 1 or n0 <= 0:
             raise ValueError("Invalid learning parameters")
@@ -60,6 +65,9 @@ class Learning:
             raise ValueError("Invalid learning window")
         if not isfinite(average_minutes) or average_minutes < 0:
             raise ValueError("Invalid learning average")
+        if not isfinite(drift_noise) or drift_noise < 0:
+            raise ValueError("Invalid background drift")
+        self.drift_noise = drift_noise
         self.lag_minutes = lag_minutes
         self.window_minutes = window_minutes
         self.average_minutes = average_minutes
@@ -308,6 +316,7 @@ class Learning:
                 exp(-duration * self.interval_minutes / 1440),
                 frozen,
                 evidence_weight,
+                self.background_drift,
             )
             if self.choose_regime(sensor):
                 continue
@@ -361,6 +370,7 @@ class Learning:
                 self.forgetting**evidence_weight,
                 frozen,
                 evidence_weight,
+                self.background_drift,
             )
 
     def averaged_window(self, sensor, sensor_filter, start, end, before, after):
@@ -459,9 +469,22 @@ class Learning:
             frozen,
         )
 
+    @property
+    def background_drift(self):
+        """Background random-walk variance per learning window (integrated rows)."""
+        return self.drift_noise if self.window_minutes else 0
+
     @staticmethod
     def fit_row(
-        row, x, error, activity, duration, forgetting, frozen=(), evidence_weight=1
+        row,
+        x,
+        error,
+        activity,
+        duration,
+        forgetting,
+        frozen=(),
+        evidence_weight=1,
+        drift=0,
     ):
         p = row.covariance
         raw_px = [sum(a * b for a, b in zip(line, x)) for line in p]
@@ -483,6 +506,10 @@ class Learning:
             [covariance(i, j, v) for j, v in enumerate(line)]
             for i, line in enumerate(p)
         ]
+        # A random-walk background tracks slow unmodeled heat or loss. When the
+        # controller reacts to that drift, a constant background leaves it to the
+        # effort, interaction and lag columns instead (closed-loop bias).
+        row.covariance[-1][-1] += drift * evidence_weight
         row.counts = [
             forgetting * n + evidence_weight * (abs(value) > 1e-9)
             for value, n in zip(activity, row.counts)
@@ -1014,6 +1041,7 @@ class Learning:
             "lag_minutes": self.lag_minutes,
             "window_minutes": self.window_minutes,
             "average_minutes": self.average_minutes,
+            "drift_noise": self.drift_noise,
             "integrated_version": int(bool(self.window_minutes)),
             "effort_history": deepcopy(self.effort_history),
             "effort_clock": self.effort_clock,
@@ -1059,6 +1087,7 @@ class Learning:
             lag_minutes=saved.get("lag_minutes", 60),
             window_minutes=saved.get("window_minutes", 0),
             average_minutes=saved.get("average_minutes", 10),
+            drift_noise=saved.get("drift_noise", DRIFT_NOISE),
         )
 
         def load_row(data):

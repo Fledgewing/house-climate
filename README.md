@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.20 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.21 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 The setpoint is the center of the smallest predicted temperature band across the counted rooms.
 The default `objective: "band"` minimizes the largest priority-scaled room deviation from it,
@@ -43,6 +43,18 @@ unless `fan_reward_lambda` is explicitly set; this remains independent of object
 Legacy PI gains, house offset clamps and slew settings remain readable and unused.
 
 Automatic mode retains its 1 °C deadband and 60-minute heat/cool dwell. Cooling is vetoed below 10 °C outdoors; heating above 24 °C. Explicit heat/cool requests take effect immediately, subject to the outdoor veto. Starts and stops obey cycling protection on scheduled and immediate passes. Explicit House off and outdoor vetoes still stop operation.
+
+Version 0.5.21 adds the **Learning background drift per window** option
+(`learning_drift`, default **0**, unchanged behaviour). With 0 the integrated fit assumes a
+constant background. When slow unmodeled heat or loss (sun, people, other heaters, drafts)
+decides when the house needs heat, that assumption biases every learned unit effect toward
+zero: the unit runs exactly when the house is losing heat faster than modeled. A positive
+value makes the background a random walk whose variance grows by that many RLS units per
+learning window, so the effect is learned from on/off contrasts instead of absolute levels.
+**1** recovers simulated effects within 25% under such a loop, but learns weather slopes
+and changed effects more slowly and discards slow exogenous variation; see
+[DESIGN.md](DESIGN.md#v0521-closed-loop-bias-and-background-drift). Changing it keeps all
+fitted learning, so an already biased fit needs **Reset learning** to benefit.
 
 Version 0.5.20 preserves thermal learning through automatic heat/cool switches.
 Intervals with an old-mode action or pending mode acknowledgement are withheld from

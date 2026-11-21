@@ -1611,3 +1611,71 @@ signed actions, between-tick mode changes, covariance resets, insignificant
 challenger wins, disturbance roundtrips and conditional legacy recovery.
 `test_mode_replay_through_real_store_restart` exercises HA Store save/load and
 coordinator reconciliation with exactly equal saved learning state.
+
+
+## v0.5.21: closed-loop bias and background drift
+
+Live diagnostics on 2026-11-20, 11 days after a learning reset: the Bryant's fixed
+effect `b` re-learned to about 0.5 °C/h in every room (1.06–1.75 °C/h before the reset),
+positive interaction `g` and negative lag `h` cancelled it at the cold-evening
+outdoor-minus-room difference, effective effects were 0–0.24 °C/h and overall
+confidence 1.8%.
+
+`tests/test_closed_loop_learning.py` separates two candidate causes with one synthetic
+plant: six rooms heated at 1.0–1.5 °C/h, outdoor 5–10 °C, rooms 20–24 °C, 0.1 °C sensor
+steps, short on/off cycles when the house mean is cool and four-hourly tests cut short
+when the warmest room passes its ceiling.
+
+- **Low excitation alone is identified.** Every effect is within 10% of truth after 11
+  days and `g × Δ + h` stays under 10% of the effect. The nearly constant gap, short runs
+  and cut-short tests do not make `b`, `g` and `h` collinear enough to cancel.
+- **Closed-loop drift reproduces the collapse.** Add a shared, persistent unmodeled heat
+  input (AR(1), about 2.75 h, ±0.2 °C/h) that the loop reacts to. Effects fall to
+  0.07–0.36 of truth, `b` to under 0.6 of truth, `g > 0`, `h ≈ −0.18 °C/h`, and
+  confidence stays near 2%: the live signature. Pinning `g` and `h` to zero still leaves
+  0.16–0.42 of truth, so the bias is in `b`; regularising the corrections cannot fix it.
+
+Root cause: integrated rows model background drift `d` as a constant with the tight
+`BACKGROUND_PRIOR` (0.0001, `learning.py` `neutral_row`). The heating decision depends
+on the same slow unmodeled heat that the model omits, so the unit runs when the house is
+losing heat faster than modeled, and that persistent loss is attributed to the unit's
+effort and its interaction and lag columns. This is the classical bias of direct
+closed-loop identification with a white-noise model. Confidence cannot flag it:
+`confidence()` caps runtime evidence by `effect² / (effect² + steady_std²)`, so a biased
+near-zero effect reads as low confidence, and `steady_std` comes from the unit-noise RLS
+covariance (it reads 11.6% even in the clean simulation where every effect is within 6%).
+
+`learning_drift` (constructor `drift_noise`, default 0) makes the integrated background
+a local level: after every accepted main or challenger fit, its covariance diagonal grows
+by `drift_noise × evidence_weight`, i.e. `drift_noise` RLS units per learning window.
+Coefficient means, other covariance entries and the per-interval compatibility mode
+are unchanged; Store keeps the setting and old stores load with 0. Changing the option
+keeps every fitted row. Measured on the same plant at 11 days with `learning_drift=1`:
+
+| case | effective / truth | notes |
+| --- | --- | --- |
+| closed-loop drift | 0.81–0.85 | `g × Δ + h` under 10% of the effect |
+| drift + 15-minute transport delay | 0.88–0.90 | `h` 0.30–0.44 °C/h is still learned |
+| true weather slope 0.018 °C/h/°C, ±8 °C swing | 0.95–1.01 | `g` shrinks to 0.002 °C/h/°C |
+| slope + drift | 0.81–0.88 | |
+| clean | 0.93–0.95 | confidence 8.7% |
+
+The default stays 0 because the random walk also discards slow exogenous variation.
+With 1, four existing regressions fail: the white five-minute effort/40-minute pure-delay
+fit learns 0.12 of 0.3 °C/h, two Night 11-04 recorder replays fall outside 35% of the
+level-based least-squares reference in at least one room, and the 8-day halved-effect replay
+adapts too slowly (0.78 versus 0.575 ± 0.115 °C/h). Residual-persistence and closed-loop
+detectors that switch the drift on automatically were tried and did not clear both
+groups. Confidence is unchanged; scaling `steady_std` by the measured fit error would
+read 66% for the biased default fit and 86% with drift, so it is not a safe signal on
+its own.
+
+From a reset model with `learning_drift=1`, effects reach 0.82–0.87 of truth after one
+simulated day. Enabling it on an already biased 11-day fit barely helps (0.15–0.41 of
+truth after seven more days), because that fit's covariance is already tight; it needs a
+learning reset to benefit.
+
+Experiments: a test cut short by a measured ceiling already contributes evidence, because
+learning integrates reported action whatever the test state. The limit is selection: a
+test starts only when a counted room is cold and stops when one is warm, so test timing
+is also part of the closed loop. No experiment policy changed.

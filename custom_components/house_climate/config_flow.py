@@ -391,6 +391,7 @@ class HouseSteps:
             ("learning_average_minutes", 1, 60, 1),
             ("learning_forgetting", 0.9, 1, 0.001),
             ("learning_n0", 1, 1000, 1),
+            ("learning_drift", 0, 100, "any"),
             ("interaction_prior", 0.000001, 1, "any"),
             ("lag_minutes", 5, 1440, 1),
             ("lag_prior", 0.000001, 1, "any"),
