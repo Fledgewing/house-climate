@@ -21,11 +21,17 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from .const import DEFAULTS, DOMAIN, fan_reward_weight
+from .const import (
+    DEFAULT_RUN_THRESHOLD,
+    DEFAULTS,
+    DELTA_DEFAULTS,
+    DOMAIN,
+    fan_reward_weight,
+)
 from .controller import ControlState, Device, Reading, control
 from .fans import FanLearning, quiet_modes
 from .filtering import SensorFilter
-from .learning import EffortTracker, Learning
+from .learning import EffortTracker, Learning, delta_effort, run_action
 from .priority import members, modes
 from .reporting import Reporting
 
@@ -62,6 +68,7 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.last_fan_commands = {}
         self.learning = self.new_learning()
         self.effort = EffortTracker()
+        self.action_sources = {}
         self.learning_baseline = None
         self.reporting = Reporting()
         self.not_reporting = {}
@@ -334,12 +341,27 @@ class HouseCoordinator(DataUpdateCoordinator):
             else lambda: None
         )
 
+        run_ids = list(
+            dict.fromkeys(
+                s[key]
+                for s in self.active_systems(include_inactive=True)
+                for key in ("run_sensor", "supply_sensor", "return_sensor")
+                if s.get(key)
+            )
+        )
+        cancel_runs = (
+            async_track_state_change_event(self.hass, run_ids, self._local_changed)
+            if run_ids
+            else lambda: None
+        )
+
         @callback
         def cancel():
             cancel_timer()
             cancel_states()
             cancel_sensors()
             cancel_sources()
+            cancel_runs()
 
         return cancel
 
@@ -361,6 +383,168 @@ class HouseCoordinator(DataUpdateCoordinator):
         else:
             return None
         return "heating" if on else "off"
+
+    def system_config(self, entity_id):
+        return next(
+            s
+            for s in self.active_systems(include_inactive=True)
+            if s["entity_id"] == entity_id
+        )
+
+    def commanded_mode(self, entity_id):
+        return self.pending_commands.get(entity_id, {}).get(
+            "hvac_mode", self.last_commands.get(entity_id, (None,))[0]
+        )
+
+    def local_problem(self, entity, now):
+        """None when a local sensor is trusted, else "unavailable"/"stale"."""
+        if not entity or entity.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return "unavailable"
+        reported = getattr(entity, "last_reported", None) or entity.last_updated
+        if now - reported.timestamp() > self.config.get("stale_after", 720) * 60:
+            return "stale"
+        return None
+
+    def run_state(self, system, now):
+        """Local run sensor: (running, problem); running is None when untrusted."""
+        sensor = system["run_sensor"]
+        entity = self.hass.states.get(sensor)
+        if problem := self.local_problem(entity, now):
+            return None, problem
+        if sensor.startswith("binary_sensor."):
+            if entity.state not in ("on", "off"):
+                return None, "unavailable"
+            return entity.state == "on", None
+        value = self.number(sensor)
+        if value is None:
+            return None, "unavailable"
+        return value > system.get("run_threshold", DEFAULT_RUN_THRESHOLD), None
+
+    def delta_state(self, system, now):
+        """Duct probes: supply, return, ΔT and signed effort, or a problem.
+
+        Without a return sensor the return is the system's own climate
+        `current_temperature` (the thermostat's indoor reading).
+        """
+        result = {
+            "supply_sensor": system["supply_sensor"],
+            "return_sensor": system.get("return_sensor")
+            or f"{system['entity_id']}.current_temperature",
+            "supply": None,
+            "return": None,
+            "delta_t": None,
+            "effort": None,
+            "problem": None,
+        }
+        readings = [("supply", system["supply_sensor"], None)]
+        readings.append(
+            ("return", system["return_sensor"], None)
+            if system.get("return_sensor")
+            else ("return", system["entity_id"], "current_temperature")
+        )
+        for name, entity_id, attribute in readings:
+            problem = self.local_problem(self.hass.states.get(entity_id), now)
+            value = None if problem else self.number(entity_id, attribute)
+            if value is None:
+                result["problem"] = f"{name} {problem or 'unavailable'}"
+                return result
+            result[name] = value
+        delta = result["supply"] - result["return"]
+        result["delta_t"] = round(delta, 2)
+        result["effort"] = delta_effort(
+            delta,
+            *(system.get(key, default) for key, default in DELTA_DEFAULTS.items()),
+        )
+        if result["effort"] is None:
+            result["problem"] = "invalid scale"
+        return result
+
+    def learning_action(self, system, device_action, mode, now, available=True):
+        """Action for effort/learning.
+
+        Duct ΔT when its probes are trusted; else a trusted run sensor with the
+        device's direction; else, when no local sensor is set, the device's
+        reported action. A configured local sensor never falls back to the
+        device: no trusted local evidence is no evidence (`problem` is set).
+        """
+        key = system["entity_id"]
+        if not available:
+            device_action = mode = None
+        if not system.get("run_sensor") and not system.get("supply_sensor"):
+            self.action_sources[key] = {"source": "device", "action": device_action}
+            return device_action
+        info = {"device_action": device_action, "mode": mode}
+        run = None
+        if system.get("run_sensor"):
+            running, run_problem = self.run_state(system, now)
+            run = run_action(running, mode, self.state.active_mode) if mode else None
+            info.update(
+                run_sensor=system["run_sensor"],
+                running=running,
+                run_problem=run_problem,
+            )
+        if system.get("supply_sensor"):
+            delta = self.delta_state(system, now)
+            info.update(
+                {k: v for k, v in delta.items() if k != "problem"},
+                delta_problem=delta["problem"],
+            )
+            if delta["problem"] is None:
+                running = info.get("running")
+                info.update(
+                    source="delta_t",
+                    action=delta["effort"],
+                    # ΔT decides; a trusted run sensor only cross-checks it.
+                    disagreement=running is not None
+                    and running != (delta["effort"] != 0),
+                    problem=None,
+                )
+            elif info.get("running") is not None:
+                info.update(
+                    source="run_sensor", action=run, disagreement=False, problem=None
+                )
+            else:
+                info.update(
+                    source="delta_t",
+                    action=None,
+                    disagreement=False,
+                    problem=delta["problem"],
+                )
+        else:
+            info.update(source="run_sensor", action=run, problem=info["run_problem"])
+        self.action_sources[key] = info
+        return info["action"]
+
+    @callback
+    def _local_changed(self, event):
+        """A run sensor or duct probe changed: re-sample its systems' effort."""
+        now = dt_util.utcnow().timestamp()
+        changed = event.data["entity_id"]
+        for system in self.active_systems(include_inactive=True):
+            if changed not in (
+                system.get("run_sensor"),
+                system.get("supply_sensor"),
+                system.get("return_sensor"),
+            ):
+                continue
+            key = system["entity_id"]
+            entity = self.hass.states.get(key)
+            available = bool(
+                entity and entity.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+            )
+            self.effort.change(
+                key,
+                self.learning_action(
+                    system,
+                    entity.attributes.get("hvac_action") if available else None,
+                    entity.state if available else None,
+                    now,
+                    available,
+                ),
+                now,
+                mode=entity.state if entity else None,
+                commanded_mode=self.commanded_mode(key),
+            )
 
     def source_value(self, source):
         """Current model effort: on fraction or kW; unknown stays missing."""
@@ -496,14 +680,16 @@ class HouseCoordinator(DataUpdateCoordinator):
         )
         self.effort.change(
             entity_id,
-            new.attributes.get("hvac_action")
-            if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
-            else None,
+            self.learning_action(
+                self.system_config(entity_id),
+                new.attributes.get("hvac_action") if new else None,
+                new.state if new else None,
+                dt_util.utcnow().timestamp(),
+                bool(new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)),
+            ),
             dt_util.utcnow().timestamp(),
             mode=new.state if new else None,
-            commanded_mode=self.pending_commands.get(entity_id, {}).get(
-                "hvac_mode", self.last_commands.get(entity_id, (None,))[0]
-            ),
+            commanded_mode=self.commanded_mode(entity_id),
         )
         if not self.system_control.get(entity_id, True):
             self.state.reported_efforts[entity_id] = 0
@@ -788,11 +974,22 @@ class HouseCoordinator(DataUpdateCoordinator):
             if not fan_clean:
                 self.fans.invalidate("; ".join(fan_problems))
             if record:
+                actions = {}
+                for system in self.active_systems(include_inactive=True):
+                    key, device = system["entity_id"], devices[system["entity_id"]]
+                    actions[key] = self.learning_action(
+                        system,
+                        device.hvac_action,
+                        device.mode,
+                        now.timestamp(),
+                        device.available,
+                    )
+                    if self.action_sources[key].get("problem"):
+                        # Untrusted local sensors never fall back to the device:
+                        # the interval since the last good sample is unknown.
+                        self.effort.invalidate(key)
                 efforts, duration = self.effort.finish(
-                    {
-                        key: device.hvac_action if device.available else None
-                        for key, device in devices.items()
-                    },
+                    actions,
                     now.timestamp(),
                     modes={key: device.mode for key, device in devices.items()},
                     commanded_modes={

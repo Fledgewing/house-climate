@@ -1,6 +1,9 @@
 """Configuration defaults; entity IDs belong only in configuration."""
 
 DOMAIN = "house_climate"
+DEFAULT_RUN_THRESHOLD = 50
+# Duct supply − return ΔT (°C) → signed learning effort (v0.5.22).
+DELTA_DEFAULTS = {"delta_deadband": 2, "delta_full_heat": 15, "delta_full_cool": 10}
 PLATFORMS = ["climate", "button", "sensor", "switch", "select"]
 DEFAULTS = {
     "sensors": [],

@@ -77,6 +77,8 @@ class HouseClimate(CoordinatorEntity, ClimateEntity, RestoreEntity):
                 for system in self.coordinator.active_systems()
             },
             "active_mode": self.coordinator.state.active_mode,
+            # Which source each unit's learning action came from: run sensor or device.
+            "action_sources": self.coordinator.action_sources,
         }
 
     async def async_set_temperature(self, **kwargs):

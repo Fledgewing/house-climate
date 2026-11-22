@@ -8,7 +8,7 @@ from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import selector
 
-from .const import DEFAULTS, DOMAIN
+from .const import DEFAULT_RUN_THRESHOLD, DEFAULTS, DELTA_DEFAULTS, DOMAIN
 from .priority import modes
 
 
@@ -227,6 +227,28 @@ class HouseSteps:
                 if key in user_input:
                     system[key] = user_input[key]
             system["preset"] = user_input.get("preset", "").strip()
+            # Empty keeps the device's reported hvac_action as the learning truth.
+            if user_input.get("run_sensor"):
+                system["run_sensor"] = user_input["run_sensor"]
+                system["run_threshold"] = user_input.get(
+                    "run_threshold",
+                    system.get("run_threshold", DEFAULT_RUN_THRESHOLD),
+                )
+            else:
+                system.pop("run_sensor", None)
+                system.pop("run_threshold", None)
+            # Duct probes: empty supply clears every ΔT field (today's behaviour).
+            if user_input.get("supply_sensor"):
+                system["supply_sensor"] = user_input["supply_sensor"]
+                if user_input.get("return_sensor"):
+                    system["return_sensor"] = user_input["return_sensor"]
+                else:
+                    system.pop("return_sensor", None)
+                for key, default in DELTA_DEFAULTS.items():
+                    system[key] = user_input.get(key, system.get(key, default))
+            else:
+                for key in ("supply_sensor", "return_sensor", *DELTA_DEFAULTS):
+                    system.pop(key, None)
             if "quiet_max_fan" in user_input:
                 system["quiet_max_fan"] = user_input["quiet_max_fan"]
             self.index += 1
@@ -275,6 +297,40 @@ class HouseSteps:
                         description={"suggested_value": system.get("modulating")},
                     ): selector.BooleanSelector(),
                     **fan_fields,
+                    vol.Optional(
+                        "run_sensor",
+                        description=(
+                            {"suggested_value": system["run_sensor"]}
+                            if system.get("run_sensor")
+                            else {}
+                        ),
+                    ): entities(["binary_sensor", "sensor"]),
+                    vol.Optional(
+                        "run_threshold",
+                        description={
+                            "suggested_value": system.get(
+                                "run_threshold", DEFAULT_RUN_THRESHOLD
+                            )
+                        },
+                    ): number(0, 1000000, "any"),
+                    **{
+                        vol.Optional(
+                            key,
+                            description=(
+                                {"suggested_value": system[key]}
+                                if system.get(key)
+                                else {}
+                            ),
+                        ): entities("sensor", device_class="temperature")
+                        for key in ("supply_sensor", "return_sensor")
+                    },
+                    **{
+                        vol.Optional(
+                            key,
+                            description={"suggested_value": system.get(key, default)},
+                        ): number(0 if key == "delta_deadband" else 0.5, 50, 0.1)
+                        for key, default in DELTA_DEFAULTS.items()
+                    },
                 }
             ),
         )

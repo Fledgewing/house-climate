@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.21 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.22 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 The setpoint is the center of the smallest predicted temperature band across the counted rooms.
 The default `objective: "band"` minimizes the largest priority-scaled room deviation from it,
@@ -44,6 +44,10 @@ Legacy PI gains, house offset clamps and slew settings remain readable and unuse
 
 Automatic mode retains its 1 °C deadband and 60-minute heat/cool dwell. Cooling is vetoed below 10 °C outdoors; heating above 24 °C. Explicit heat/cool requests take effect immediately, subject to the outdoor veto. Starts and stops obey cycling protection on scheduled and immediate passes. Explicit House off and outdoor vetoes still stop operation.
 
+Version 0.5.22 adds optional per-system **duct temperature probes** and a **Run sensor** as
+the learning truth for units whose reported action is unreliable; see
+[Local run sensor and duct probes](#local-run-sensor-and-duct-probes-0522).
+
 Version 0.5.21 adds the **Learning background drift per window** option
 (`learning_drift`, default **0**, unchanged behaviour). With 0 the integrated fit assumes a
 constant background. When slow unmodeled heat or loss (sun, people, other heaters, drafts)
@@ -65,6 +69,116 @@ Restart storage retains fitted coefficients, covariance, counts and disturbance 
 On upgrade, an archived fit can be restored when retained observations establish that it
 is better; overwritten or evicted learning cannot be reconstructed. Ordinary operation
 continues learning, including persistent changes in room response.
+
+## Local run sensor and duct probes (0.5.22)
+
+Some cloud-read units report an `hvac_action` that is stale or contradictory. On 2026-11-21 a
+Bryant Evolution Connex read through Carrier's cloud said `heating` for over 76 minutes while
+the same snapshot said the indoor unit was off with zero airflow, and `idle` while rooms
+warmed. Learning took that as evidence that heating cools the house. Its blower also runs
+almost continuously, so "blower running" says nothing either.
+
+Each system's step of **Configure** has optional local sensors that replace the device's
+reported action as the truth for that unit's **learning** effort. Control, cycling protection
+and fan learning still use the device's reported state. Leaving them empty keeps the previous
+behaviour; setting, changing or clearing them keeps all learning.
+
+### Duct probes (recommended)
+
+- **Supply duct temperature**: a probe in the supply plenum, after the coil and any heat strips.
+- **Return duct temperature** (optional): a probe in the return duct, before the filter. When
+  empty, the return is the system's own `current_temperature` (its thermostat's indoor
+  reading). To use a room instead, pick that room's sensor here.
+
+The effort is signed and continuous, from ΔT = supply − return:
+
+| ΔT | Effort |
+| --- | --- |
+| within ±**ΔT dead band** (`delta_deadband`, default 2 °C) | 0 (blower only, probe offsets) |
+| positive | ΔT / **ΔT at full heating** (`delta_full_heat`, default 15 °C), at most +1 |
+| negative | ΔT / **ΔT at full cooling** (`delta_full_cool`, default 10 °C), at least −1 |
+
+Typical readings: heating +8…+20 °C (more with electric strips), blower only 0 ± 2, cooling
+−8…−12, a defrost in heat mode briefly negative. The sign comes from the air, not from the
+device's mode, so a defrost counts as removing heat and a stale cloud mode cannot flip it. A
+variable-speed unit at part load gives a proportional fraction, so effects are learned per
+full effort. This assumes roughly constant airflow (true for a blower that always runs); if
+the blower slows with capacity, part load reads a little high. Effort is capped at ±1: it is
+per full unit capacity, and the controller also caps efforts at 1, so strips beyond a full
+ΔT saturate rather than count extra. The probes are sampled on each update of either probe,
+of the system (fallback return), and on each controller tick, and integrated over the
+interval; no extra smoothing is applied.
+
+A probe that is unavailable, unknown, or has neither changed nor reported for longer than
+**Sensor stale after** (`stale_after`, default 720 minutes) makes that unit's intervals
+uncertain: they are withheld from learning like a mode transition, unless a trusted run
+sensor is also set (below). There is never a fallback to the device's reported action.
+
+### Run sensor
+
+**Run sensor** selects a local sensor that shows whether the unit is really running:
+
+- a `binary_sensor` (on = running), or
+- a numeric `sensor` (power or current) with **Run threshold** (default 50): running when the
+  value is above the threshold, in the sensor's own unit (W, kW, A …), for example a smart
+  circuit monitor on the heat pump's circuit (compressor on/off).
+
+On its own it gives on/off evidence: running in heat mode is heating (+1), in cool mode
+cooling (−1), not running idle. In `heat_cool`/`auto` the direction is the House's selected
+direction (`active_mode`). Running while the device reports off, fan or dry is uncertain. An
+unavailable or stale run sensor withholds the interval, like a probe.
+
+### Both set
+
+ΔT decides the effort. The run sensor is a cross-check and the fallback:
+
+- probes trusted → ΔT effort. If the run sensor disagrees (off with ΔT outside the dead band,
+  for example strips on a separate circuit, or on with ΔT inside it, for example a compressor
+  start), ΔT still wins and `disagreement` is set;
+- probes unavailable/stale, run sensor trusted → the run sensor rule above;
+- neither trusted → no evidence for that interval.
+
+### Attributes
+
+`climate.house` shows `action_sources` for each unit: `source` (`delta_t`, `run_sensor` or
+`device`), the resulting `action` (a number for ΔT), and as configured `supply`, `return`,
+`delta_t`, `effort`, `supply_sensor`, `return_sensor`, `running`, `disagreement`, `problem`
+(why there is no evidence), `delta_problem`/`run_problem` (each source's own problem) and the
+device's reported `device_action` and `mode`.
+
+### Hardware: two DS18B20 probes on an ESP32 (ESPHome)
+
+Use waterproof stainless DS18B20 probes on one 1-Wire bus (data pin with a 4.7 kΩ pull-up to
+3.3 V). Drill a small hole in the supply plenum downstream of the coil and strips (out of the
+line of sight of the strips' radiant heat), and one in the return duct before the filter.
+Insert the probe tips into the airstream and seal both holes airtight with foil HVAC tape.
+
+```yaml
+esphome:
+  name: hvac-ducts
+esp32:
+  board: esp32dev
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+api:
+one_wire:
+  - platform: gpio
+    pin: GPIO4
+sensor:
+  - platform: dallas_temp
+    address: 0x1c0000031edd2a28  # from the ESPHome log
+    name: Supply air
+    update_interval: 10s
+  - platform: dallas_temp
+    address: 0x5e0000031e1a7f28
+    name: Return air
+    update_interval: 10s
+```
+
+Pick `sensor.hvac_ducts_supply_air` and `sensor.hvac_ducts_return_air` in the system's step.
+With a circuit monitor on the heat pump's circuit, set it as **Run sensor** too: it keeps
+learning going while the ESP32 is offline and flags strips running on another circuit.
 
 ## Steady operation and cycling protection
 

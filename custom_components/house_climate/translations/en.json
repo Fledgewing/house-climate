@@ -21,14 +21,30 @@
       },
       "system": {
         "title": "System preset",
-        "description": "Set a hold preset for {entity}, such as manual, when required by the device. Room effects are learned automatically.",
+        "description": "Set a hold preset for {entity}, such as manual, when required by the device. Room effects are learned automatically. Optionally choose local sensors (duct temperature probes and/or a run sensor) if the device's reported action is unreliable.",
         "data": {
           "preset": "Required preset (optional)",
           "quiet_max_fan": "Quiet hours maximum fan (list order)",
           "min_run_minutes": "Minimum reported run (minutes)",
           "min_off_minutes": "Minimum reported off time (minutes)",
           "max_starts_per_hour": "Maximum starts per hour",
-          "modulating": "Modulating target (default: target step below 0.5 \u00b0C)"
+          "modulating": "Modulating target (default: target step below 0.5 \u00b0C)",
+          "run_sensor": "Run sensor (optional)",
+          "run_threshold": "Run threshold (numeric run sensor)",
+          "supply_sensor": "Supply duct temperature (optional)",
+          "return_sensor": "Return duct temperature (optional)",
+          "delta_deadband": "Duct \u0394T dead band (\u00b0C)",
+          "delta_full_heat": "Duct \u0394T at full heating (\u00b0C)",
+          "delta_full_cool": "Duct \u0394T at full cooling (\u00b0C)"
+        },
+        "data_description": {
+          "run_sensor": "A local sensor at the equipment that shows whether this unit is really running: a binary sensor (on = running) or a power/current sensor. When set, it replaces the device's reported heating/cooling action for learning; the direction comes from the device's heat or cool mode (in heat/cool auto, from the House's selected direction). If it is unavailable or has not reported for longer than the sensor stale after setting, that unit's intervals are not learned from. Leave empty to use the device's reported action.",
+          "run_threshold": "For a numeric run sensor: the unit counts as running when the value is above this, in the sensor's own unit (for example 50 W, or 0.5 A for a current clamp). Ignored for a binary sensor.",
+          "supply_sensor": "A temperature probe in the supply plenum, after the coil and any heat strips. When set, supply minus return temperature (\u0394T) decides this unit's learning effort and its sign: positive adds heat, negative removes it, whatever the device's mode or reported action says (a defrost counts as negative). It takes precedence over the run sensor, which then only cross-checks it and is the fallback while the probes are unavailable or stale. Leave empty to not use duct probes.",
+          "return_sensor": "A temperature probe in the return duct, before the filter. Leave empty to use this system's own current temperature (its thermostat's indoor reading) as the return, or pick a room sensor near the return grille.",
+          "delta_deadband": "\u0394T within \u00b1 this many degrees counts as not heating or cooling (blower only, probe offsets). Default 2.",
+          "delta_full_heat": "Positive \u0394T that counts as full heating effort (effort 1). Smaller \u0394T is a proportional part load; larger (for example with electric strips) stays 1. Default 15.",
+          "delta_full_cool": "Negative \u0394T magnitude that counts as full cooling effort (effort \u22121). Default 10."
         }
       },
       "tunables": {
@@ -151,14 +167,30 @@
       },
       "system": {
         "title": "System preset",
-        "description": "Set a hold preset for {entity}, such as manual, when required by the device. Room effects are learned automatically.",
+        "description": "Set a hold preset for {entity}, such as manual, when required by the device. Room effects are learned automatically. Optionally choose local sensors (duct temperature probes and/or a run sensor) if the device's reported action is unreliable.",
         "data": {
           "preset": "Required preset (optional)",
           "quiet_max_fan": "Quiet hours maximum fan (list order)",
           "min_run_minutes": "Minimum reported run (minutes)",
           "min_off_minutes": "Minimum reported off time (minutes)",
           "max_starts_per_hour": "Maximum starts per hour",
-          "modulating": "Modulating target (default: target step below 0.5 \u00b0C)"
+          "modulating": "Modulating target (default: target step below 0.5 \u00b0C)",
+          "run_sensor": "Run sensor (optional)",
+          "run_threshold": "Run threshold (numeric run sensor)",
+          "supply_sensor": "Supply duct temperature (optional)",
+          "return_sensor": "Return duct temperature (optional)",
+          "delta_deadband": "Duct \u0394T dead band (\u00b0C)",
+          "delta_full_heat": "Duct \u0394T at full heating (\u00b0C)",
+          "delta_full_cool": "Duct \u0394T at full cooling (\u00b0C)"
+        },
+        "data_description": {
+          "run_sensor": "A local sensor at the equipment that shows whether this unit is really running: a binary sensor (on = running) or a power/current sensor. When set, it replaces the device's reported heating/cooling action for learning; the direction comes from the device's heat or cool mode (in heat/cool auto, from the House's selected direction). If it is unavailable or has not reported for longer than the sensor stale after setting, that unit's intervals are not learned from. Leave empty to use the device's reported action.",
+          "run_threshold": "For a numeric run sensor: the unit counts as running when the value is above this, in the sensor's own unit (for example 50 W, or 0.5 A for a current clamp). Ignored for a binary sensor.",
+          "supply_sensor": "A temperature probe in the supply plenum, after the coil and any heat strips. When set, supply minus return temperature (\u0394T) decides this unit's learning effort and its sign: positive adds heat, negative removes it, whatever the device's mode or reported action says (a defrost counts as negative). It takes precedence over the run sensor, which then only cross-checks it and is the fallback while the probes are unavailable or stale. Leave empty to not use duct probes.",
+          "return_sensor": "A temperature probe in the return duct, before the filter. Leave empty to use this system's own current temperature (its thermostat's indoor reading) as the return, or pick a room sensor near the return grille.",
+          "delta_deadband": "\u0394T within \u00b1 this many degrees counts as not heating or cooling (blower only, probe offsets). Default 2.",
+          "delta_full_heat": "Positive \u0394T that counts as full heating effort (effort 1). Smaller \u0394T is a proportional part load; larger (for example with electric strips) stays 1. Default 15.",
+          "delta_full_cool": "Negative \u0394T magnitude that counts as full cooling effort (effort \u22121). Default 10."
         }
       },
       "tunables": {

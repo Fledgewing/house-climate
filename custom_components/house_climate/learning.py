@@ -1162,6 +1162,45 @@ class Learning:
         return model
 
 
+def run_action(running, mode, active_mode=None):
+    """Learning action from a local run sensor instead of a reported hvac_action.
+
+    `running` is True/False, or None when the run sensor is unavailable or stale.
+    Direction comes from the device's mode; in heat_cool/auto it comes from the
+    house controller's selected direction (`ControlState.active_mode`), which is
+    what the coordinator commands. Running with no known heat/cool direction, or
+    any unknown run state, is uncertain (None) rather than a guess.
+    """
+    if running is None:
+        return None
+    if not running:
+        return "idle"
+    if mode in ("heat_cool", "auto"):
+        mode = active_mode
+    return {"heat": "heating", "cool": "cooling"}.get(mode)
+
+
+def delta_effort(delta, deadband=2, full_heat=15, full_cool=10):
+    """Signed effort from duct supply − return ΔT (°C), clamped to [−1, 1].
+
+    The sign is the air's: positive adds heat, negative removes it, whatever
+    the device's mode says (a defrost in heat mode is negative). Inside the
+    dead band (blower only, probe offsets) the effort is 0. Outside it the
+    effort is proportional to ΔT, so a variable-speed unit at part load reports
+    its part-load fraction of a full-capacity ΔT at roughly constant airflow.
+    Above a full-capacity ΔT (aux strips) it saturates: effort is per full
+    unit capacity, which the controller also caps at 1.
+    """
+    if delta is None or not isfinite(delta):
+        return None
+    if abs(delta) <= deadband:
+        return 0.0
+    scale = full_heat if delta > 0 else full_cool
+    if not scale or scale <= 0:
+        return None
+    return max(-1.0, min(1.0, delta / scale))
+
+
 class EffortTracker:
     """Integrate numeric efforts or action transitions between controller passes.
 
@@ -1217,6 +1256,10 @@ class EffortTracker:
             }.get(action)
         )
         self.times[system] = now
+
+    def invalidate(self, system):
+        """Withhold this system's current interval, e.g. a stale run sensor."""
+        self.missing.add(system)
 
     def finish(self, actions, now, *, modes=None, commanded_modes=None):
         for system, action in actions.items():

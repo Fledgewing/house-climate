@@ -1679,3 +1679,96 @@ Experiments: a test cut short by a measured ceiling already contributes evidence
 learning integrates reported action whatever the test state. The limit is selection: a
 test starts only when a counted room is cold and stops when one is warm, so test timing
 is also part of the closed loop. No experiment policy changed.
+
+
+## v0.5.22: local run sensor and duct probes
+
+Live evidence 2026-11-21: `climate.home_zone_1` (Bryant Evolution Connex via the ha_carrier
+cloud integration) reported `hvac_action: heating` for 76+ minutes while the same snapshot
+said indoor unit off, airflow 0 and outdoor unit Stage 0; status changed only on hourly full
+refreshes or reconnects. Rooms fell while it said heating and rose while it said idle, and
+every learned effect collapsed to ≤0. No learner change can recover a sign that the input
+reports backwards, so the fix is a better input.
+
+Each system may set `run_sensor` (binary on = running, or numeric with `run_threshold`,
+default 50, compared in the sensor's own unit; kind is inferred from the domain, as for
+extra heat sources). `learning.run_action(running, mode, active_mode)` maps it to the
+signed action: heat → heating (+1), cool → cooling (−1), not running → idle (0). In device
+`heat_cool`/`auto` the direction is `ControlState.active_mode`, the controller's selected
+direction and the mode it commands; with no heat/cool direction, or running while the device
+reports off/fan/dry, the action is unknown. The coordinator's `learning_action` feeds that
+action to `EffortTracker` on device events, run-sensor events (`_run_changed`) and each
+tick, with the existing mode/commanded-mode checks, so the v0.5.20 transition withholding is
+unchanged. An unavailable/unknown run sensor reports `None`; one whose `last_reported` is
+older than `stale_after` also calls `EffortTracker.invalidate`, so the whole interval and
+its transition history are missing, as for a mode transition, and nothing falls back to the
+device's action. Measured efforts passed to the controller (`drive_bias`) come from the same
+tracker. Control estimates (`observe_report`, cycling clocks, thermostat latch) and fan
+windows still use the device's report: the option is scoped to thermal learning evidence.
+
+`run_sensor`/`run_threshold` live in the system's options and are absent when empty, so
+existing entries are unchanged. Options changes reload through the Store, which keeps every
+learned row (system list unchanged). `climate.house` `action_sources` shows per unit whether
+the action came from `run_sensor` or `device`, with the run state, problem and the device's
+reported action.
+
+`tests/test_run_sensor.py` replays the 11/21 pattern (actual hour on/hour off, cloud
+reporting the inverse) for three days: with the run sensor every room's effect is within
+20% of the supplied Bryant rate, without it every effect is ≤0 (today's behaviour). HA
+tests cover binary and power sensors overriding a contradictory device action in heat and
+cool, unavailable and stale run sensors yielding no evidence, and options set/clear keeping
+learning.
+
+### Duct probes: signed, continuous effort from ΔT
+
+The Bryant's blower runs almost continuously, so a run sensor on the blower says nothing and
+one on the compressor circuit misses strips on another circuit and gives only on/off for a
+variable-speed unit. Supply − return air temperature gives both direction and size. Each
+system may set `supply_sensor` and optionally `return_sensor` (temperature sensors). Without
+a return sensor the return is the system's own climate `current_temperature`, the
+thermostat's indoor reading: always present, near return-air temperature, and needing no
+extra choice; a room sensor can be picked as `return_sensor` instead.
+
+`learning.delta_effort(ΔT, delta_deadband=2, delta_full_heat=15, delta_full_cool=10)`: |ΔT|
+within the dead band is 0; otherwise ΔT/`delta_full_heat` above zero and ΔT/`delta_full_cool`
+below, clamped to [−1, 1]. Proportional to ΔT rather than to ΔT minus the dead band, so a
+part-load ΔT maps to its capacity fraction at constant airflow (the always-on blower). The
+clamp stays at ±1: the linear learner would accept larger values, but a system's effect is
+per full unit capacity, `ControlState` efforts and `drive_bias` are capped at 1, and strips
+beyond a full ΔT would otherwise inflate the per-effort effect. The sign is the air's, never
+the device mode's: a defrost in heat mode is negative and a stale cloud mode cannot flip it.
+One coefficient per system serves both signs, so the two scales also define how much cooling
+equals one unit of heating; a defrost's negative ΔT uses the cool scale and is overstated by
+15/10, which is small because defrosts are short.
+
+The coordinator samples ΔT (`delta_state`) on each update of either probe and of the system
+entity (fallback return) via `_local_changed`/`_system_changed`, and on each tick, and feeds
+it as a numeric action into the same `EffortTracker` that modulating units use; the tracker
+holds each sample until the next and integrates over the interval, so no smoothing is added.
+The v0.5.20 mode-transition withholding still applies (numeric actions are never nulled by
+the heat/cool mismatch check, only by mode transitions or unacknowledged commands).
+
+Combination rule (`learning_action`):
+
+1. probes trusted → ΔT effort, `source: delta_t`. A trusted run sensor only cross-checks:
+   `disagreement` is set when `running != (effort != 0)`, and ΔT still wins (strips on a
+   separate circuit, compressor starting);
+2. probe unavailable/unknown/stale (same `stale_after` rule as the run sensor, via
+   `local_problem`) and run sensor trusted → the run-sensor action, `source: run_sensor`;
+3. neither trusted → no action, `problem` set, and the tick calls `EffortTracker.invalidate`;
+   a configured local sensor never falls back to the device's reported action.
+
+`action_sources` adds
+`supply`, `return`, `delta_t`, `effort`, the sensors used, `disagreement`, and
+`delta_problem`/`run_problem`. Fields are absent when empty; clearing `supply_sensor` clears
+every ΔT field; options changes keep learning.
+
+`tests/test_duct_delta.py`: the ΔT→effort table; ΔT overriding a contradictory action and
+mode (stale cool mode while heating, defrost in heat mode, device off while air is heated);
+integration of probe updates within an interval; the run-sensor combinations; unavailable and
+stale probes yielding no samples; the return fallback; options round-trip. Replays of the
+11/21 pattern with probes (on/off, and a variable-speed unit at 35–85% part load, both with
+defrosts) learn every room's per-full-effort Bryant effect within 20% over four simulated
+days (observed 0.97–1.06 of truth), while on/off-only evidence for the variable-speed unit
+learns under 75% of truth.
+

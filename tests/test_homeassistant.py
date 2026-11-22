@@ -566,7 +566,23 @@ async def test_config_flow_empty_defaults_and_selector_filters(hass):
         "min_off_minutes",
         "max_starts_per_hour",
         "modulating",
+        "run_sensor",
+        "run_threshold",
+        "supply_sensor",
+        "return_sensor",
+        "delta_deadband",
+        "delta_full_heat",
+        "delta_full_cool",
     }
+    selectors = {
+        field.schema: value for field, value in result["data_schema"].schema.items()
+    }
+    run_selector = selectors["run_sensor"]
+    assert run_selector.config["domain"] == ["binary_sensor", "sensor"]
+    assert run_selector.config["multiple"] is False
+    for key in ("supply_sensor", "return_sensor"):
+        assert selectors[key].config["domain"] == ["sensor"]
+        assert selectors[key].config["device_class"] == ["temperature"]
     result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
     assert result["step_id"] == "tunables"
     fields = {
