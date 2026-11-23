@@ -33,6 +33,20 @@ COMMAND_DEFAULTS = {
     # while the estimated gap is at least this (°C): its thermostat latches
     # until its reading reaches the target.
     "command_hold_gap": 0.5,
+    # v0.5.24: the hold also needs the house mean moving in the commanded
+    # direction over the last `command_trend_minutes`, at least this rate
+    # (°C per 5 min). Live heating moved it 0.04–0.08 °C per 5 min; a
+    # satisfied thermostat leaves it flat.
+    "command_trend_minutes": 15,
+    # v0.5.24: when a slow unit's reading/action changes before its report
+    # timestamp moves, its command label is held (not re-estimated) for up to
+    # this many minutes waiting for the timestamp; past it, the old mark is
+    # used as before (an echo that never gets a new timestamp).
+    "report_settle_minutes": 10,
+    # Content that changes within this many seconds after a new report time
+    # was first seen belongs to that report (timestamp sensor first).
+    "report_pair_seconds": 120,
+    "command_hold_min_rate": 0.01,
     # v0.5.24: a slow reporter's hysteresis comes from cleanly observed
     # transitions (both reports fresh, at most `report_fresh_minutes` apart);
     # below this many such points the `thermostat_hysteresis` default is used.

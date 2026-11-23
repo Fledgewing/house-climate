@@ -1467,6 +1467,8 @@ def command_effort(
     drift=None,
     running=0,
     hold_gap=0.5,
+    trend=None,
+    hold_min_rate=0.01,
 ):
     """Classify a confirmed thermostat setting as clear on, clear off or ambiguous.
 
@@ -1483,7 +1485,11 @@ def command_effort(
     off test keeps the margin either way. `running` is the direction of the
     current on label (0 when none): a thermostat already running stays on until
     its reading reaches the target, so the same direction stays on while the
-    gap is at least `hold_gap` (plus the on margin). Otherwise an on needs the gap past both `clear_gap` and the
+    gap is at least `hold_gap` (plus the on margin) *and* the house is still
+    moving in the commanded direction: `trend` (house-mean rate, °C per 5 min,
+    None when unknown) at least `hold_min_rate`. A satisfied thermostat leaves
+    the house flat, so a flat house ends the hold. Such an on is returned as
+    "held" (never from the clear test). Otherwise an on needs the gap past both `clear_gap` and the
     thermostat's hysteresis plus `off_gap`; an off needs the target at least
     `off_gap` on the far side, since no thermostat runs with its target behind
     its reading. Mode off (and fan only) is a certain off. In heat_cool/auto the
@@ -1507,13 +1513,16 @@ def command_effort(
     gap = direction * (target - own)
     margin = min(margin_factor * abs(correction or 0), margin_cap)
     on_margin = 0.0 if drift is not None and direction * drift >= 0 else margin
-    needed = (
-        hold_gap
-        if running and running == direction
-        else max(clear_gap, (hysteresis or 0) + off_gap)
-    )
-    if gap >= needed + on_margin:
+    if gap >= max(clear_gap, (hysteresis or 0) + off_gap) + on_margin:
         return "on", direction, gap
+    if (
+        running
+        and running == direction
+        and trend is not None
+        and direction * trend >= hold_min_rate
+        and gap >= hold_gap + on_margin
+    ):
+        return "held", direction, gap
     if gap <= -off_gap - margin:
         return "off", direction, gap
     return "ambiguous", direction, gap
@@ -1592,6 +1601,15 @@ class CommandTransitions:
         found = None
         for state in self.history.get(key, []):
             if state["since"] <= when:
+                found = state
+        return found
+
+    def state_before(self, key, when):
+        """The state observed strictly before `when` (excludes changes the
+        observation at `when` itself made)."""
+        found = None
+        for state in self.history.get(key, []):
+            if state["since"] < when:
                 found = state
         return found
 

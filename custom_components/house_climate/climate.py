@@ -1,7 +1,5 @@
 """The single house thermostat."""
 
-from copy import deepcopy
-
 from homeassistant.components.climate import (
     ClimateEntity,
     ClimateEntityFeature,
@@ -11,6 +9,8 @@ from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
+
+from .attributes import snapshot
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -64,7 +64,8 @@ class HouseClimate(CoordinatorEntity, ClimateEntity, RestoreEntity):
         # A deep copy: the coordinator mutates these maps in place, and HA
         # compares new attributes with the previous state's (which would hold
         # the same objects), so a nested change would never be written.
-        return deepcopy(
+        # Rounded to stay under the recorder's attribute limit.
+        return snapshot(
             {
                 "last_decision": data.explanation if data else "Starting",
                 "disturbed": dict(self.coordinator.learning.disturbed),

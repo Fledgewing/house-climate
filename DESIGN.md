@@ -2061,7 +2061,16 @@ mostly the commanded unit doing what it was told.
    latches until its reading reaches the target (as `thermostat_effort` models), so a label
    already on in the command's direction stays on while the gap is at least
    `command_hold_gap` (0.5 °C, `COMMAND_DEFAULTS`) plus the on margin. Starting from no
-   label or off still needs the clear gap.
+   label or off still needs the clear gap. **Trend condition (review fix):** a satisfied
+   thermostat was held on for 70 min (estimate 23.54 lagging the real 24.5). The hold now
+   also needs the house mean moving in the commanded direction over the last
+   `command_trend_minutes` (15) at ≥ `command_hold_min_rate` (0.01 °C per 5 min; the live
+   evening warmed 0.04–0.08 °C per 5 min, so a quarter of the slowest live rate, above
+   sensor noise of a multi-room mean). `command_effort` returns `held` for an on that
+   survives only via the hold (`trend` and `held: true` in diagnostics); a clear-gap on is
+   unaffected. The trend comes from `HouseCoordinator.house_trend` (house-mean samples,
+   not persisted: after a restart there is no hold for one window). In the live replay the
+   hold carries 19:49–20:04 only.
 3. **Display:** `climate.house`'s `extra_state_attributes` returned
    `coordinator.action_sources` (and other maps) by reference. The coordinator mutates them in
    place, so the previous state's attributes held the same objects, HA's `attributes ==`
@@ -2085,6 +2094,51 @@ mostly the commanded unit doing what it was told.
    restarted it with a false 2-min start delay. Now an ambiguous confirmed command whose fresh
    report shows the unit running in its direction is on (`reason: fresh report running`); a
    new on label starts at the report time (the unit was already running then).
+6. **Review fixes to the report rules:**
+   - The mirror rule: a fresh report showing idle/off while the command is ambiguous or
+     held labels off from the report time (`reason: fresh report idle`; stop tail if it was
+     on). A clear on stays on and the report is a contradiction check instead.
+   - Both report rules trust only a report made at or after the command's `sent_at`
+     (an echo of an older fetch says nothing about the command).
+   - The cross-check compares a fresh report with the label in effect *before* its report
+     time (`CommandTransitions.state_before`), captured before this tick's observe. It used
+     the label after this tick's update, so a held on that a fresh idle report ended was
+     never counted. "Before", not "at": when the climate entity updates before the
+     timestamp sensor, the first tick pairs the new reading with the old report's mark and
+     may relabel at the report's own instant. A report within 5 min after the current
+     command was sent is not cross-checked (it reflects the change itself, e.g. the
+     21:15 off echo-fetch).
+
+7. **Report-mark ordering (fix):** when the climate entity updates before the timestamp
+   sensor, the action-change tick paired the new reading with the previous report's mark
+   (live 20:07 replay: reading 24.0 + 1.4 °C since 18:07 = est 25.4, ambiguous, effort
+   None, averaged windows restarted: the ~70 min loss this release fixes). Chosen: both
+   halves. `report_status` remembers when the climate entity's reading changes, with the
+   report time and house mean then (`report_content`, not persisted). A reading that
+   changes while the report time is one already marked more than `report_pair_seconds`
+   (120) ago is *early*: until the report time moves (at most `report_settle_minutes`, 10)
+   the status carries `report_pending` and `command_action` keeps the current label
+   (`reason: report time pending`) instead of estimating. When the time moves, the mark
+   is re-keyed with the mean from when the reading arrived. A reading that changes
+   within 120 s after a new report time was first seen belongs to it (timestamp sensor
+   first, with a tick in between). Only the reading counts as content (the action does not
+   enter the estimate; a mode echo changes it). A command sent after the current label is
+   still classified while pending (the mode-switch echo case). An echo whose reading never
+   gets a new time is held at most 10 min, then the old mark is used as before. Holding
+   was chosen over re-keying alone because re-keying cannot tell a fetch from a stale
+   echo until the timestamp moves.
+8. **Attribute size (fix):** live HA logged "State attributes for sensor.house_learning
+   exceed maximum size of 16384 bytes" every 5 min (113 times on 11-22) and the recorder
+   dropped them. A new `attributes.snapshot` deep-copies and rounds floats to 4 significant
+   digits (values ≥ 1e6, timestamps, are kept); used by `climate.house` and both learning
+   sensors. `sensor.house_learning` exposes per row only `b` (`e` for sources),
+   `effective_effect`, `confidence` and `effective_samples` (dropped: `g`, `h`,
+   `steady_std`, `blended_b`, `influence`), saved regime models without their
+   coefficients, and no per-sensor `disturbed` (duplicate of the top-level map). There is
+   no diagnostics download in this integration, so the dropped fields remain only in
+   `Learning.diagnostics()` (and the Store). 8 rooms, 2 systems, 4 sources, 3 saved models
+   per row: 16.7 KB before, 11.8 KB after (fan learning 0.3 KB, climate 3.0 KB). Each
+   further source adds about 1 KB.
 
 ### Storage and rollback
 
@@ -2135,4 +2189,19 @@ dataclass fields, the new key round-trips, a v0.5.23 store loads. Attributes: a 
 `action_sources` change in place is written (old and new states differ), and the learning
 sensor returns fresh dicts. `test_command_effort.py`'s table covers the half-size, capped
 margin, the v0.5.23 parameters, signed drift with and against heat and cool (against still
-widens the band; off keeps the margin) and the running hold.
+widens the band; off keeps the margin) and the running hold (held only with the house
+moving in the commanded direction; flat, unknown or wrong-way trend ends it; clear on
+ignores the trend). Review fixes: the review repro (satisfied at 20:20, idle fetch 21:30)
+is held at 19:54 (trend 0.077), ambiguous from 20:34 with no effort 20:39–21:29, and off
+(`fresh report idle`) at 21:34; a fresh idle fetch at 19:55 under a held label counts one
+contradiction (rate 1.0) and labels off, with either update order (timestamp sensor first
+or climate entity first); a fresh running report 60 s before the command settles nothing,
+60 s after it labels on. The live replay asserts the hold only at 19:49–20:04.
+Report ordering: the live evening with the 18:07 and 20:07 fetches in either order
+(timestamp sensor first, climate entity first) has no ambiguous label 18:11–21:15 and
+accepted windows at every tick 19:30–21:14; with the hold disabled
+(`report_settle_minutes` −1) the entity-first order breaks it (asserted), and the tick
+after the entity-first fetch estimates 24.0 ± 0.1 (re-keyed mark). `tests/
+test_attribute_size.py`: the 8-room × 2-system × 4-source house with full-precision
+rows and 3 saved models per row stays under 12 KB for all three entities; exposed row
+fields and saved-model fields are exact; the model's diagnostics keep the rest.

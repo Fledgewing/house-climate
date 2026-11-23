@@ -8,6 +8,7 @@ came from thermostat points learned from transitions seen up to 2 h late
 `own_estimate` and again as the full margin in `command_effort`).
 """
 
+import asyncio
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
@@ -236,22 +237,33 @@ def room(when):
     return 21.5 + WARMING[-1][1] + RATE * (when - WARMING[-1][0]).total_seconds()
 
 
-async def evening(hass, settings):
-    """Replay 17:55–21:44 PT; return per-tick (time, info, effort)."""
-    entry, c = await start(hass, settings)
-    c.state.thermostat_points[CLOUD] = list(INFLATED)
-    events = {
-        pt(18, 7): lambda t: device(c, t, True, current_temperature=21.5),
+def live_events(c, order="timestamp_first"):
+    """The live evening's reports and commands (fetches in `order`)."""
+    return {
+        pt(18, 7): lambda t: fetch(c, t, order, current_temperature=21.5),
         pt(18, 9): lambda t: send(c, t, "heat", 24.5) or device(c, t, temperature=24.5),
         # The thermostat heats with its target only 0.5 above its reading.
-        pt(20, 7): lambda t: device(
-            c, t, True, hvac_action="heating", current_temperature=24.0
+        pt(20, 7): lambda t: fetch(
+            c, t, order, hvac_action="heating", current_temperature=24.0
         ),
         pt(20, 9): lambda t: send(c, t, "heat", 27) or device(c, t, temperature=27),
         pt(21, 15): lambda t: (
             send(c, t, "off", 27) or device(c, t, True, mode="off", hvac_action="off")
         ),
     }
+
+
+def first_events(c):
+    """The live evening up to the 18:09 command only (no later fetch)."""
+    events = live_events(c)
+    return {t: events[t] for t in (pt(18, 7), pt(18, 9))}
+
+
+async def evening(hass, settings, events=live_events, house=room, extra=None):
+    """Replay 17:55–21:44 PT; return per-tick (time, info, effort)."""
+    entry, c = await start(hass, settings)
+    c.state.thermostat_points[CLOUD] = list(INFLATED)
+    events = {**events(c), **(extra(c) if extra else {})}
     ticks = []
     windows = False
     when = pt(17, 59, 10)
@@ -261,11 +273,12 @@ async def evening(hass, settings):
                 await events[event_time](event_time)
         with at(when):
             hass.states.async_set(
-                "sensor.room", f"{room(when):.2f}", {"unit_of_measurement": "°C"}
+                "sensor.room", f"{house(when):.2f}", {"unit_of_measurement": "°C"}
             )
             await hass.async_block_till_done()
             await c.async_tick()
         info = deepcopy(c.action_sources[CLOUD])
+        info["windows_accepted"] = c.windows_accepted()
         ticks.append((when, info, c.samples[-1]["efforts"][CLOUD]))
         windows = windows or c.windows_accepted()
         when += timedelta(minutes=5)
@@ -296,6 +309,10 @@ async def test_live_evening_stays_on_and_completes_a_window(hass, settings):
     assert estimates[pt(18, 39, 10)] == pytest.approx(21.83, abs=0.01)
     assert estimates[pt(18, 59, 10)] == pytest.approx(22.17, abs=0.01)
     assert estimates[pt(19, 14, 10)] == pytest.approx(22.53, abs=0.01)
+    # 19:49–20:04 stay on only through the hold, while the house warms.
+    held = [when for when, info, _ in ticks if info.get("command", {}).get("held")]
+    assert pt(19, 49, 10) in held and pt(20, 4, 10) in held
+    assert all(pt(19, 49) <= when < pt(20, 7) for when in held)
     on = next(info for when, info, _ in ticks if when == pt(21, 4, 10))
     assert on["command"]["hysteresis"] == 0.5
     assert on["command"]["hysteresis_source"] == "default"
@@ -376,3 +393,158 @@ async def test_nested_attribute_change_is_written(hass, settings):
     second = entity.extra_state_attributes
     assert first.keys() == second.keys()
     assert all(first[k] is not second[k] for k in first if isinstance(first[k], dict))
+
+
+# --- the hold ends with the run ----------------------------------------------
+
+
+def satisfied_at(end):
+    """The live warming, then flat from `end` (the thermostat is satisfied)."""
+    return lambda when: room(min(when, end))
+
+
+async def fetch(c, when, order, **changes):
+    """A cloud fetch: timestamp sensor first, or the climate entity first."""
+    with at(when):
+        state = c.hass.states.get(CLOUD)
+        attributes = {**state.attributes, **changes}
+        if order == "timestamp_first":
+            c.hass.states.async_set(FETCH, when.isoformat())
+            await c.hass.async_block_till_done()
+        c.hass.states.async_set(CLOUD, state.state, attributes)
+        await c.hass.async_block_till_done()
+        if order == "entity_first":
+            c.hass.states.async_set(FETCH, when.isoformat())
+            await c.hass.async_block_till_done()
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_hold_ends_when_the_house_stops_warming(hass, settings):
+    """Review repro: satisfied at 20:20, next fetch 21:30 idle at 24.5.
+
+    The estimate (23.54) lags the thermostat's real reading. With the hold
+    alone the label stayed on (effort 1) for 70 min and nothing contradicted
+    it. Now the flat house ends the hold and the idle fetch labels off.
+    """
+    c, ticks, _ = await evening(
+        hass,
+        settings,
+        events=first_events,
+        house=satisfied_at(pt(20, 20)),
+        extra=lambda c: {
+            pt(21, 30): lambda t: fetch(
+                c, t, "entity_first", hvac_action="idle", current_temperature=24.5
+            )
+        },
+    )
+    info = {when: (i["command"], effort) for when, i, effort in ticks}
+    # Held (below the clear gap) while the house still warms.
+    command, effort = info[pt(19, 54, 10)]
+    assert command["class"] == "on" and command["held"] and effort == 1
+    assert command["trend"] > 0.05
+    # Flat from 20:20: the hold ends within one trend window.
+    assert info[pt(20, 34, 10)][0]["class"] == "ambiguous"
+    for when, (command, effort) in info.items():
+        if pt(20, 39) <= when < pt(21, 34):
+            assert command["class"] == "ambiguous", when
+            assert effort is None, when
+    command, _ = info[pt(21, 34, 10)]
+    assert command["class"] == "off"
+    assert command["reason"] == "fresh report idle"
+
+
+@pytest.mark.parametrize("order", ["timestamp_first", "entity_first"])
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_fresh_idle_report_contradicts_a_held_label(hass, settings, order):
+    """The cross-check uses the label in effect at the report time."""
+    c, ticks, _ = await evening(
+        hass,
+        settings,
+        events=first_events,
+        extra=lambda c: {
+            pt(19, 55): lambda t: fetch(
+                c, t, order, hvac_action="idle", current_temperature=24.5
+            )
+        },
+    )
+    info = {when: i["command"] for when, i, _ in ticks}
+    assert info[pt(19, 54, 10)]["held"]
+    checks = c.reporting.checks.status(CLOUD)
+    assert checks["checks"] == 1
+    assert checks["rate"] == 1.0
+    command = info[pt(19, 59, 10)]
+    assert command["class"] == "off"
+    assert command["reason"] == "fresh report idle"
+
+
+@pytest.mark.parametrize(("offset", "trusted"), [(-60, False), (60, True)])
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_reports_before_the_command_settle_nothing(
+    hass, settings, offset, trusted
+):
+    """A fresh report made before the command was sent says nothing about it."""
+    entry, c = await start(hass, settings)
+    sent = pt(18, 9)
+    # Target 1.0 above the reading: an unclear (ambiguous) command.
+    send(c, sent, "heat", 22.5)
+    await device(c, sent, temperature=22.5)
+    await fetch(
+        c,
+        sent + timedelta(seconds=offset),
+        "timestamp_first",
+        hvac_action="heating",
+        current_temperature=21.5,
+    )
+    with at(sent + timedelta(seconds=180)):
+        await c.async_tick()
+    command = c.action_sources[CLOUD]["command"]
+    if trusted:
+        assert (command["class"], command["reason"]) == ("on", "fresh report running")
+    else:
+        assert command["class"] == "ambiguous"
+        assert command.get("reason") != "fresh report running"
+
+
+# --- a fetch whose content arrives before its timestamp ----------------------
+
+
+@pytest.mark.parametrize("order", ["timestamp_first", "entity_first"])
+@pytest.mark.parametrize("settle", [None, -1])
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_fetch_order_never_breaks_the_label(hass, settings, order, settle):
+    """The 20:07 fetch in either update order: no ambiguous label, no reset.
+
+    Entity first, the action-change tick saw the new reading (24.0) with the
+    18:07 report's mark (+1.4 °C since): est 25.4, ambiguous, effort None, and
+    the averaged windows restarted. `settle` -1 disables the v0.5.24 hold.
+    """
+    if settle is not None:
+        settings["report_settle_minutes"] = settle
+    labels = []
+    c, ticks, _ = await evening(
+        hass,
+        settings,
+        events=lambda c: {
+            **live_events(c, order),
+            # Every label change between ticks (incl. the action-change tick).
+            pt(20, 7, 1): lambda t: (
+                labels.extend(list(c.command_labels.history[CLOUD])) or asyncio.sleep(0)
+            ),
+        },
+    )
+    history = [
+        state
+        for state in c.command_labels.history[CLOUD] + labels
+        if pt(18, 11).timestamp() <= state["since"] < pt(21, 15).timestamp()
+    ]
+    broken = any(state["label"] is None for state in history) or any(
+        not info["windows_accepted"]
+        for when, info, _ in ticks
+        if pt(19, 30) <= when < pt(21, 15)
+    )
+    assert broken == (order == "entity_first" and settle == -1)
+    if order == "entity_first" and settle is None:
+        info = {when: i["command"] for when, i, _ in ticks}
+        # The next tick re-keys the mark with the mean from 20:07 (the 18:07
+        # mark would give about 25.5).
+        assert info[pt(20, 9, 10)]["own_est"] == pytest.approx(24.0, abs=0.1)

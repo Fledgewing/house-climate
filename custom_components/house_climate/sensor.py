@@ -1,7 +1,5 @@
 """House temperature, spread and system offsets."""
 
-from copy import deepcopy
-
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -11,8 +9,13 @@ from homeassistant.const import UnitOfTemperature
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
+from .attributes import snapshot
 from .controller import excitation_scores
 from .priority import members
+
+# Per-row fields exposed in the learning sensor's attributes (v0.5.24).
+SYSTEM_FIELDS = {"b", "effective_effect", "confidence", "effective_samples"}
+SOURCE_FIELDS = {"e", "effective_effect", "confidence", "effective_samples"}
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -118,9 +121,27 @@ class LearningSensor(CoordinatorEntity, SensorEntity):
             }
             for key, (score, _) in scores.items()
         }
-        # A deep copy, so a nested change is never equal to the previous
-        # state's attributes (HA would skip the write).
-        return deepcopy(diagnostics)
+        # A rounded deep copy, so a nested change is never equal to the
+        # previous state's attributes (HA would skip the write), and the
+        # attributes stay under the recorder's 16 KB limit (v0.5.24: 8 rooms,
+        # 2 systems and 4 sources were 16.7 KB). Per row only the effect, the
+        # effective effect, confidence and effective samples are exposed; the
+        # model keeps the rest (`Learning.diagnostics`).
+        for info in diagnostics["sensors"].values():
+            # Duplicates the top-level `disturbed` map.
+            info.pop("disturbed", None)
+            # Saved regime models: id and fit time; coefficients stay in the
+            # model (12+ floats each, several per room).
+            info["saved_models"] = [
+                {k: v for k, v in saved.items() if k != "coefficients"}
+                for saved in info.get("saved_models", [])
+            ]
+        for name, keep in (("systems", SYSTEM_FIELDS), ("sources", SOURCE_FIELDS)):
+            for cells in diagnostics[name].values():
+                for sensor, cell in cells.items():
+                    if isinstance(cell, dict):
+                        cells[sensor] = {k: v for k, v in cell.items() if k in keep}
+        return snapshot(diagnostics)
 
 
 class FanLearningSensor(LearningSensor):
@@ -136,4 +157,4 @@ class FanLearningSensor(LearningSensor):
 
     @property
     def extra_state_attributes(self):
-        return deepcopy(self.coordinator.fans.diagnostics())
+        return snapshot(self.coordinator.fans.diagnostics())

@@ -280,12 +280,24 @@ change:
   and the estimate already includes it). A move against the command, and the "off" test,
   widen it by half its size, at most 0.5 °C (it was the full size, either way).
 - A unit already labelled running stays on while its estimated reading is at least 0.5 °C
-  short of the target, as its thermostat latches until it reaches it.
+  short of the target *and* the house is still warming (cooling) at 0.01 °C per 5 min or
+  more over the last 15 minutes, as its thermostat latches until it reaches the target.
+  Once the house flattens, that time is left unlabelled.
 - A fresh report of the unit running at a small, unclear gap keeps the command's on label
-  instead of dropping it (the thermostat runs with its target just above its reading).
+  instead of dropping it (the thermostat runs with its target just above its reading); a
+  fresh report of it idle or off labels it off. Only reports made after the command count,
+  and each fresh report is checked against the label in effect when it was made.
 
 The House thermostat's `action_sources` attribute (and the learning sensors' attributes)
-now update in the UI as they change; before, the frontend could keep showing `{}`.
+now update in the UI as they change; before, the frontend could keep showing `{}`. They are
+also rounded to 4 significant digits, and **House learning** shows per room only each
+unit's and source's effect, effective effect, confidence and effective samples (no
+interaction/lag terms, saved-model coefficients or per-room disturbed copy), so its
+attributes stay under Home Assistant's 16 KB recorder limit.
+
+When a cloud unit's reading arrives before its report timestamp sensor updates, its
+command label is kept until the timestamp arrives (at most 10 minutes) instead of being
+estimated from the previous report.
 
 `climate.house` `action_sources` shows, for a slow unit: `source` (`command`, `report`,
 `latent` while waiting for its late label, or none), `slow` and `slow_reason` (mode, measured gaps, median gap), `report_age_s`,

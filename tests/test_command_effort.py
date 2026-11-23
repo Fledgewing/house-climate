@@ -64,12 +64,23 @@ FETCH = "sensor.cloud_fetch"
         (("cool", 18.03, 20, 1.03), {"drift": -1.03}, "on"),
         (("cool", 18.03, 20, 1.03), {"drift": 1.03}, "ambiguous"),
         (("heat", 18.7, 20, 0.8), {"drift": 0.8}, "ambiguous"),
-        # A running label (same direction) holds down to the hold gap.
-        (("heat", 20.6, 20), {"running": 1}, "on"),
-        (("heat", 20.4, 20), {"running": 1}, "ambiguous"),
-        (("heat", 20.6, 20), {"running": -1}, "ambiguous"),
-        (("heat", 20.6, 20, 0.6), {"running": 1, "drift": -0.6}, "ambiguous"),
-        (("cool", 19.4, 20), {"running": -1}, "on"),
+        # A running label (same direction) holds down to the hold gap while
+        # the house still moves in the commanded direction.
+        (("heat", 20.6, 20), {"running": 1, "trend": 0.04}, "held"),
+        (("heat", 20.4, 20), {"running": 1, "trend": 0.04}, "ambiguous"),
+        (("heat", 20.6, 20), {"running": -1, "trend": 0.04}, "ambiguous"),
+        (
+            ("heat", 20.6, 20, 0.6),
+            {"running": 1, "drift": -0.6, "trend": 0.04},
+            "ambiguous",
+        ),
+        (("cool", 19.4, 20), {"running": -1, "trend": -0.04}, "held"),
+        # A flat (or unknown, or wrong-way) house ends the hold.
+        (("heat", 20.6, 20), {"running": 1, "trend": 0.005}, "ambiguous"),
+        (("heat", 20.6, 20), {"running": 1}, "ambiguous"),
+        (("cool", 19.4, 20), {"running": -1, "trend": 0.04}, "ambiguous"),
+        # The clear test is unaffected by the trend.
+        (("heat", 22, 20), {"running": 1, "trend": 0.0}, "on"),
         # A learned wide hysteresis needs a wider on gap.
         (("heat", 21.6, 20), {"hysteresis": 1.0}, "ambiguous"),
         # Unconfirmed (echo missing, pending, outside change) is never a label.

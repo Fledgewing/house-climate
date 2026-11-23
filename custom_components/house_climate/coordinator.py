@@ -108,6 +108,13 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.command_settings = {}
         # House mean when each system's current report was fetched.
         self.report_marks = {}
+        # (time, house mean) samples for the command hold's trend (v0.5.24);
+        # not persisted: after a restart no hold for one trend window.
+        self.mean_history = []
+        # Last seen report content (reading, action) per system, with the
+        # report time and house mean when it changed (v0.5.24, not persisted).
+        self.report_content = {}
+        self.mark_taken = {}
         self.reports = {}
         self.outside_changes = {}
         self.command_fed = set()
@@ -557,6 +564,24 @@ class HouseCoordinator(DataUpdateCoordinator):
             weight += share
         return total / weight if weight else None
 
+    def house_trend(self, now):
+        """House-mean rate (°C per 5 min) over the last trend window, or None.
+
+        Needs a sample at least `command_trend_minutes` old; keeps the newest
+        such sample as the base and drops older ones.
+        """
+        mean = self.house_mean()
+        window = self.command_setting("command_trend_minutes") * 60
+        history = self.mean_history
+        if mean is not None and (not history or history[-1][0] < now):
+            history.append((now, mean))
+        while len(history) > 1 and history[1][0] <= now - window:
+            history.pop(0)
+        if mean is None or not history or history[0][0] > now - window:
+            return None
+        base_time, base_mean = history[0]
+        return (mean - base_mean) / (now - base_time) * 300
+
     def report_status(self, system, now):
         """Slow-reporter tag and report freshness for one system (v0.5.23)."""
         key = system["entity_id"]
@@ -572,10 +597,39 @@ class HouseCoordinator(DataUpdateCoordinator):
         fresh = age is not None and age <= (
             self.report_setting(system, "report_fresh_minutes") * 60
         )
+        # The report's reading can arrive before its timestamp (the climate
+        # entity updates before the timestamp sensor). Pairing the new reading
+        # with the old report's mark gives a wrong estimate for a tick, so
+        # remember when the reading changed and the house mean then. (The
+        # action alone does not enter the estimate; a mode echo changes it.)
+        content = entity.attributes.get("current_temperature") if entity else None
+        seen = self.report_content.get(key)
+        if seen is None or seen["content"] != content:
+            self.report_content[key] = seen = {
+                "content": content,
+                "reported": reported,
+                "at": now if seen is not None else None,
+                "mean": self.house_mean(),
+                # Changed without a new report time (yet): the current time
+                # is not one first seen moments ago (timestamp first).
+                "early": reported is not None
+                and self.report_marks.get(key, {}).get("reported") == reported
+                and now - self.mark_taken.get(key, float("-inf"))
+                > self.command_setting("report_pair_seconds"),
+            }
+        settle = self.command_setting("report_settle_minutes") * 60
+        recent = seen["at"] is not None and seen["early"] and now - seen["at"] <= settle
+        pending = recent and seen["reported"] == reported
         if reported is not None and (
             self.report_marks.get(key, {}).get("reported") != reported
         ):
-            self.report_marks[key] = {"reported": reported, "mean": self.house_mean()}
+            # Content that arrived first carries its own (earlier) mean.
+            arrived_first = recent and seen["reported"] != reported
+            self.report_marks[key] = {
+                "reported": reported,
+                "mean": seen["mean"] if arrived_first else self.house_mean(),
+            }
+            self.mark_taken[key] = now
         status = {
             "slow": slow,
             "slow_reason": reason,
@@ -583,6 +637,8 @@ class HouseCoordinator(DataUpdateCoordinator):
             "report_fresh": fresh,
             "reported": reported,
         }
+        if pending:
+            status["report_pending"] = True
         self.reports[key] = status
         # Control reads the tag for the thermostat hysteresis (v0.5.24).
         if slow:
@@ -604,6 +660,25 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.command_labels.observe(key, "ambiguous", 0, now)
             return None, {"class": "ambiguous", "reason": "no command"}
         sent = command["sent_at"]
+        current = self.command_labels.current(key)
+        if (
+            report.get("report_pending")
+            and current is not None
+            and sent <= current["since"]
+        ):
+            # New reading without its report time yet: keep the label rather
+            # than estimate from a mismatched mark (v0.5.24). A command sent
+            # since the label is still classified (with the old mark).
+            info = {
+                "mode": command["mode"],
+                "target": command["target"],
+                "class": current["label"] or "ambiguous",
+                "since": current["since"],
+                "reason": "report time pending",
+            }
+            if self.reporting.checks.suspended(key):
+                return None, info
+            return self.command_labels.value(key, now), info
         target = self.number(key, "temperature")
         step = self.number(key, "target_temp_step") or 0.5
         echoed = mode == command["mode"] and (
@@ -648,7 +723,16 @@ class HouseCoordinator(DataUpdateCoordinator):
                 if points
                 else (self.config.get("thermostat_hysteresis", 0.5), "default")
             )
-        current = self.command_labels.current(key)
+        # The label in effect when the report was made, for the cross-check
+        # (v0.5.24): independent of which entity updated first, and never a
+        # change observed at or after the report time (the report's own).
+        reported_at = report["reported"]
+        at_report = (
+            self.command_labels.state_before(key, reported_at)
+            if reported_at is not None
+            else None
+        )
+        trend = self.house_trend(now)
         kind, direction, gap = command_effort(
             command["mode"],
             command["target"],
@@ -666,22 +750,41 @@ class HouseCoordinator(DataUpdateCoordinator):
             drift=own - reported_value if own_source == "reported+house" else None,
             running=current["direction"] if current and current["label"] == "on" else 0,
             hold_gap=self.command_setting("command_hold_gap"),
+            trend=trend,
+            hold_min_rate=self.command_setting("command_hold_min_rate"),
+        )
+        held = kind == "held"
+        # A report made before this command was sent (an echo of an older
+        # fetch) says nothing about it (v0.5.24).
+        report_after_command = (
+            report["report_fresh"] and reported_at is not None and reported_at >= sent
         )
         # v0.5.24: a fresh report of the unit running in the commanded
         # direction settles a small gap (its thermostat runs with the target
         # just past its reading). Without it the on label drops for that tick
         # and the next clear command restarts with a false start delay.
         reported_on = (
-            kind == "ambiguous"
+            kind in ("ambiguous", "held")
             and direction
-            and report["report_fresh"]
+            and report_after_command
             and device_action == ("heating" if direction > 0 else "cooling")
         )
-        if reported_on:
+        # Mirror: a fresh idle/off report settles an ambiguous or held label
+        # as off from the report time (stop tail if it was on).
+        reported_off = (
+            kind in ("ambiguous", "held")
+            and report_after_command
+            and device_action in ("idle", "off")
+        )
+        if reported_on or held:
             kind = "on"
+        elif reported_off:
+            kind = "off"
         if reported_on and (current is None or current["label"] != "on"):
             # Seen running at the report: the start is no later than that.
-            cause = report["reported"] - self.command_labels.start_delay
+            cause = reported_at - self.command_labels.start_delay
+        elif reported_off:
+            cause = reported_at
         else:
             cause = sent if current is None or sent > current["since"] else now
         state = self.command_labels.observe(key, kind, direction, now, cause)
@@ -693,23 +796,29 @@ class HouseCoordinator(DataUpdateCoordinator):
             transition = (
                 "stop_tail" if now < state.get("tail_until", float("-inf")) else "off"
             )
-        # A fresh report cross-checks a settled label once per report.
+        # A fresh report cross-checks the label settled at its report time,
+        # once per report.
         if (
             report["report_fresh"]
-            and state["label"] is not None
+            and at_report is not None
+            and at_report["label"] is not None
             and device_action in ("heating", "cooling", "idle", "off", "fan", "drying")
         ):
             settled_at = (
-                state["start"]
-                if state["label"] == "on"
-                else max(state["since"], state.get("tail_until", float("-inf")))
+                at_report["start"]
+                if at_report["label"] == "on"
+                else max(at_report["since"], at_report.get("tail_until", float("-inf")))
             )
-            if now - settled_at >= 5 * 60:
+            # A report within 5 min after this command reflects the change
+            # itself (an echo fetch), not the settled label.
+            if reported_at - settled_at >= 5 * 60 and not (
+                sent <= reported_at < sent + 5 * 60
+            ):
                 self.reporting.checks.check(
                     key,
-                    report["reported"],
+                    reported_at,
                     (device_action in ("heating", "cooling"))
-                    != (state["label"] == "on"),
+                    != (at_report["label"] == "on"),
                     self.config,
                 )
         info = {
@@ -730,8 +839,13 @@ class HouseCoordinator(DataUpdateCoordinator):
             )
         if transition:
             info["transition"] = transition
+        if held:
+            info["held"] = True
+            info["trend"] = round(trend, 3)
         if reported_on:
             info["reason"] = "fresh report running"
+        elif reported_off:
+            info["reason"] = "fresh report idle"
         if self.reporting.checks.suspended(key):
             return None, info
         return value, info

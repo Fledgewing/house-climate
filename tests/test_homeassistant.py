@@ -2931,9 +2931,12 @@ async def test_interaction_diagnostics_include_zero_weight_rooms_and_device_rows
     assert attrs["systems"]["climate.ducted"]["climate.ducted"][
         "effective_effect"
     ] == pytest.approx(0.13 * 12)
-    assert attrs["sources"]["switch.fan"]["sensor.ignored"]["g"] == pytest.approx(
-        0.02 * 12
-    )
+    # v0.5.24: the attribute keeps b/e, effective effect, confidence and
+    # samples per row; the model's diagnostics keep the rest.
+    assert c.learning.diagnostics()["sources"]["switch.fan"]["sensor.ignored"][
+        "g"
+    ] == pytest.approx(0.02 * 12)
+    assert "g" not in attrs["sources"]["switch.fan"]["sensor.ignored"]
     assert attrs["sources"]["switch.fan"]["sensor.ignored"][
         "effective_effect"
     ] == pytest.approx(-0.29 * 12)
