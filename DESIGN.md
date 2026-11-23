@@ -2009,3 +2009,130 @@ under 12 anchors, a one-room 1 °C/h spike rejected by χ², û 1 ± 0.15 on hel
 blocks, a second unlabelled system blocking; and the coordinator: a backfilled heating
 span (`source: latent`, coverage, delay 45, persistence), the option off, and a v0.5.22
 store loading.
+
+## v0.5.24: slow reporter hysteresis, command margin, attribute snapshots
+
+### Live evidence (v0.5.23, `climate.home_zone_1`, 2026-11-22 18:09–21:54 PT)
+
+Command labels were right when given, but `command_action` turned ambiguous about 30 min
+after each report, so no 70-min learning window completed (coverage: command 53%, skipped
+42%, windows 0; learning frozen). From `action_sources` history:
+
+- 18:09 command heat 24.5, est 21.50 (report age 130 s) → on; 18:14 est 21.58 → on; … 18:34
+  est 21.63 → on; 18:39 est 21.83 (age 1927 s, correction ≈ 0.33), gap 2.67 → ambiguous;
+  18:59 est 22.17, correction 0.67, gap 2.33 → ambiguous; 19:14 gap 1.97 → ambiguous, until a
+  fresh fetch.
+- 20:07 fresh report: heating, reading 24, target 24.5 (it heats with the target only 0.5
+  above its reading). 20:09 target 27, est 24.16 → on; 20:14 → on; 21:04 est 24.3 (age
+  3421 s) → ambiguous; 21:09 → on (start delay again); 21:15 mode off → stop tail, then off.
+
+### Causes
+
+(a) `η` in `command_effort` was the mean of `thermostat_points`, recorded by
+`ControlState.observe_report` as `target − own` at an observed idle→heating transition. A
+slow reporter's transition is observed up to 2 h late, so the reading has already fallen
+further below the target: inflated points (inferred η ≳ 1.4 °C), on threshold
+`max(1.5, η + 1.0)` ≈ 2.4–2.5 °C.
+(b) `own_estimate` already moves the reported reading by the house-mean change since the
+report; `command_effort` then added `|correction|` again as margin. And that warming is
+mostly the commanded unit doing what it was told.
+
+### Fixes
+
+1. **Learning, slow units:** `command_action` takes η from `controller.thermostat_hysteresis`:
+   the clean points (below) once there are `fresh_points_min` (4, `COMMAND_DEFAULTS`), else
+   `thermostat_hysteresis` (0.5). Threshold 1.5 for the Bryant. Units that are not slow
+   (command labels for untrusted local sensors) keep the learned `thermostat_points` mean.
+   `command` diagnostics gain `hysteresis` and `hysteresis_source`
+   (`fresh_points`/`points`/`default`).
+2. **Learning, margin (direction-aware):** `command_effort` takes the signed house-mean
+   move since the report (`drift`, from the coordinator as `own − reported` when the
+   source is `reported+house`). A move in the commanded direction (warming under heat,
+   cooling under cool) is consistent with the command and already in `own`: it adds no
+   on margin. A move against it adds `min(command_margin_factor·|c|, command_margin_cap)` =
+   `min(0.5·|c|, 0.5)` °C (both in `COMMAND_DEFAULTS`; v0.5.23 was the full |c|, any
+   direction). The off test keeps the symmetric margin: a house warming under a heat
+   command whose target is already behind the reading moves the estimate further past
+   the target, so the margin only delays a clear off; no reason found to change it.
+   Without `drift` (unknown sign) the margin is symmetric.
+2b. **Learning, running hold (coordinator follow-up):** with the real warming rate the
+   estimate reaches 1.5 °C of the 24.5 target by about 19:49 (est 23.07, gap 1.43), and
+   the 20:07 fetch showed the unit still heating at gap 0.5. A thermostat that is running
+   latches until its reading reaches the target (as `thermostat_effort` models), so a label
+   already on in the command's direction stays on while the gap is at least
+   `command_hold_gap` (0.5 °C, `COMMAND_DEFAULTS`) plus the on margin. Starting from no
+   label or off still needs the clear gap.
+3. **Display:** `climate.house`'s `extra_state_attributes` returned
+   `coordinator.action_sources` (and other maps) by reference. The coordinator mutates them in
+   place, so the previous state's attributes held the same objects, HA's `attributes ==`
+   comparison saw no change and skipped the write: the frontend kept `{}` while REST and the
+   recorder (written on other attribute changes) showed real values. The climate entity and
+   both learning sensors now return a `deepcopy`. Switch attributes are scalars.
+4. **Control change (user-approved), slow units:** thermostat points are recorded only from
+   a cleanly observed transition (`ControlState.observe_fresh_report`, called from
+   `_system_changed` before `observe_report`): an idle report followed by a heating/cooling
+   report at the same target and mode, both fresh (`report_fresh`, the v0.5.23 report
+   freshness), report times strictly increasing and at most `report_fresh_minutes` apart, gap
+   in (0, 3]. A command echo (same report time, new target or mode) is not a report of that
+   setting and never counts as the idle side. They go to `fresh_thermostat_points` (last 32).
+   For a slow unit, `thermostat_effort` (the outage/latch model) uses the same
+   `thermostat_hysteresis`: fresh points once ≥ 4, else the 0.5 default. Units that are not
+   slow keep `thermostat_points` exactly as before; `observe_report` still appends to that
+   list for every unit, so a rollback finds it unchanged.
+5. **Learning, continuity (found by the regression simulation):** the coordinator ticks on
+   every reported action change. At the 20:07 fetch the command (24.5 vs a fresh reading of
+   24.0, gap 0.5) is honestly ambiguous, which dropped the on label; the 20:09 command then
+   restarted it with a false 2-min start delay. Now an ambiguous confirmed command whose fresh
+   report shows the unit running in its direction is on (`reason: fresh report running`); a
+   new on label starts at the report time (the unit was already running then).
+
+### Storage and rollback
+
+`ControlState` is saved as `asdict(state)` and v0.5.23 loads it with `ControlState(**state)`,
+so the new per-system maps are attributes set in `__post_init__`, not dataclass fields:
+`fresh_thermostat_points` (persisted under its own top-level Store key
+`fresh_thermostat_points`), `fresh_reports` (the last report per system, not persisted:
+the first transition after a restart is not recorded) and `slow_reporters` (set by
+`report_status` on every report, read by control). A v0.5.23 store loads with no clean
+points; a v0.5.24 store's `state` has exactly the v0.5.23 field set, and v0.5.23 ignores the
+new top-level key.
+
+### Decisions beyond the brief (all reversible)
+
+- Item 5 above (fresh running report settles an ambiguous command): without it the replayed
+  evening kept a 2-min false start delay at 20:09 and was not continuously on.
+- Clean points are recorded for every unit (cheap) but used only while it is slow, so a unit
+  that turns slow already has them.
+- The fresh-points minimum is a `COMMAND_DEFAULTS` config key like the margin constants
+  (not in the UI).
+- `slow_reporters` follows the auto bootstrap: an `auto` unit with fewer than 6 measured
+  gaps is slow, so a newly added prompt unit uses the 0.5 default in the latch model until
+  its cadence is measured (persisted cadences are unaffected).
+- The 19:14 tick (gap 1.97, correction +1.03 °C since the 18:07 report) is on by the
+  direction-aware margin alone (threshold 1.5); the hold also covers it. The hold is the
+  only way the 19:49–20:04 ticks stay on with the real warming rate.
+- The hold gap is 0.5 °C, not 0: the estimate is a house-mean extrapolation, so a small
+  safety gap is kept before calling the latch still on.
+
+### Tests
+
+`tests/test_slow_hysteresis.py`: clean transitions record a point; two hours apart, either
+side stale, the same report and an unknown time do not; a command echo is never the idle
+side; `thermostat_hysteresis` for slow and prompt units and the 4-point minimum; the control
+latch ignores inflated points only for a slow unit; the live 18:39 numbers (ambiguous with
+the v0.5.23 parameters, on now); the live 19:14 numbers (on with warming drift, ambiguous
+unsigned or against). The live evening replayed through the coordinator (reports 17:55,
+18:07, echo 18:09, 20:07, echo 20:09, 21:15; the real warming since 18:07, est
+21.83/22.17/22.53 at 18:39/18:59/19:14 (asserted), then ≈ 0.077 °C per 5 min; inflated
+points [1.5, 1.6, 1.4]; ticks every 5 min plus the action-change ticks):
+command on (`transition: on`) at every tick 18:14–21:14, effort 1 from 18:19 (18:14 holds the
+start delay), off after 21:15 plus the tail, effort 0 from 21:24, at least one learning
+window accepted, the legacy list still gaining 0.5 at 20:07 and no clean point. Run against
+v0.5.23 (HEAD 4e09172 in a scratch worktree, same test file): ambiguous from 18:34 to 20:04
+and 20:29 to 21:14, no window ever accepted. Without the running hold (direction-aware
+margin only) the replay still went ambiguous at 19:49 (gap 1.43). Store: the saved `state` keys equal the
+dataclass fields, the new key round-trips, a v0.5.23 store loads. Attributes: a nested
+`action_sources` change in place is written (old and new states differ), and the learning
+sensor returns fresh dicts. `test_command_effort.py`'s table covers the half-size, capped
+margin, the v0.5.23 parameters, signed drift with and against heat and cool (against still
+widens the band; off keeps the margin) and the running hold.

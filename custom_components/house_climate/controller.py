@@ -4,6 +4,8 @@ from copy import copy
 from dataclasses import dataclass, field
 from math import ceil, floor, isfinite
 
+from .const import COMMAND_DEFAULTS
+
 
 @dataclass
 class Reading:
@@ -73,6 +75,65 @@ class ControlState:
 
     # Reported starts while demand was explicitly off, awaiting a decision.
     unrequested_starts: dict[str, float] = field(default_factory=dict)
+
+    def __post_init__(self):
+        # v0.5.24 attributes, deliberately not dataclass fields: the Store's
+        # "state" is `asdict(state)` and v0.5.23 loads it with
+        # `ControlState(**state)`, so a new field would break a rollback.
+        # Points from cleanly observed transitions (own Store key
+        # `fresh_thermostat_points`), the last report seen per system, and the
+        # systems tagged slow now (set by the coordinator on each report).
+        self.fresh_thermostat_points: dict[str, list[float]] = {}
+        self.fresh_reports: dict[str, dict] = {}
+        self.slow_reporters: set[str] = set()
+
+    def observe_fresh_report(self, key, device, reported, fresh, window):
+        """Record a thermostat point only from a cleanly observed transition.
+
+        Both the idle and the heating/cooling observation must be fresh reports
+        (`fresh`: the report is at most `report_fresh_minutes` old) and their
+        report times at most `window` seconds apart, at the same target and
+        mode. A command echo (same report time, new target or mode) is not a
+        report of that setting, so it never counts as the idle side. v0.5.24.
+        """
+        action, target, own = (
+            device.hvac_action,
+            device.temperature,
+            device.current_temperature,
+        )
+        mode = device.mode
+        if action in ("heating", "cooling"):
+            mode = "heat" if action == "heating" else "cool"
+        previous = self.fresh_reports.get(key)
+        echo = (
+            previous is not None
+            and reported == previous["reported"]
+            and (target, mode) != (previous["target"], previous["mode"])
+        )
+        clean = bool(device.available and fresh and reported is not None and not echo)
+        if (
+            clean
+            and previous
+            and previous["clean"]
+            and previous["action"] == "idle"
+            and action in ("heating", "cooling")
+            and previous["target"] == target
+            and previous["mode"] == mode
+            and 0 < reported - previous["reported"] <= window
+            and all(v is not None and isfinite(v) for v in (own, target))
+        ):
+            gap = (1 if mode == "heat" else -1) * (target - own)
+            if 0 < gap <= 3:
+                points = self.fresh_thermostat_points.setdefault(key, [])
+                points.append(gap)
+                del points[:-32]
+        self.fresh_reports[key] = {
+            "action": action,
+            "target": target,
+            "mode": mode,
+            "reported": reported,
+            "clean": clean,
+        }
 
     def demand_on(self, key):
         return self.commanded.get(key, self.actions.get(key) in ("heating", "cooling"))
@@ -608,19 +669,36 @@ def clamp(value, low, high):
     return max(low, min(high, value))
 
 
+def thermostat_hysteresis(config, state, key):
+    """The thermostat's on threshold (°C) and where it came from.
+
+    Learned `thermostat_points` (any observed idle→running transition) as
+    before for units that report promptly. A slow reporter observes its
+    transitions up to hours late, which inflates those points, so it uses
+    only the cleanly observed `fresh_thermostat_points` once there are
+    `fresh_points_min` of them, else the `thermostat_hysteresis` default.
+    """
+    settings = {**config, **next(s for s in config["systems"] if s["entity_id"] == key)}
+    default = settings.get("thermostat_hysteresis", 0.5)
+    if key in state.slow_reporters:
+        points = state.fresh_thermostat_points.get(key, [])
+        minimum = config.get("fresh_points_min", COMMAND_DEFAULTS["fresh_points_min"])
+        if len(points) >= minimum:
+            return sum(points) / len(points), "fresh_points"
+        return default, "default"
+    points = state.thermostat_points.get(key, [])
+    if points:
+        return sum(points) / len(points), "points"
+    return default, "default"
+
+
 def thermostat_effort(config, state, key, thermostat):
     """Apply the local thermostat's latched on/off thresholds."""
     mode = thermostat["mode"]
     if mode not in ("heat", "cool"):
         thermostat["running"] = False
         return 0.0
-    settings = {**config, **next(s for s in config["systems"] if s["entity_id"] == key)}
-    points = state.thermostat_points.get(key, [])
-    hysteresis = (
-        sum(points) / len(points)
-        if points
-        else settings.get("thermostat_hysteresis", 0.5)
-    )
+    hysteresis, _ = thermostat_hysteresis(config, state, key)
     direction = 1 if mode == "heat" else -1
     gap = direction * (thermostat["target"] - thermostat["own"])
     if gap <= 0:

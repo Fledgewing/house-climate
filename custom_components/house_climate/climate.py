@@ -1,5 +1,7 @@
 """The single house thermostat."""
 
+from copy import deepcopy
+
 from homeassistant.components.climate import (
     ClimateEntity,
     ClimateEntityFeature,
@@ -59,27 +61,32 @@ class HouseClimate(CoordinatorEntity, ClimateEntity, RestoreEntity):
     @property
     def extra_state_attributes(self):
         data = self.coordinator.data
-        return {
-            "last_decision": data.explanation if data else "Starting",
-            "disturbed": dict(self.coordinator.learning.disturbed),
-            "learning_enabled": self.coordinator.learning_enabled,
-            "learning_resume_at": self.coordinator.learning_resume_at,
-            "not_reporting": self.coordinator.not_reporting,
-            "raw_sensor_readings": self.coordinator.raw_readings,
-            "filtered_sensor_readings": data.readings if data else {},
-            "sensor_readings": data.readings if data else {},
-            "priority_mode": self.coordinator.priority_mode,
-            "priority_weights": self.coordinator.priority_weights,
-            "cycling": {
-                system["entity_id"]: self.coordinator.state.cycling_status(
-                    system["entity_id"], dt_util.utcnow().timestamp()
-                )
-                for system in self.coordinator.active_systems()
-            },
-            "active_mode": self.coordinator.state.active_mode,
-            # Which source each unit's learning action came from: run sensor or device.
-            "action_sources": self.coordinator.action_sources,
-        }
+        # A deep copy: the coordinator mutates these maps in place, and HA
+        # compares new attributes with the previous state's (which would hold
+        # the same objects), so a nested change would never be written.
+        return deepcopy(
+            {
+                "last_decision": data.explanation if data else "Starting",
+                "disturbed": dict(self.coordinator.learning.disturbed),
+                "learning_enabled": self.coordinator.learning_enabled,
+                "learning_resume_at": self.coordinator.learning_resume_at,
+                "not_reporting": self.coordinator.not_reporting,
+                "raw_sensor_readings": self.coordinator.raw_readings,
+                "filtered_sensor_readings": data.readings if data else {},
+                "sensor_readings": data.readings if data else {},
+                "priority_mode": self.coordinator.priority_mode,
+                "priority_weights": self.coordinator.priority_weights,
+                "cycling": {
+                    system["entity_id"]: self.coordinator.state.cycling_status(
+                        system["entity_id"], dt_util.utcnow().timestamp()
+                    )
+                    for system in self.coordinator.active_systems()
+                },
+                "active_mode": self.coordinator.state.active_mode,
+                # Which source each unit's learning action came from: run sensor or device.
+                "action_sources": self.coordinator.action_sources,
+            }
+        )
 
     async def async_set_temperature(self, **kwargs):
         await self.coordinator.async_change(setpoint=kwargs[ATTR_TEMPERATURE])

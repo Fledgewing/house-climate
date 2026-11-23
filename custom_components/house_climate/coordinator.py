@@ -30,7 +30,7 @@ from .const import (
     REPORT_DEFAULTS,
     fan_reward_weight,
 )
-from .controller import ControlState, Device, Reading, control
+from .controller import ControlState, Device, Reading, control, thermostat_hysteresis
 from .fans import FanLearning, quiet_modes
 from .filtering import SensorFilter
 from .latent import DELAYS, LatentEffort, room_terms
@@ -296,6 +296,10 @@ class HouseCoordinator(DataUpdateCoordinator):
                         key, []
                     )
             self.restored = True
+            self.state.fresh_thermostat_points = {
+                key: list(points)
+                for key, points in saved.get("fresh_thermostat_points", {}).items()
+            }
             self.reporting = Reporting(saved.get("reporting"))
             self.command_settings = {
                 key: dict(value)
@@ -580,6 +584,11 @@ class HouseCoordinator(DataUpdateCoordinator):
             "reported": reported,
         }
         self.reports[key] = status
+        # Control reads the tag for the thermostat hysteresis (v0.5.24).
+        if slow:
+            self.state.slow_reporters.add(key)
+        else:
+            self.state.slow_reporters.discard(key)
         return status
 
     def report_usable(self, key):
@@ -619,13 +628,27 @@ class HouseCoordinator(DataUpdateCoordinator):
             and not self.local_problem(self.hass.states.get(sensor), now)
         ):
             own_value = self.number(sensor)
+        reported_value = self.number(key, "current_temperature")
         own, correction, own_source = own_estimate(
-            self.number(key, "current_temperature"),
+            reported_value,
             self.report_marks.get(key, {}).get("mean"),
             self.house_mean(),
             own_value,
         )
-        points = self.state.thermostat_points.get(key)
+        if report["slow"]:
+            # v0.5.24: a slow unit's learned points come from transitions
+            # seen up to hours late (inflated); only clean ones count.
+            hysteresis, hysteresis_source = thermostat_hysteresis(
+                self.config, self.state, key
+            )
+        else:
+            points = self.state.thermostat_points.get(key)
+            hysteresis, hysteresis_source = (
+                (sum(points) / len(points), "points")
+                if points
+                else (self.config.get("thermostat_hysteresis", 0.5), "default")
+            )
+        current = self.command_labels.current(key)
         kind, direction, gap = command_effort(
             command["mode"],
             command["target"],
@@ -635,12 +658,32 @@ class HouseCoordinator(DataUpdateCoordinator):
             confirmed=confirmed,
             clear_gap=self.command_setting("command_clear_gap"),
             off_gap=self.command_setting("command_off_gap"),
-            hysteresis=sum(points) / len(points)
-            if points
-            else self.config.get("thermostat_hysteresis", 0.5),
+            hysteresis=hysteresis,
+            margin_factor=self.command_setting("command_margin_factor"),
+            margin_cap=self.command_setting("command_margin_cap"),
+            # Signed house-mean move since the report (v0.5.24): a move with
+            # the command adds no on margin.
+            drift=own - reported_value if own_source == "reported+house" else None,
+            running=current["direction"] if current and current["label"] == "on" else 0,
+            hold_gap=self.command_setting("command_hold_gap"),
         )
-        current = self.command_labels.current(key)
-        cause = sent if current is None or sent > current["since"] else now
+        # v0.5.24: a fresh report of the unit running in the commanded
+        # direction settles a small gap (its thermostat runs with the target
+        # just past its reading). Without it the on label drops for that tick
+        # and the next clear command restarts with a false start delay.
+        reported_on = (
+            kind == "ambiguous"
+            and direction
+            and report["report_fresh"]
+            and device_action == ("heating" if direction > 0 else "cooling")
+        )
+        if reported_on:
+            kind = "on"
+        if reported_on and (current is None or current["label"] != "on"):
+            # Seen running at the report: the start is no later than that.
+            cause = report["reported"] - self.command_labels.start_delay
+        else:
+            cause = sent if current is None or sent > current["since"] else now
         state = self.command_labels.observe(key, kind, direction, now, cause)
         value = self.command_labels.value(key, now)
         transition = None
@@ -676,6 +719,8 @@ class HouseCoordinator(DataUpdateCoordinator):
             "own_source": own_source,
             "correction": round(correction, 2) if correction is not None else None,
             "gap": round(gap, 2) if gap is not None else None,
+            "hysteresis": round(hysteresis, 2),
+            "hysteresis_source": hysteresis_source,
             "class": kind,
             "since": state["since"],
         }
@@ -685,6 +730,8 @@ class HouseCoordinator(DataUpdateCoordinator):
             )
         if transition:
             info["transition"] = transition
+        if reported_on:
+            info["reason"] = "fresh report running"
         if self.reporting.checks.suspended(key):
             return None, info
         return value, info
@@ -1161,24 +1208,33 @@ class HouseCoordinator(DataUpdateCoordinator):
         # Runtime changes must be captured even during service calls under lock.
         entity_id = event.data["entity_id"]
         system = self.system_config(entity_id)
-        # Cadence/freshness are learning-only; control sees every report as
-        # in v0.5.22 (v0.5.23 changes learning, not control).
-        self.report_status(system, dt_util.utcnow().timestamp())
+        # Control sees every report as in v0.5.22; freshness only decides which
+        # transitions give a slow unit's thermostat points (v0.5.24).
+        report = self.report_status(system, dt_util.utcnow().timestamp())
         if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            device = Device(
+                mode=new.state,
+                hvac_action=new.attributes.get("hvac_action"),
+                temperature=self.number(entity_id, "temperature"),
+                current_temperature=self.number(entity_id, "current_temperature"),
+                step=self.number(entity_id, "target_temp_step") or 0.5,
+                name=new.name,
+            )
+            # Before observe_report: both compare with the previous report.
+            self.state.observe_fresh_report(
+                entity_id,
+                device,
+                report["reported"],
+                report["report_fresh"],
+                self.report_setting(system, "report_fresh_minutes") * 60,
+            )
             self.state.observe_report(
                 next(
                     s
                     for s in self.active_systems(include_inactive=True)
                     if s["entity_id"] == entity_id
                 ),
-                Device(
-                    mode=new.state,
-                    hvac_action=new.attributes.get("hvac_action"),
-                    temperature=self.number(entity_id, "temperature"),
-                    current_temperature=self.number(entity_id, "current_temperature"),
-                    step=self.number(entity_id, "target_temp_step") or 0.5,
-                    name=new.name,
-                ),
+                device,
                 self.config,
             )
         self.state.observe_action(
@@ -1928,6 +1984,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                     "reporting": self.reporting.to_dict(),
                     "command_settings": self.command_settings,
                     "report_marks": self.report_marks,
+                    # v0.5.24: its own key, so v0.5.23 still loads "state".
+                    "fresh_thermostat_points": self.state.fresh_thermostat_points,
                     "latent": self.latent.to_dict(),
                     "filters": {key: f.to_dict() for key, f in self.filters.items()},
                 }

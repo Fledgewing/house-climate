@@ -1,5 +1,7 @@
 """House temperature, spread and system offsets."""
 
+from copy import deepcopy
+
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -116,7 +118,9 @@ class LearningSensor(CoordinatorEntity, SensorEntity):
             }
             for key, (score, _) in scores.items()
         }
-        return diagnostics
+        # A deep copy, so a nested change is never equal to the previous
+        # state's attributes (HA would skip the write).
+        return deepcopy(diagnostics)
 
 
 class FanLearningSensor(LearningSensor):
@@ -132,4 +136,4 @@ class FanLearningSensor(LearningSensor):
 
     @property
     def extra_state_attributes(self):
-        return self.coordinator.fans.diagnostics()
+        return deepcopy(self.coordinator.fans.diagnostics())

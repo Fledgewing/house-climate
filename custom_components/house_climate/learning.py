@@ -1462,6 +1462,11 @@ def command_effort(
     clear_gap=1.5,
     off_gap=1.0,
     hysteresis=0.5,
+    margin_factor=0.5,
+    margin_cap=0.5,
+    drift=None,
+    running=0,
+    hold_gap=0.5,
 ):
     """Classify a confirmed thermostat setting as clear on, clear off or ambiguous.
 
@@ -1469,7 +1474,16 @@ def command_effort(
     direction +1 heat / −1 cool (0 when off or unknown), and gap the signed
     distance d·(target − own) in °C. `own` is the best estimate of the
     thermostat's own reading and `correction` its uncertainty, which widens the
-    ambiguity band. An on needs the gap past both `clear_gap` and the
+    ambiguity band by `min(margin_factor·|correction|, margin_cap)` (v0.5.24:
+    `own` already carries the correction, so its full size counted it twice;
+    v0.5.23 used factor 1 and no cap). `drift` is the signed house-mean move
+    since the report, when known: a move in the commanded direction (warming
+    under heat, cooling under cool) is the command working and is already in
+    `own`, so it adds no margin to the on test; a move against it does. The
+    off test keeps the margin either way. `running` is the direction of the
+    current on label (0 when none): a thermostat already running stays on until
+    its reading reaches the target, so the same direction stays on while the
+    gap is at least `hold_gap` (plus the on margin). Otherwise an on needs the gap past both `clear_gap` and the
     thermostat's hysteresis plus `off_gap`; an off needs the target at least
     `off_gap` on the far side, since no thermostat runs with its target behind
     its reading. Mode off (and fan only) is a certain off. In heat_cool/auto the
@@ -1491,8 +1505,14 @@ def command_effort(
     ):
         return "ambiguous", 0, None
     gap = direction * (target - own)
-    margin = abs(correction or 0)
-    if gap >= max(clear_gap, (hysteresis or 0) + off_gap) + margin:
+    margin = min(margin_factor * abs(correction or 0), margin_cap)
+    on_margin = 0.0 if drift is not None and direction * drift >= 0 else margin
+    needed = (
+        hold_gap
+        if running and running == direction
+        else max(clear_gap, (hysteresis or 0) + off_gap)
+    )
+    if gap >= needed + on_margin:
         return "on", direction, gap
     if gap <= -off_gap - margin:
         return "off", direction, gap

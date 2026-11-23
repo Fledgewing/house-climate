@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.23 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.24 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 The setpoint is the center of the smallest predicted temperature band across the counted rooms.
 The default `objective: "band"` minimizes the largest priority-scaled room deviation from it,
@@ -43,6 +43,10 @@ unless `fan_reward_lambda` is explicitly set; this remains independent of object
 Legacy PI gains, house offset clamps and slew settings remain readable and unused.
 
 Automatic mode retains its 1 °C deadband and 60-minute heat/cool dwell. Cooling is vetoed below 10 °C outdoors; heating above 24 °C. Explicit heat/cool requests take effect immediately, subject to the outdoor veto. Starts and stops obey cycling protection on scheduled and immediate passes. Explicit House off and outdoor vetoes still stop operation.
+
+Version 0.5.24 keeps a slow cloud-read unit's clear commands labelled between its reports
+(learning windows completed again) and stops it learning an inflated thermostat hysteresis;
+see [Slow cloud reporters](#slow-cloud-reporters-learning-from-commands-0523), 0.5.24 notes.
 
 Version 0.5.23 learns slow cloud-read units' effort from House Climate's own clear commands
 and, where neither a command nor a fresh report is clear, from the rooms' response; see
@@ -234,7 +238,7 @@ For a slow unit, each interval's learning effort comes from the first of:
 A unit with local sensors configured that are unavailable or stale uses step 2 too, but never
 its reported action. Units that report promptly (`fresh`, or measured fast) are unchanged.
 
-This release changes learning only. Control sees every report of a slow unit exactly as in
+0.5.23 changes learning only (0.5.24 changes a slow unit's thermostat hysteresis, below). Control sees every report of a slow unit exactly as in
 0.5.22 (thermostat hysteresis, starts, cycling protection, steady tests). For learning, its
 own climate row is learned only from fresh reports (the row is kept).
 
@@ -259,6 +263,29 @@ that respond clearly, and never while another unit is also unlabelled. Labels ar
 minutes late too. Latent labels fill learning windows but **never raise confidence**: a
 window holding any latent time adds no confidence count and does not tighten the
 uncertainty confidence is judged on, and room calibration never learns from latent blocks.
+
+**0.5.24:** on 2026-11-22 a slow Bryant's clear on commands turned "unclear" about 30 minutes
+after each report, so no learning window completed all evening. Two fixes and one control
+change:
+
+- The thermostat hysteresis of a slow unit (how far past its reading the target must be
+  before it runs) is no longer learned from transitions seen up to two hours late, which
+  made it look about 1.5 °C wide. Both learning and control now use only transitions seen
+  cleanly: an idle report and a running report at the same target, both fresh and at most
+  the fresh report window apart. Until there are four such points the **Thermostat
+  hysteresis** setting (0.5 °C) is used. Units that report promptly keep their learned
+  hysteresis as before.
+- The house-mean move since a stale report no longer widens the "on" margin when it is in
+  the commanded direction (the house warming under a heat command is the command working,
+  and the estimate already includes it). A move against the command, and the "off" test,
+  widen it by half its size, at most 0.5 °C (it was the full size, either way).
+- A unit already labelled running stays on while its estimated reading is at least 0.5 °C
+  short of the target, as its thermostat latches until it reaches it.
+- A fresh report of the unit running at a small, unclear gap keeps the command's on label
+  instead of dropping it (the thermostat runs with its target just above its reading).
+
+The House thermostat's `action_sources` attribute (and the learning sensors' attributes)
+now update in the UI as they change; before, the frontend could keep showing `{}`.
 
 `climate.house` `action_sources` shows, for a slow unit: `source` (`command`, `report`,
 `latent` while waiting for its late label, or none), `slow` and `slow_reason` (mode, measured gaps, median gap), `report_age_s`,

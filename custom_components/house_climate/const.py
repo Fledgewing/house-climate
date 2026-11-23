@@ -23,6 +23,20 @@ REPORT_TRUST = ["auto", "fresh", "slow"]
 COMMAND_DEFAULTS = {
     "command_clear_gap": 1.5,
     "command_off_gap": 1.0,
+    # v0.5.24: a stale reading's house-mean correction widens the ambiguity
+    # band by this share of its size, at most the cap (°C). `own_estimate`
+    # already moved the reading by the correction; the full size counted it
+    # twice, and the house warming is mostly the commanded unit's own work.
+    "command_margin_factor": 0.5,
+    "command_margin_cap": 0.5,
+    # v0.5.24: a unit already labelled on in the command's direction stays on
+    # while the estimated gap is at least this (°C): its thermostat latches
+    # until its reading reaches the target.
+    "command_hold_gap": 0.5,
+    # v0.5.24: a slow reporter's hysteresis comes from cleanly observed
+    # transitions (both reports fresh, at most `report_fresh_minutes` apart);
+    # below this many such points the `thermostat_hysteresis` default is used.
+    "fresh_points_min": 4,
     "command_start_delay": 2,
     "command_restart_guard": 5,
     "command_stop_tail": 3,

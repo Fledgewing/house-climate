@@ -46,10 +46,30 @@ FETCH = "sensor.cloud_fetch"
         # Small gaps are left to the thermostat's own hysteresis: unknown.
         (("heat", 21, 20), {}, "ambiguous"),
         (("heat", 19.5, 20), {}, "ambiguous"),
-        # A stale reading's correction widens the band.
+        # A stale reading's correction widens the band by half its size
+        # (v0.5.24; v0.5.23 used all of it), at most 0.5 °C.
         (("heat", 22, 20), {}, "on"),
-        (("heat", 22, 20, 0.8), {}, "ambiguous"),
-        (("heat", 18.5, 20, 0.8), {}, "ambiguous"),
+        (("heat", 22, 20, 0.8), {}, "on"),
+        (("heat", 21.8, 20, 0.8), {}, "ambiguous"),
+        (("heat", 18.5, 20, 0.8), {}, "off"),
+        (("heat", 18.7, 20, 0.8), {}, "ambiguous"),
+        (("heat", 21.95, 20, 3.0), {}, "ambiguous"),
+        (("heat", 22.05, 20, 3.0), {}, "on"),
+        (("heat", 22, 20, 0.8), {"margin_factor": 1, "margin_cap": 9}, "ambiguous"),
+        # Signed drift: a move with the command adds no on margin; a move
+        # against it still widens the band; off keeps the margin either way.
+        (("heat", 21.97, 20, 1.03), {"drift": 1.03}, "on"),
+        (("heat", 21.97, 20, 1.03), {"drift": -1.03}, "ambiguous"),
+        (("heat", 21.97, 20, 1.03), {}, "ambiguous"),
+        (("cool", 18.03, 20, 1.03), {"drift": -1.03}, "on"),
+        (("cool", 18.03, 20, 1.03), {"drift": 1.03}, "ambiguous"),
+        (("heat", 18.7, 20, 0.8), {"drift": 0.8}, "ambiguous"),
+        # A running label (same direction) holds down to the hold gap.
+        (("heat", 20.6, 20), {"running": 1}, "on"),
+        (("heat", 20.4, 20), {"running": 1}, "ambiguous"),
+        (("heat", 20.6, 20), {"running": -1}, "ambiguous"),
+        (("heat", 20.6, 20, 0.6), {"running": 1, "drift": -0.6}, "ambiguous"),
+        (("cool", 19.4, 20), {"running": -1}, "on"),
         # A learned wide hysteresis needs a wider on gap.
         (("heat", 21.6, 20), {"hysteresis": 1.0}, "ambiguous"),
         # Unconfirmed (echo missing, pending, outside change) is never a label.
