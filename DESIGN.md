@@ -1804,16 +1804,19 @@ and slow until 6 gaps exist. It persists in the `reporting` Store key next to
 `report_fresh_minutes` after its report time; the tracker gets a `None` at that expiry
 (`label_until`), so a stale action never extends past it.
 
-For a slow, non-fresh system: `observe_report`/`observe_action` are skipped on its events
-and `control()` gets its device with `hvac_action=None` (no thermostat points, starts,
-unrequested starts or "finishing" from a stale action; commanded demand still protects
-cycling), and its own climate row is left out of `learning_values` (kept, not deleted).
+For a slow, non-fresh system its own climate row is left out of `learning_values` (kept,
+not deleted). **Control is unchanged from v0.5.22** (review decision after part B): the
+design's Q5 (fresh-only thermostat points and starts) was built in part A by hiding a stale
+action from `observe_report`/`observe_action` and from `control()`, but
+`observe_action(None)` makes the next fresh report a new start (fake starts, cycling hold,
+min-run re-armed, steady-test runtime reset). v0.5.23 is learning-only: control sees the
+device's raw reported action, and `report_status` on its events feeds only the cadence.
 
 ### Command labels (`learning.command_effort`, `own_estimate`, `CommandTransitions`)
 
 The coordinator records each `set_hvac_mode`/`set_temperature` as `command_settings[key] =
 {mode, target, sent_at}` when it is sent (persisted; a failed call restores the previous one).
-It is confirmed when the unit echoes mode and target (within half a step), or within
+It is confirmed when the unit echoes mode and target (within max(half a step, 0.3 °C)), or within
 `command_confirm_seconds` (120 s) of sending, and no outside change was noted since. The
 thermostat's reading is an explicit `own_sensor` room sensor, else the reported
 `current_temperature` moved by the house mean's change since that report
@@ -1896,6 +1899,13 @@ second term. Each row therefore keeps `independent`, a covariance updated only b
 without latent time (None until the first latent window, then a copy). `confidence` uses it;
 `steady_std` for control and diagnostics keeps the full covariance. Coefficients learn from
 every window. Rows stored by v0.5.22 load with `independent` None (= their covariance).
+Row dicts in the Store keep exactly the v0.5.22 `Row` fields (a v0.5.22 rollback builds
+`Row(**data)`); the independent covariances are a separate top-level map
+`independent_covariances` (`rows`, `challengers`, `saved` by id), re-attached in
+`from_dict` (a dimension change drops them). `reconcile` remaps them with the covariance's
+index mapping; a challenger covariance reset clears its copy. An input whose lag hour
+(the lag regressor's span) holds latent time also counts nothing, in averaged, windowed
+and plain fits.
 
 ### Part B: latent effort (`latent.LatentEffort`, `latent.room_terms`)
 
@@ -1921,8 +1931,9 @@ with `latent_effort` on, once the block plus 30 min of response is in:
   time and its coverage span is relabelled `latent`.
 
 Latent blocks are never anchors, so shares, offsets and noise come only from independent
-labels. Persisted in the Store under `latent` (sums, anchors, last processed block, last
-estimate per system); the tick buffer is not persisted (a restart loses under an hour of
+labels. Anchors older than 7 days before the latest tick stop counting (readiness
+expires on a stale calibration). Persisted in the Store under `latent` (sums, anchors, last
+processed block, latest tick, `engaged`, last estimate per system); the tick buffer is not persisted (a restart loses under an hour of
 blocks). Stores without the key load empty.
 
 Coordinator: `latent_action` (the part A seam) returns the estimator's diagnostics when
@@ -1933,6 +1944,13 @@ labelled later). `action_sources[...]["latent"]` carries `u_hat`, `se`, `chi2`, 
 `translations/en.json`; `latent_block_minutes` (15) is in `COMMAND_DEFAULTS`.
 
 ### Decisions beyond the design, part B (all reversible)
+
+- **Label delay held once engaged**: the first time any candidate is ready, `engaged` is
+  set (persisted) and the 45-min learning delay stays on, even if readiness later lapses;
+  it drops to 0 only when `latent_effort` is off for every system. Flipping with readiness
+  would fit or skip the same 45 minutes of windows twice.
+- **Command echo tolerance** is `max(step/2, 0.3)` °C (part A used step/2): a °F unit
+  shown in °C rounds the echo (22.5 °C → 72 °F → 22.22 °C).
 
 - One release: part B ships in v0.5.23 with part A, not as v0.5.24 (as instructed).
 - **Count weight is 0 for any window holding latent time**, not the design's

@@ -29,6 +29,17 @@ class Row:
     independent: list[list[float]] | None = None
 
 
+def row_dict(row):
+    """A row's stored fields: exactly the v0.5.22 `Row` fields.
+
+    `independent` is stored separately (`independent_covariances`), so a
+    v0.5.23 store still loads in v0.5.22 (rollback), which builds `Row(**data)`.
+    """
+    data = asdict(row)
+    data.pop("independent", None)
+    return data
+
+
 class Learning:
     """RLS on [delta, inputs..., inputs * delta..., lagged inputs..., solar, 1].
 
@@ -143,6 +154,12 @@ class Learning:
                         for j, other in enumerate(mapping):
                             if other is not None:
                                 row.covariance[i][j] = old.covariance[source][other]
+                if old.independent is not None:
+                    row.independent = self.neutral_row(systems, sources).covariance
+                    for i, source in enumerate(mapping):
+                        for j, other in enumerate(mapping):
+                            if source is not None and other is not None:
+                                row.independent[i][j] = old.independent[source][other]
                 row.counts = [
                     old.counts[previous.index(s)] if s in previous else 0
                     for s in inputs
@@ -211,6 +228,14 @@ class Learning:
             for kind, keys in (("system", self.systems), ("source", self.sources))
             for key in keys
         ]
+        # Lag regressors read the hour before the interval, which a latent
+        # backfill may have labelled: such an input adds no count either.
+        lag_latent = [
+            self.latent_share(kind, key, start_time - self.lag_minutes * 60, start_time)
+            > 1e-9
+            for kind, keys in (("system", self.systems), ("source", self.sources))
+            for key in keys
+        ]
         self.record_efforts(efforts, sources, start_time, timestamp, observed_history)
         context = [outdoor, solar, duration, *activity]
         averaged = self.window_minutes and self.average_minutes
@@ -276,7 +301,11 @@ class Learning:
                 continue
             if state["temporary"]:
                 continue
-            count_weights = None
+            count_weights = (
+                [0.0 if flag else 1.0 for flag in lag_latent]
+                if any(lag_latent)
+                else None
+            )
             x = [
                 duration * v
                 for v in [
@@ -312,7 +341,9 @@ class Learning:
                 window = self.windows.get(sensor)
                 if window is None or abs(window["end"] - start_time) > 1e-6:
                     window = {"segments": []}
-                window["segments"].append((x, end - start, duration, activity, frozen))
+                window["segments"].append(
+                    (x, end - start, duration, activity, frozen, lag_latent)
+                )
                 window["end"] = timestamp
                 self.windows[sensor] = window
                 segments = window["segments"]
@@ -331,6 +362,12 @@ class Learning:
                     for k in range(len(activity))
                 ]
                 frozen = set().union(*(s[4] for s in segments))
+                touched = [
+                    any(s[5][k] for s in segments) for k in range(len(lag_latent))
+                ]
+                count_weights = (
+                    [0.0 if flag else 1.0 for flag in touched] if any(touched) else None
+                )
                 duration = 1
             error = end - start - sum(a * b for a, b in zip(row.theta, x))
             evidence_weight = (
@@ -347,6 +384,7 @@ class Learning:
             state["surprises"] = state.get("surprises", 0) + 1 if surprise else 0
             if state["surprises"] >= 2 and challenger.samples >= 24:
                 challenger.covariance = self.neutral_row().covariance
+                challenger.independent = None
                 # Scores earned before reopening uncertainty cannot qualify the
                 # newly unidentified candidate for promotion.
                 state["blocks"] = []
@@ -475,6 +513,7 @@ class Learning:
         count = len(self.systems) + len(self.sources)
         x = [0.0] * (3 * count + 3)
         latent = [0.0] * count
+        lag_latent = [False] * count
         target = seconds = 0.0
         frozen = set()
         keys = [
@@ -522,6 +561,8 @@ class Learning:
                     x[k] += v * (hi - lo)
                 for k, (kind, key) in enumerate(keys):
                     latent[k] += self.latent_share(kind, key, lo, hi) * (hi - lo)
+                    if self.latent_share(kind, key, lo - self.lag_minutes * 60, lo):
+                        lag_latent[k] = True
                 seconds += hi - lo
         if not seconds:
             return None
@@ -532,7 +573,12 @@ class Learning:
             target * self.interval_minutes * 60 / seconds,
             [v / seconds for v in x[1 : count + 1]],
             frozen,
-            [v / seconds for v in latent],
+            # Latent share per input; an input whose lag span (only) is latent
+            # reports 1, so it too adds no count.
+            [
+                1.0 if lagged_latent and not share else share / seconds
+                for share, lagged_latent in zip(latent, lag_latent)
+            ],
         )
 
     @property
@@ -1234,9 +1280,9 @@ class Learning:
             "regimes": {
                 s: {
                     **deepcopy(state),
-                    "challenger": asdict(state["challenger"]),
+                    "challenger": row_dict(state["challenger"]),
                     "saved": [
-                        {**saved, "row": asdict(saved["row"])}
+                        {**saved, "row": row_dict(saved["row"])}
                         for saved in state["saved"]
                     ],
                 }
@@ -1249,7 +1295,32 @@ class Learning:
             "disturbance_clear_intervals": self.disturbance_clear_intervals,
             "forgetting": self.forgetting,
             "n0": self.n0,
-            "rows": {s: asdict(row) for s, row in self.rows.items()},
+            "rows": {s: row_dict(row) for s, row in self.rows.items()},
+            # v0.5.23: confidence covariances (see `fit_row`), kept out of the
+            # row dicts; only rows that have seen a latent window have one.
+            "independent_covariances": {
+                "rows": {
+                    s: deepcopy(row.independent)
+                    for s, row in self.rows.items()
+                    if row.independent is not None
+                },
+                "challengers": {
+                    s: deepcopy(state["challenger"].independent)
+                    for s, state in self.regimes.items()
+                    if state["challenger"].independent is not None
+                },
+                "saved": {
+                    s: {
+                        item["id"]: deepcopy(item["row"].independent)
+                        for item in state["saved"]
+                        if item["row"].independent is not None
+                    }
+                    for s, state in self.regimes.items()
+                    if any(
+                        item["row"].independent is not None for item in state["saved"]
+                    )
+                },
+            },
         }
 
     @classmethod
@@ -1271,10 +1342,20 @@ class Learning:
             drift_noise=saved.get("drift_noise", DRIFT_NOISE),
         )
 
-        def load_row(data):
-            row = Row(**deepcopy(data))
+        independent = saved.get("independent_covariances", {})
+
+        def load_row(data, covariance=None):
+            data = deepcopy(data)
+            # Stores written before the separate map carried it in the row.
+            covariance = (
+                data.pop("independent", None) if covariance is None else covariance
+            )
+            row = Row(**data)
             count = len(model.systems) + len(model.sources)
+            if covariance is not None and len(covariance) == len(row.covariance):
+                row.independent = deepcopy(covariance)
             if len(row.theta) != 3 * count + 3:
+                row.independent = None
                 # Insert missing interaction/lag columns, preserving all old covariance.
                 old_groups = (len(row.theta) - 3) // count if count else 3
                 prior = model.neutral_row()
@@ -1304,7 +1385,10 @@ class Learning:
 
         model.effort_history = deepcopy(saved.get("effort_history", []))
         model.effort_clock = saved.get("effort_clock", saved.get("clock", 0))
-        model.rows = {s: load_row(row) for s, row in saved["rows"].items()}
+        model.rows = {
+            s: load_row(row, independent.get("rows", {}).get(s))
+            for s, row in saved["rows"].items()
+        }
         for key in (
             "regime_margin",
             "regime_hours",
@@ -1315,9 +1399,14 @@ class Learning:
             if key in saved:
                 setattr(model, key, saved[key])
         for sensor, state in deepcopy(saved.get("regimes", {})).items():
-            state["challenger"] = load_row(state["challenger"])
+            state["challenger"] = load_row(
+                state["challenger"], independent.get("challengers", {}).get(sensor)
+            )
             for item in state["saved"]:
-                item["row"] = load_row(item["row"])
+                item["row"] = load_row(
+                    item["row"],
+                    independent.get("saved", {}).get(sensor, {}).get(item.get("id")),
+                )
             model.regimes[sensor] = state
         model.residuals = dict(saved.get("residuals", {}))
         model.streaks = {s: tuple(v) for s, v in saved.get("streaks", {}).items()}

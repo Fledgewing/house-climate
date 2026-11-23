@@ -372,6 +372,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 ):
                     setattr(self.learning, key, self.config.get(key, default))
                 self.learning.interval_minutes = self.config.get("interval", 5)
+            self.sync_label_delay()
 
     def start(self):
         cancel_timer = async_track_time_interval(
@@ -600,7 +601,9 @@ class HouseCoordinator(DataUpdateCoordinator):
             command["mode"] == "off"
             or target is not None
             and command["target"] is not None
-            and abs(target - command["target"]) <= step / 2
+            # A °F unit shown in °C rounds the echo (22.5 °C -> 72 °F ->
+            # 22.22 °C), so allow at least 0.3 °C.
+            and abs(target - command["target"]) <= max(step / 2, 0.3)
         )
         outside = self.outside_changes.get(key, float("-inf")) > sent
         confirmed = not outside and (
@@ -934,11 +937,24 @@ class HouseCoordinator(DataUpdateCoordinator):
         ):
             if self.learning.backfill_effort(key, start, end, value):
                 self.relabel_coverage(key, start, end)
-        ready = any(
+        if any(
             options["estimate"] and self.latent.diagnostics(key)["ready"]
             for key, options in candidates.items()
+        ):
+            self.latent.engaged = True
+        # Held once engaged: flipping it with readiness would fit or skip the
+        # same 45 minutes of windows twice. Off only with latent off everywhere.
+        self.sync_label_delay()
+
+    def sync_label_delay(self):
+        """Averaged windows wait for late latent labels once latent is engaged."""
+        enabled = any(
+            self.report_setting(system, "latent_effort")
+            for system in self.active_systems(include_inactive=True)
         )
-        self.learning.label_delay_minutes = self.latent_delay_minutes if ready else 0
+        self.learning.label_delay_minutes = (
+            self.latent_delay_minutes if self.latent.engaged and enabled else 0
+        )
 
     def command_labelled(self, key):
         """Whether this system's effort comes (or can come) from its commands.
@@ -1145,11 +1161,10 @@ class HouseCoordinator(DataUpdateCoordinator):
         # Runtime changes must be captured even during service calls under lock.
         entity_id = event.data["entity_id"]
         system = self.system_config(entity_id)
+        # Cadence/freshness are learning-only; control sees every report as
+        # in v0.5.22 (v0.5.23 changes learning, not control).
         self.report_status(system, dt_util.utcnow().timestamp())
-        # A slow reporter's stale action (e.g. a command echo of an old fetch)
-        # is neither a thermostat observation nor a start (v0.5.23).
-        usable = self.report_usable(entity_id)
-        if usable and new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+        if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             self.state.observe_report(
                 next(
                     s
@@ -1166,14 +1181,13 @@ class HouseCoordinator(DataUpdateCoordinator):
                 ),
                 self.config,
             )
-        if usable:
-            self.state.observe_action(
-                entity_id,
-                new.attributes.get("hvac_action")
-                if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
-                else None,
-                dt_util.utcnow().timestamp(),
-            )
+        self.state.observe_action(
+            entity_id,
+            new.attributes.get("hvac_action")
+            if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+            else None,
+            dt_util.utcnow().timestamp(),
+        )
         if (
             new
             and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
@@ -1674,14 +1688,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 },
                 self.state,
                 readings,
-                {
-                    # A slow reporter's stale action is unknown to control:
-                    # no thermostat points, starts or "finishing" from it.
-                    key: device
-                    if self.report_usable(key)
-                    else replace(device, hvac_action=None)
-                    for key, device in self.active_devices(devices).items()
-                },
+                self.active_devices(devices),
                 now.timestamp(),
                 outdoor,
                 self.enabled,
@@ -2192,6 +2199,7 @@ class HouseCoordinator(DataUpdateCoordinator):
     async def async_reset_learning(self):
         async with self.lock:
             self.learning = self.new_learning()
+            self.sync_label_delay()
             self.fans = FanLearning(
                 self.config.get("fan_hold_minutes", 30),
                 fan_reward_weight(self.config),

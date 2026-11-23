@@ -265,8 +265,6 @@ async def test_clear_off_command_beats_stale_heating_report(hass, settings):
     # The slow unit's own (stale) row is kept but not learned from.
     assert c.learning.rows[CLOUD].samples == own_samples
     assert CLOUD in c.learning.rows
-    # Control does not see the stale action either.
-    assert c.state.actions.get(CLOUD) is None
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
@@ -457,3 +455,45 @@ async def test_command_state_persists_and_options_keep_learning(hass, settings):
     learned_after = c.learning.to_dict()
     assert learned_after["rows"] == learned["rows"]
     assert c.command_settings[CLOUD]["target"] == 16.0
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_control_sees_a_slow_units_raw_reports_as_in_v0522(hass, settings):
+    """v0.5.23 is learning-only: stale reports reach control unchanged."""
+    from custom_components.house_climate.controller import ControlState
+
+    start = dt_util.utcnow()
+    entry, c = await setup(hass, settings, start)
+    reference = ControlState()
+    sequence = ["idle", "heating", "idle", "heating", "idle", "heating"]
+    for step, action in enumerate(sequence):
+        when = start + timedelta(minutes=10 * (step + 1))
+        with at(when):
+            state = hass.states.get(CLOUD)
+            hass.states.async_set(
+                CLOUD, state.state, {**state.attributes, "hvac_action": action}
+            )
+            await hass.async_block_till_done()
+        reference.observe_action(CLOUD, action, when.timestamp())
+        # The fetch is an hour old: the report is stale for learning only.
+        assert not c.report_usable(CLOUD)
+    assert c.state.actions[CLOUD] == "heating"
+    assert c.state.reported_starts[CLOUD] == reference.reported_starts[CLOUD]
+    assert len(c.state.reported_starts[CLOUD]) == 3
+    assert c.state.steady_runs[CLOUD]["since"] == reference.steady_runs[CLOUD]["since"]
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_fahrenheit_rounded_echo_confirms_the_command(hass, settings):
+    start = dt_util.utcnow()
+    entry, c = await setup(hass, settings, start)
+    c.command_settings[CLOUD] = {
+        "mode": "heat",
+        "target": 22.5,
+        "sent_at": (start - timedelta(hours=1)).timestamp(),
+    }
+    # 22.5 °C -> 72 °F on the unit -> 22.22 °C echoed back.
+    await tick_at(c, start, temperature=22.22)
+    command = c.action_sources[CLOUD]["command"]
+    assert "reason" not in command
+    assert command["class"] == "on"

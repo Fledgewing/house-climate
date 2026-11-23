@@ -221,7 +221,7 @@ For a slow unit, each interval's learning effort comes from the first of:
    stored `own_sensor` room sensor when set (never a sensor matched on the unit's own
    device, which arrives through the same slow fetch), else its last report moved by the
    house mean's change since then, and that move widens the margins. A command counts once the unit echoes its mode and
-   target (or within 2 minutes of sending it) and nobody changed it outside House Climate.
+   target (within 0.3 °C, for units that round through °F) (or within 2 minutes of sending it) and nobody changed it outside House Climate.
    Transitions are modelled, not skipped: after an on, 0 for a 2-minute start delay and never
    within 5 minutes of the last stop; after an off, 0.5 for a 3-minute tail, then 0;
 3. a **fresh report** (within the fresh window), with the usual mode checks;
@@ -234,9 +234,9 @@ For a slow unit, each interval's learning effort comes from the first of:
 A unit with local sensors configured that are unavailable or stale uses step 2 too, but never
 its reported action. Units that report promptly (`fresh`, or measured fast) are unchanged.
 
-For a slow unit, control also ignores a stale reported action: it adds no thermostat
-hysteresis point, counts no start or "unrequested" start, and does not keep a "finishing"
-target from it. Its own climate row is learned only from fresh reports (the row is kept).
+This release changes learning only. Control sees every report of a slow unit exactly as in
+0.5.22 (thermostat hysteresis, starts, cycling protection, steady tests). For learning, its
+own climate row is learned only from fresh reports (the row is kept).
 
 **Contradiction check:** every fresh report is compared with a settled command label (more
 than 5 minutes past the start delay or stop tail). When over 30% of the last 20 checks (at

@@ -7,6 +7,7 @@ Assistant tests for the coordinator wiring. The closed-loop latent
 simulation is in tests/test_slow_reporter.py.
 """
 
+import json
 from copy import deepcopy
 from datetime import timedelta
 from random import Random
@@ -141,15 +142,95 @@ def test_stored_rows_without_new_fields_load_unchanged():
     model = averaged()
     feed(model, 20, 1)
     saved = model.to_dict()
-    for data in saved["rows"].values():
-        data.pop("independent")
+    saved.pop("independent_covariances")
     for item in saved["effort_history"]:
         assert not any(key.startswith("latent:") for key in item[2])
     restored = Learning.from_dict(saved)
     assert restored.rows["room"].independent is None
     assert restored.rows["room"].theta == model.rows["room"].theta
     assert restored.rows["room"].counts == model.rows["room"].counts
-    assert Row(**{k: v for k, v in saved["rows"]["room"].items()}).independent is None
+
+
+V0522_ROW_FIELDS = {"theta", "covariance", "counts", "samples", "squared_error"}
+
+
+def marked(model, value):
+    return [
+        [value] * len(model.neutral_row().covariance)
+        for _ in model.neutral_row().covariance
+    ]
+
+
+def test_row_dicts_keep_the_v0522_fields_for_rollback():
+    """v0.5.22 builds `Row(**data)`: a stored row must have exactly its fields."""
+    model = averaged()
+    feed(model, 20, 1)
+    state = model.regimes["room"]
+    model.rows["room"].independent = marked(model, 1.0)
+    state["challenger"].independent = marked(model, 2.0)
+    state["saved"] = [
+        {"id": "saved #1", "row": deepcopy(model.rows["room"]), "last_fit": 0}
+    ]
+    state["saved"][0]["row"].independent = marked(model, 3.0)
+    saved = model.to_dict()
+    assert set(saved["rows"]["room"]) == V0522_ROW_FIELDS
+    assert set(saved["regimes"]["room"]["challenger"]) == V0522_ROW_FIELDS
+    assert set(saved["regimes"]["room"]["saved"][0]["row"]) == V0522_ROW_FIELDS
+    Row(**saved["rows"]["room"])  # what v0.5.22's from_dict does
+    restored = Learning.from_dict(json.loads(json.dumps(saved)))
+    assert restored.rows["room"].independent == marked(model, 1.0)
+    assert restored.regimes["room"]["challenger"].independent == marked(model, 2.0)
+    assert restored.regimes["room"]["saved"][0]["row"].independent == marked(model, 3.0)
+    # A store written with the field inside the row (86b7e6e) loads too.
+    saved.pop("independent_covariances")
+    saved["rows"]["room"]["independent"] = marked(model, 4.0)
+    legacy = Learning.from_dict(saved)
+    assert legacy.rows["room"].independent == marked(model, 4.0)
+
+
+def test_reconcile_keeps_and_remaps_the_independent_covariance():
+    model = averaged()
+    model.rows["room"].independent = marked(model, 9.0)
+    model.reconcile(["room"], ["unit"])
+    assert model.rows["room"].independent == marked(model, 9.0)
+    model.rows["room"].independent[1][1] = 5.0  # the unit's b variance
+    model.reconcile(["room"], ["unit", "split"])
+    independent = model.rows["room"].independent
+    assert independent[1][1] == 5.0  # unit's column kept in place
+    assert independent[2][2] == model.neutral_row().covariance[2][2]  # new: prior
+
+
+def test_challenger_reset_also_resets_its_independent_covariance():
+    model = Learning(["room"], ["unit"])
+    challenger = model.regimes["room"]["challenger"]
+    challenger.samples = 30
+    challenger.independent = marked(model, 9.0)
+    model.regimes["room"]["surprises"] = 1
+    model.update({"room": 20}, {"room": 25}, 10, {"unit": 0})
+    assert model.regimes["room"]["challenger"].independent is None
+
+
+def test_latent_lag_span_adds_no_count():
+    """A window whose lag regressor reads a latent span counts nothing."""
+    model = averaged()
+    feed(model, 10, 1)
+    feed(model, 1, None, start=10)
+    model.backfill_effort("unit", 3000, 3300, 1.0)
+    # Windows end at most at 10200 s: the gap at 3000-3300 has left every
+    # window by 7200 s but stays in their lag hour.
+    feed(model, 23, 1, start=11)
+    assert model.rows["room"].samples > 0
+    assert model.rows["room"].counts == [0.0]
+    feed(model, 16, 1, start=34)
+    assert model.rows["room"].counts[0] > 0
+
+
+def test_plain_fit_lag_span_latent_adds_no_count():
+    model = Learning(["room"], ["unit"])
+    feed(model, 3, 1)
+    model.effort_history[-1][2]["latent:system:unit"] = True
+    feed(model, 1, 1, start=3)
+    assert model.rows["room"].counts == pytest.approx([3 * 0.998**2 + 0.0], rel=0.01)
 
 
 def test_label_delay_evaluates_windows_later():
@@ -294,6 +375,8 @@ def test_latent_state_round_trips():
         "stats": {},
         "anchors": {},
         "processed": None,
+        "clock": None,
+        "engaged": False,
         "status": {},
     }
 
@@ -404,8 +487,7 @@ async def test_store_without_latent_state_loads_and_keeps_learning(hass, setting
     saved = await c.store.async_load()
     legacy = deepcopy(saved)
     legacy.pop("latent")
-    for data in legacy["learning"]["rows"].values():
-        data.pop("independent")
+    legacy["learning"].pop("independent_covariances")
     await c.store.async_save(legacy)
     with at(start):
         await hass.config_entries.async_reload(entry.entry_id)
@@ -417,3 +499,39 @@ async def test_store_without_latent_state_loads_and_keeps_learning(hass, setting
         assert row.theta == c.learning.rows[key].theta
         assert row.counts == c.learning.rows[key].counts
     assert DEFAULTS["learning_window_minutes"] == 60
+
+
+def test_anchors_expire_with_time():
+    estimator = LatentEffort()
+    for block in range(30):
+        estimator.add_anchor(UNIT, block * 900, float(block % 2), {5: {"a": 0.0}})
+    estimator.observe(30 * 900, {})
+    assert estimator.anchor_counts(UNIT) == (15, 15)
+    estimator.observe(8 * 86400, {})
+    assert estimator.anchor_counts(UNIT) == (0, 0)
+    assert not estimator.diagnostics(UNIT)["ready"]
+    assert LatentEffort(estimator.to_dict()).clock == 8 * 86400
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_label_delay_holds_once_engaged(hass, rooms):
+    rooms["learning_window_minutes"] = 60
+    start = dt_util.utcnow().replace(second=0, microsecond=0)
+    for key in EXTRA:
+        hass.states.async_set(key, "20", {"unit_of_measurement": "°C"})
+    entry, c = await setup(hass, rooms, start)
+    c.latent = ready_estimator(start.timestamp())
+    await tick_at(c, start)
+    assert c.latent.engaged and c.learning.label_delay_minutes == 45
+    # Calibration goes stale (no longer ready): the delay is held anyway.
+    c.latent.anchors = {}
+    await tick_at(c, start + timedelta(minutes=5))
+    assert not c.latent.diagnostics(CLOUD)["ready"]
+    assert c.learning.label_delay_minutes == 45
+    saved = await c.store.async_load()
+    assert saved["latent"]["engaged"] is True
+    # Latent off for every system releases it.
+    for system in c.config["systems"]:
+        system["latent_effort"] = False
+    await tick_at(c, start + timedelta(minutes=10))
+    assert c.learning.label_delay_minutes == 0

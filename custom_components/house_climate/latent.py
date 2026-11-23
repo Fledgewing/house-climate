@@ -70,6 +70,12 @@ class LatentEffort:
             for system, items in saved.get("anchors", {}).items()
         }
         self.processed = saved.get("processed")
+        # Time of the latest tick: anchors older than `anchor_days` before it
+        # no longer count, so readiness expires on a stale calibration.
+        self.clock = saved.get("clock")
+        # Once an estimate has been ready, learning keeps its label delay
+        # (see the coordinator) instead of flipping with readiness.
+        self.engaged = saved.get("engaged", False)
         self.status = {
             system: dict(value) for system, value in saved.get("status", {}).items()
         }
@@ -85,6 +91,8 @@ class LatentEffort:
             },
             "anchors": {s: [list(a) for a in v] for s, v in self.anchors.items()},
             "processed": self.processed,
+            "clock": self.clock,
+            "engaged": self.engaged,
             "status": {s: dict(v) for s, v in self.status.items()},
         }
 
@@ -101,6 +109,7 @@ class LatentEffort:
             and isfinite(passive)
         }
         self.samples.append([now, clean])
+        self.clock = now
         horizon = 3 * self.block + max(DELAYS) * 60 + 3600
         self.samples = [s for s in self.samples if s[0] >= now - horizon]
 
@@ -194,7 +203,12 @@ class LatentEffort:
         return (best[0], best[1]) if best else (None, {})
 
     def anchor_counts(self, system):
+        """(on, off) anchors within `anchor_days` of the latest tick."""
         items = self.anchors.get(system, [])
+        if self.clock is not None:
+            items = [a for a in items if a[0] > self.clock - self.anchor_seconds]
+            if system in self.anchors:
+                self.anchors[system] = items
         return (
             sum(kind == "on" for _, kind in items),
             sum(kind == "off" for _, kind in items),
