@@ -1772,3 +1772,102 @@ defrosts) learn every room's per-full-effort Bryant effect within 20% over four 
 days (observed 0.97–1.06 of truth), while on/off-only evidence for the variable-speed unit
 learns under 75% of truth.
 
+
+## v0.5.23: slow cloud reporters and command-derived effort
+
+Live evidence 2026-11-21/22: `climate.home_zone_1` (ha_carrier) fetched new data about every
+two hours (`sensor.living_room_home_all_data_last_updated`: 11:57, 14:43, 16:08, 16:16,
+16:21 PT on 11-22), and setpoint writes at 15:05/15:15/15:45 re-published a stale `heating`
+at an old temperature, moving the climate entity's `last_updated` without a fetch. Its
+indoor/outdoor status sensors are frozen. No local probe is fitted yet. Learning from the
+reported action is learning from a snapshot up to two hours old. The approved design is
+"effort inference for slow cloud reporters"; this release is its part A (tasks 1–9). Part B
+(latent effort from room response, window advance/backfill, count weights) is v0.5.24.
+
+A single missing effort costs about 70 minutes of evidence: `Learning.update` clears all
+windows when any system's effort is None, and `averaged_window` needs `window + average`
+minutes of contiguous labelled updates. So unclear spans are skipped, transitions are not.
+
+### Slow-reporter tag (`reporting.ReportCadence`)
+
+Per system: `report_trust` (`auto` default, `fresh`, `slow`), `report_timestamp_sensor`
+(empty), `report_fresh_minutes` (5), `command_effort` (on). Absent keys are defaults, so old
+entries load unchanged. A report time is the timestamp sensor's state when set (O2 answered:
+the climate entity's `last_updated`/`last_reported` also moves on command echoes), else the
+entity's `last_reported`. `ReportCadence` keeps the last 48 gaps between strictly later report
+times (echoes of one fetch add none); `auto` is slow when the median gap exceeds 3 × interval,
+and slow until 6 gaps exist. It persists in the `reporting` Store key next to
+`CommandChecks`; v0.5.22 stores load with both empty. A slow report is fact only for
+`report_fresh_minutes` after its report time; the tracker gets a `None` at that expiry
+(`label_until`), so a stale action never extends past it.
+
+For a slow, non-fresh system: `observe_report`/`observe_action` are skipped on its events
+and `control()` gets its device with `hvac_action=None` (no thermostat points, starts,
+unrequested starts or "finishing" from a stale action; commanded demand still protects
+cycling), and its own climate row is left out of `learning_values` (kept, not deleted).
+
+### Command labels (`learning.command_effort`, `own_estimate`, `CommandTransitions`)
+
+The coordinator records each `set_hvac_mode`/`set_temperature` as `command_settings[key] =
+{mode, target, sent_at}` when it is sent (persisted; a failed call restores the previous one).
+It is confirmed when the unit echoes mode and target (within half a step), or within
+`command_confirm_seconds` (120 s) of sending, and no outside change was noted since. The
+thermostat's reading is an explicit `own_sensor` room sensor, else the reported
+`current_temperature` moved by the house mean's change since that report
+(`report_marks[key] = {reported, mean}`, recorded when the report time changes), with the
+size of the move as the uncertainty `c`. `command_effort` then gives on when
+`d·(T − own) ≥ max(1.5, η + 1.0) + c`, off when `≤ −1.0 − c` or mode off/fan_only, else
+ambiguous; `η` is the learned `thermostat_points` mean or `thermostat_hysteresis`.
+`CommandTransitions` turns the class into a value over time: on is 0 until
+`max(cause + 2 min, last run end + 5 min)` then ±1; off after a run is 0.5·d for 3 min then
+0; ambiguous is None. `cause` is the command's send time when the command is newer than the
+current label, so a restart with a stored command does not re-apply the start delay.
+`feed_effort`/`label_until` insert the transition breakpoints into `EffortTracker`, and
+command labels pass `trusted=True`, which skips the mode-transition withholding; a
+command-labelled system also skips the `set_hvac_mode` pre-mark and is re-labelled right
+after its commands.
+
+Chain (`learning_action`): local probe > run sensor > clear command > fresh report > latent
+(`latent_action`, a stub returning None: the v0.5.24 seam) > skip. Non-slow systems without
+local sensors keep the exact `device` path. Untrusted local sensors fall back to a clear
+command, then latent, never to the report.
+
+### Contradictions (`reporting.CommandChecks`)
+
+Each distinct fresh report is one cross-check against a settled label (≥ 5 min past the
+start or the stop tail): reported running vs label on. Over the last 20 checks, with at least
+10, a rate above 30% suspends command labels (source falls to report/latent/skip,
+`problem: command_contradicted`, repair issue `command_contradicted`); below 10% clears.
+
+### Decisions beyond the design (all reversible)
+
+- `report_timestamp_sensor` option added (maintainer's live O2 answer).
+- The cadence is not seeded from recorder: recorder rows exist only for changed states, so
+  their gaps overstate any device's cadence; seeding would mark a fast unit slow for longer
+  and adds nothing for a slow one (bootstrap is slow anyway). The Store persists the cadence.
+- Auto bootstraps slow (Q3), so tests that model locally reporting units set
+  `report_trust: fresh` in their fixtures.
+- A command is confirmed during a 120-s grace before its echo, and recorded when sent rather
+  than after the call returns, so the service call's own echo is labelled, not lost.
+- Only an explicitly stored `own_sensor` is used for the command comparison: a sensor matched
+  on the unit's own device arrives through the same slow fetch.
+- The on gap is `max(clear_gap, η + off_gap)`, so a learned wide hysteresis widens it.
+- Contradictions need ≥ 10 checks before suspending (30% of a handful is noise); the 10%
+  frozen snapshots of the simulation never suspend.
+- The tuning constants live in `const.COMMAND_DEFAULTS` (config keys, not UI), so the tunables
+  form and its tests are unchanged.
+
+### Tests
+
+`tests/test_slow_reporter.py` simulates three days: six rooms, a latched thermostat
+(η 0.5), 2-min start delay, 5-min restart guard, 6-min defrost per 60 min of running below
+5 °C, a 3-min warm tail, the controller's own ± 3 °C commands on the reported temperature, a
+daily 5-h commanded off span, reports every 120 min at :57 and after each write, 10% frozen
+contradictory snapshots. HEAD's path (the reported action, mode withholding, pre-mark)
+learns 0.27 of the per-commanded-hour truth in every room (pinned < 0.5). Command labels
+learn 1.01–1.03 of truth with `learning_drift` 0 and 1, coverage 99.8%, 100% of the off span
+with full windows (HEAD 77%); a variable-speed unit at 35–85% part load learns 1.00–1.01 of
+mean delivered per commanded hour; a lockout suspends labels. `tests/test_command_effort.py`
+covers the pure pieces and the coordinator: a clear off beating a stale `heating`,
+fresh report then skip, a mode switch kept with its start delay, the repair issue raised and
+cleared, hand control, persistence and the options round-trip.

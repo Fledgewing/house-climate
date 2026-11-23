@@ -35,7 +35,11 @@
           "return_sensor": "Return duct temperature (optional)",
           "delta_deadband": "Duct \u0394T dead band (\u00b0C)",
           "delta_full_heat": "Duct \u0394T at full heating (\u00b0C)",
-          "delta_full_cool": "Duct \u0394T at full cooling (\u00b0C)"
+          "delta_full_cool": "Duct \u0394T at full cooling (\u00b0C)",
+          "report_trust": "Reported action trust",
+          "report_timestamp_sensor": "Report timestamp sensor (optional)",
+          "report_fresh_minutes": "Fresh report window (minutes)",
+          "command_effort": "Learn from clear commands"
         },
         "data_description": {
           "run_sensor": "A local sensor at the equipment that shows whether this unit is really running: a binary sensor (on = running) or a power/current sensor. When set, it replaces the device's reported heating/cooling action for learning; the direction comes from the device's heat or cool mode (in heat/cool auto, from the House's selected direction). If it is unavailable or has not reported for longer than the sensor stale after setting, that unit's intervals are not learned from. Leave empty to use the device's reported action.",
@@ -44,7 +48,11 @@
           "return_sensor": "A temperature probe in the return duct, before the filter. Leave empty to use this system's own current temperature (its thermostat's indoor reading) as the return, or pick a room sensor near the return grille.",
           "delta_deadband": "\u0394T within \u00b1 this many degrees counts as not heating or cooling (blower only, probe offsets). Default 2.",
           "delta_full_heat": "Positive \u0394T that counts as full heating effort (effort 1). Smaller \u0394T is a proportional part load; larger (for example with electric strips) stays 1. Default 15.",
-          "delta_full_cool": "Negative \u0394T magnitude that counts as full cooling effort (effort \u22121). Default 10."
+          "delta_full_cool": "Negative \u0394T magnitude that counts as full cooling effort (effort \u22121). Default 10.",
+          "report_trust": "How far to trust this unit's reported heating/cooling action for learning. auto (default) measures how often the device really reports: a median gap above three control intervals (or fewer than six measured gaps) makes it a slow reporter. A slow reporter's action is used only while its report is fresh; otherwise learning uses the command House Climate sent (clearly on or clearly off, with start and stop delays), and skips the time when neither is clear. fresh always trusts the report (today's behaviour); slow always treats it as slow.",
+          "report_timestamp_sensor": "A sensor whose state is the time of this device's last real data fetch from its cloud (for example a 'last updated' timestamp sensor from the device's integration). When set, it decides report freshness and the auto cadence, because a command echo can rewrite the climate entity without a new fetch. Leave empty to use the climate entity's own last report time.",
+          "report_fresh_minutes": "A slow reporter's action counts as fact for this many minutes after its report time. Default 5.",
+          "command_effort": "For a slow reporter (or while local run sensors/duct probes are unavailable), learn from the command House Climate sent when it is clearly on or off. A report that keeps contradicting the commands (over 30% of recent checks) suspends this and raises a repair issue. Default on."
         }
       },
       "tunables": {
@@ -181,7 +189,11 @@
           "return_sensor": "Return duct temperature (optional)",
           "delta_deadband": "Duct \u0394T dead band (\u00b0C)",
           "delta_full_heat": "Duct \u0394T at full heating (\u00b0C)",
-          "delta_full_cool": "Duct \u0394T at full cooling (\u00b0C)"
+          "delta_full_cool": "Duct \u0394T at full cooling (\u00b0C)",
+          "report_trust": "Reported action trust",
+          "report_timestamp_sensor": "Report timestamp sensor (optional)",
+          "report_fresh_minutes": "Fresh report window (minutes)",
+          "command_effort": "Learn from clear commands"
         },
         "data_description": {
           "run_sensor": "A local sensor at the equipment that shows whether this unit is really running: a binary sensor (on = running) or a power/current sensor. When set, it replaces the device's reported heating/cooling action for learning; the direction comes from the device's heat or cool mode (in heat/cool auto, from the House's selected direction). If it is unavailable or has not reported for longer than the sensor stale after setting, that unit's intervals are not learned from. Leave empty to use the device's reported action.",
@@ -190,7 +202,11 @@
           "return_sensor": "A temperature probe in the return duct, before the filter. Leave empty to use this system's own current temperature (its thermostat's indoor reading) as the return, or pick a room sensor near the return grille.",
           "delta_deadband": "\u0394T within \u00b1 this many degrees counts as not heating or cooling (blower only, probe offsets). Default 2.",
           "delta_full_heat": "Positive \u0394T that counts as full heating effort (effort 1). Smaller \u0394T is a proportional part load; larger (for example with electric strips) stays 1. Default 15.",
-          "delta_full_cool": "Negative \u0394T magnitude that counts as full cooling effort (effort \u22121). Default 10."
+          "delta_full_cool": "Negative \u0394T magnitude that counts as full cooling effort (effort \u22121). Default 10.",
+          "report_trust": "How far to trust this unit's reported heating/cooling action for learning. auto (default) measures how often the device really reports: a median gap above three control intervals (or fewer than six measured gaps) makes it a slow reporter. A slow reporter's action is used only while its report is fresh; otherwise learning uses the command House Climate sent (clearly on or clearly off, with start and stop delays), and skips the time when neither is clear. fresh always trusts the report (today's behaviour); slow always treats it as slow.",
+          "report_timestamp_sensor": "A sensor whose state is the time of this device's last real data fetch from its cloud (for example a 'last updated' timestamp sensor from the device's integration). When set, it decides report freshness and the auto cadence, because a command echo can rewrite the climate entity without a new fetch. Leave empty to use the climate entity's own last report time.",
+          "report_fresh_minutes": "A slow reporter's action counts as fact for this many minutes after its report time. Default 5.",
+          "command_effort": "For a slow reporter (or while local run sensors/duct probes are unavailable), learn from the command House Climate sent when it is clearly on or off. A report that keeps contradicting the commands (over 30% of recent checks) suspends this and raises a repair issue. Default on."
         }
       },
       "tunables": {
@@ -296,6 +312,10 @@
     "regime": {
       "title": "Room behavior has changed",
       "description": "{room} behaves differently than learned; if something changed, press Accept new normal."
+    },
+    "command_contradicted": {
+      "title": "Heating/cooling unit contradicts its commands",
+      "description": "{system}'s fresh reports contradicted House Climate's clear on/off commands in {rate}% of recent checks, so learning no longer uses its commands (for example a lockout, hold or utility curtailment). Learning uses only its fresh reports until the contradictions fall below 10%."
     }
   },
   "entity": {

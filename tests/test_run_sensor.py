@@ -104,7 +104,8 @@ def settings():
             "preset": "",
             "run_sensor": "binary_sensor.ducted_run",
         },
-        {"entity_id": "climate.split", "preset": ""},
+        # A locally reporting unit (v0.5.23 would bootstrap auto as slow).
+        {"entity_id": "climate.split", "preset": "", "report_trust": "fresh"},
     ]
     return data
 
@@ -241,6 +242,7 @@ async def test_stale_run_sensor_feeds_no_evidence(hass, settings):
 @pytest.mark.usefixtures("enable_custom_integrations")
 async def test_without_run_sensor_device_action_is_used(hass, settings):
     settings["systems"][0].pop("run_sensor")
+    settings["systems"][0]["report_trust"] = "fresh"
     entry, c = await setup(hass, settings)
     start = dt_util.utcnow()
     await tick_at(c, start)

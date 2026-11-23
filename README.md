@@ -180,6 +180,75 @@ Pick `sensor.hvac_ducts_supply_air` and `sensor.hvac_ducts_return_air` in the sy
 With a circuit monitor on the heat pump's circuit, set it as **Run sensor** too: it keeps
 learning going while the ESP32 is offline and flags strips running on another circuit.
 
+## Slow cloud reporters: learning from commands (0.5.23)
+
+Some cloud-read units refresh their state only every hour or two. A Bryant Evolution Connex
+read through Carrier's cloud (ha_carrier) fetched new data about every two hours on
+2026-11-22, and every setpoint write re-published the *old* `heating` with an old
+temperature. Learning from such an action is learning from the past. Without local sensors
+(above), House Climate now tags such a unit as a **slow reporter** and learns its effort
+from what it can be sure of instead.
+
+Each system's step of **Configure** has:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| **Reported action trust** (`report_trust`) | `auto` | `auto` measures the unit's report cadence: slow when the median gap between its last 48 real reports is above three control intervals (15 min at the default 5), and slow until six gaps are measured. `fresh` always trusts the report (the previous behaviour); `slow` always treats it as slow. |
+| **Report timestamp sensor** (`report_timestamp_sensor`) | empty | A sensor whose state is the unit's last real data fetch time. Freshness and the auto cadence then come from it; empty uses the climate entity's own last report time. |
+| **Fresh report window** (`report_fresh_minutes`) | 5 | A slow unit's reported action is fact for this many minutes after its report time. |
+| **Learn from clear commands** (`command_effort`) | on | Learn a slow unit's effort from the command House Climate sent when it is clearly on or off. |
+
+**Carrier / Bryant (ha_carrier):** set **Report timestamp sensor** to the integration's
+"all data last updated" timestamp sensor, for example
+`sensor.living_room_home_all_data_last_updated` (a diagnostic entity, disabled by default:
+enable it first). The climate entity's own update time is not usable: command echoes rewrite
+it without a new fetch. The websocket timestamp sensor is unavailable when the websocket never
+delivers. The indoor/outdoor unit status sensors are frozen on that integration and are not
+used.
+
+For a slow unit, each interval's learning effort comes from the first of:
+
+1. a local duct probe or run sensor (above), when configured and trusted;
+2. the last **clear command**: House Climate's own on and off targets sit 3 °C from the
+   thermostat's reading, so a confirmed target at least 1.5 °C past the estimated
+   thermostat reading in the heating/cooling direction is on (+1 heat, −1 cool), at least
+   1.0 °C behind it, or mode off, is off (0). The thermostat's reading is an explicitly
+   stored `own_sensor` room sensor when set (never a sensor matched on the unit's own
+   device, which arrives through the same slow fetch), else its last report moved by the
+   house mean's change since then, and that move widens the margins. A command counts once the unit echoes its mode and
+   target (or within 2 minutes of sending it) and nobody changed it outside House Climate.
+   Transitions are modelled, not skipped: after an on, 0 for a 2-minute start delay and never
+   within 5 minutes of the last stop; after an off, 0.5 for a 3-minute tail, then 0;
+3. a **fresh report** (within the fresh window), with the usual mode checks;
+4. otherwise nothing: that time is not learned from. A gap in between (a small target
+   difference while modulating, an unconfirmed or overridden command) costs about an hour of
+   learning windows, so only these unclear spans are skipped; a commanded off span (for
+   example a morning with the unit off) stays fully learned.
+
+A unit with local sensors configured that are unavailable or stale uses step 2 too, but never
+its reported action. Units that report promptly (`fresh`, or measured fast) are unchanged.
+
+For a slow unit, control also ignores a stale reported action: it adds no thermostat
+hysteresis point, counts no start or "unrequested" start, and does not keep a "finishing"
+target from it. Its own climate row is learned only from fresh reports (the row is kept).
+
+**Contradiction check:** every fresh report is compared with a settled command label (more
+than 5 minutes past the start delay or stop tail). When over 30% of the last 20 checks (at
+least 10) disagree, for example a lockout, a hold or a utility curtailment, command labels are
+suspended for that unit, a repair issue is raised, and learning uses only its fresh reports
+until the rate falls below 10%.
+
+`climate.house` `action_sources` shows, for a slow unit: `source` (`command`, `report`, or
+none), `slow` and `slow_reason` (mode, measured gaps, median gap), `report_age_s`,
+`report_fresh`, `command` (`mode`, `target`, `own_est`, `own_source`, `correction`, `gap`,
+`class`, `since`, `transition`, and `reason` when unconfirmed), `contradictions` (`checks`,
+`rate`, `suspended`) and `coverage_24h`: the share of the last 24 h labelled by each source,
+`skipped`, and `windows` (share with a full learning window). Coverage is the number to watch.
+
+The start delay, restart guard and stop tail (2, 5 and 3 minutes), the 1.5/1.0 °C margins
+and the check settings are configuration constants (`COMMAND_DEFAULTS` in `const.py`), not
+UI options. Existing learning is kept; nothing is reset.
+
 ## Steady operation and cycling protection
 
 Defaults are `min_run_minutes=10`, `min_off_minutes=5` and `max_starts_per_hour=3`.

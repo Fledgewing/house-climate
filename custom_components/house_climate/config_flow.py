@@ -8,7 +8,14 @@ from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import selector
 
-from .const import DEFAULT_RUN_THRESHOLD, DEFAULTS, DELTA_DEFAULTS, DOMAIN
+from .const import (
+    DEFAULT_RUN_THRESHOLD,
+    DEFAULTS,
+    DELTA_DEFAULTS,
+    DOMAIN,
+    REPORT_DEFAULTS,
+    REPORT_TRUST,
+)
 from .priority import modes
 
 
@@ -251,6 +258,16 @@ class HouseSteps:
                     system.pop(key, None)
             if "quiet_max_fan" in user_input:
                 system["quiet_max_fan"] = user_input["quiet_max_fan"]
+            # Slow reporters (v0.5.23): absent keys keep their defaults.
+            for key in ("report_trust", "report_fresh_minutes", "command_effort"):
+                if key in user_input:
+                    system[key] = user_input[key]
+            if user_input.get("report_timestamp_sensor"):
+                system["report_timestamp_sensor"] = user_input[
+                    "report_timestamp_sensor"
+                ]
+            else:
+                system.pop("report_timestamp_sensor", None)
             self.index += 1
             if self.index == len(self.settings["systems"]):
                 self.source_index = 0
@@ -331,6 +348,41 @@ class HouseSteps:
                         ): number(0 if key == "delta_deadband" else 0.5, 50, 0.1)
                         for key, default in DELTA_DEFAULTS.items()
                     },
+                    vol.Optional(
+                        "report_trust",
+                        description={
+                            "suggested_value": system.get(
+                                "report_trust", REPORT_DEFAULTS["report_trust"]
+                            )
+                        },
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(options=REPORT_TRUST)
+                    ),
+                    vol.Optional(
+                        "report_timestamp_sensor",
+                        description=(
+                            {"suggested_value": system["report_timestamp_sensor"]}
+                            if system.get("report_timestamp_sensor")
+                            else {}
+                        ),
+                    ): entities("sensor"),
+                    vol.Optional(
+                        "report_fresh_minutes",
+                        description={
+                            "suggested_value": system.get(
+                                "report_fresh_minutes",
+                                REPORT_DEFAULTS["report_fresh_minutes"],
+                            )
+                        },
+                    ): number(1, 120, 1),
+                    vol.Optional(
+                        "command_effort",
+                        description={
+                            "suggested_value": system.get(
+                                "command_effort", REPORT_DEFAULTS["command_effort"]
+                            )
+                        },
+                    ): selector.BooleanSelector(),
                 }
             ),
         )

@@ -1180,6 +1180,151 @@ def run_action(running, mode, active_mode=None):
     return {"heat": "heating", "cool": "cooling"}.get(mode)
 
 
+def command_effort(
+    mode,
+    target,
+    own,
+    correction=0.0,
+    *,
+    active_mode=None,
+    confirmed=True,
+    clear_gap=1.5,
+    off_gap=1.0,
+    hysteresis=0.5,
+):
+    """Classify a confirmed thermostat setting as clear on, clear off or ambiguous.
+
+    Returns `(kind, direction, gap)`: kind is "on", "off" or "ambiguous",
+    direction +1 heat / −1 cool (0 when off or unknown), and gap the signed
+    distance d·(target − own) in °C. `own` is the best estimate of the
+    thermostat's own reading and `correction` its uncertainty, which widens the
+    ambiguity band. An on needs the gap past both `clear_gap` and the
+    thermostat's hysteresis plus `off_gap`; an off needs the target at least
+    `off_gap` on the far side, since no thermostat runs with its target behind
+    its reading. Mode off (and fan only) is a certain off. In heat_cool/auto the
+    direction is the controller's `active_mode`, as in `run_action`.
+    """
+    if not confirmed:
+        return "ambiguous", 0, None
+    if mode in ("off", "fan_only"):
+        return "off", 0, None
+    if mode in ("heat_cool", "auto"):
+        mode = active_mode
+    direction = {"heat": 1, "cool": -1}.get(mode)
+    if (
+        direction is None
+        or target is None
+        or own is None
+        or not isfinite(target)
+        or not isfinite(own)
+    ):
+        return "ambiguous", 0, None
+    gap = direction * (target - own)
+    margin = abs(correction or 0)
+    if gap >= max(clear_gap, (hysteresis or 0) + off_gap) + margin:
+        return "on", direction, gap
+    if gap <= -off_gap - margin:
+        return "off", direction, gap
+    return "ambiguous", direction, gap
+
+
+def own_estimate(reported, mean_at_report, mean_now, sensor=None):
+    """Best estimate of a slow thermostat's own reading: (own, correction, source).
+
+    A trusted room sensor next to the thermostat wins (no correction). Else the
+    last reported reading is moved by the house mean's change since that report,
+    and the size of that move is the estimate's uncertainty. Without house means
+    the reported reading stands uncorrected.
+    """
+    if sensor is not None and isfinite(sensor):
+        return sensor, 0.0, "own_sensor"
+    if reported is None or not isfinite(reported):
+        return None, None, None
+    if mean_at_report is None or mean_now is None:
+        return reported, 0.0, "reported"
+    correction = mean_now - mean_at_report
+    return reported + correction, abs(correction), "reported+house"
+
+
+class CommandTransitions:
+    """Per-system command label over time with a thermostat transition model.
+
+    Labels: "on" (±1 after a start delay, never before the restart guard has
+    passed since the last run ended), "off" (half the last direction during the
+    stop tail, then 0) and None (ambiguous: no effort). Times are seconds. The
+    `cause` of a change is when it happened (the command's send time) and may
+    precede the observation; values before the observation are never rewritten.
+    """
+
+    def __init__(self, start_delay=120, restart_guard=300, stop_tail=180):
+        self.start_delay = start_delay
+        self.restart_guard = restart_guard
+        self.stop_tail = stop_tail
+        self.history = {}
+        self.on_end = {}
+
+    def current(self, key):
+        states = self.history.get(key)
+        return states[-1] if states else None
+
+    def observe(self, key, kind, direction, now, cause=None):
+        label = kind if kind in ("on", "off") else None
+        direction = direction if label == "on" else 0
+        current = self.current(key)
+        if (
+            current is not None
+            and current["label"] == label
+            and current["direction"] == direction
+        ):
+            return current
+        cause = now if cause is None else min(cause, now)
+        state = {"since": now, "label": label, "direction": direction}
+        if current is not None and current["label"] == "on":
+            if cause > current["start"]:
+                self.on_end[key] = cause
+                if label == "off":
+                    state["tail"] = 0.5 * current["direction"]
+                    state["tail_until"] = cause + self.stop_tail
+        if label == "on":
+            start = cause + self.start_delay
+            if key in self.on_end:
+                start = max(start, self.on_end[key] + self.restart_guard)
+            state["start"] = start
+        states = self.history.setdefault(key, [])
+        states.append(state)
+        # Keep one state older than an hour as the base for value lookups.
+        while len(states) > 2 and states[1]["since"] < now - 3600:
+            states.pop(0)
+        return state
+
+    def state_at(self, key, when):
+        found = None
+        for state in self.history.get(key, []):
+            if state["since"] <= when:
+                found = state
+        return found
+
+    def value(self, key, when):
+        """Effort at `when`: None when ambiguous or unknown."""
+        state = self.state_at(key, when)
+        if state is None or state["label"] is None:
+            return None
+        if state["label"] == "on":
+            return 0.0 if when < state["start"] else float(state["direction"])
+        if when < state.get("tail_until", float("-inf")):
+            return state["tail"]
+        return 0.0
+
+    def breakpoints(self, key, start, end):
+        """Times in (start, end) at which the modelled value changes."""
+        times = set()
+        for state in self.history.get(key, []):
+            for name in ("since", "start", "tail_until"):
+                if name in state and start < state[name] < end:
+                    times.add(state[name])
+        return sorted(times)
+
+
 def delta_effort(delta, deadband=2, full_heat=15, full_cool=10):
     """Signed effort from duct supply − return ΔT (°C), clamped to [−1, 1].
 
@@ -1218,9 +1363,17 @@ class EffortTracker:
         self.finished_segments = {}
         self.modes = {}
 
-    def change(self, system, action, now, *, mode=None, commanded_mode=None):
-        """Observe signed action, withholding mode transitions from learning."""
-        if mode is not None:
+    def change(
+        self, system, action, now, *, mode=None, commanded_mode=None, trusted=False
+    ):
+        """Observe signed action, withholding mode transitions from learning.
+
+        A `trusted` action (a command label with its own transition model)
+        skips the withholding: the mode switch is known, not unknown.
+        """
+        if mode is not None and trusted:
+            self.modes[system] = mode
+        elif mode is not None:
             if system in self.modes and self.modes[system] != mode:
                 self.missing.add(system)
             self.modes[system] = mode
@@ -1261,7 +1414,7 @@ class EffortTracker:
         """Withhold this system's current interval, e.g. a stale run sensor."""
         self.missing.add(system)
 
-    def finish(self, actions, now, *, modes=None, commanded_modes=None):
+    def finish(self, actions, now, *, modes=None, commanded_modes=None, trusted=()):
         for system, action in actions.items():
             self.change(
                 system,
@@ -1269,6 +1422,7 @@ class EffortTracker:
                 now,
                 mode=(modes or {}).get(system),
                 commanded_mode=(commanded_modes or {}).get(system),
+                trusted=system in trusted,
             )
         duration = now - self.started if self.started is not None else 0
         result = {

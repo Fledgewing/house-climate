@@ -22,16 +22,26 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    COMMAND_DEFAULTS,
     DEFAULT_RUN_THRESHOLD,
     DEFAULTS,
     DELTA_DEFAULTS,
     DOMAIN,
+    REPORT_DEFAULTS,
     fan_reward_weight,
 )
 from .controller import ControlState, Device, Reading, control
 from .fans import FanLearning, quiet_modes
 from .filtering import SensorFilter
-from .learning import EffortTracker, Learning, delta_effort, run_action
+from .learning import (
+    CommandTransitions,
+    EffortTracker,
+    Learning,
+    command_effort,
+    delta_effort,
+    own_estimate,
+    run_action,
+)
 from .priority import members, modes
 from .reporting import Reporting
 
@@ -86,6 +96,29 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.raw_readings = {}
         self.current_temperatures = {}
         self.startup_sensors = set(self.filters)
+        # Slow reporters and command-derived effort (v0.5.23).
+        self.command_labels = CommandTransitions(
+            self.command_setting("command_start_delay") * 60,
+            self.command_setting("command_restart_guard") * 60,
+            self.command_setting("command_stop_tail") * 60,
+        )
+        # Last command per system as a learning label: mode, target, sent_at (s).
+        self.command_settings = {}
+        # House mean when each system's current report was fetched.
+        self.report_marks = {}
+        self.reports = {}
+        self.outside_changes = {}
+        self.command_fed = set()
+        self.report_fed = {}
+        self.coverage = {}
+
+    def command_setting(self, key):
+        return self.config.get(key, COMMAND_DEFAULTS[key])
+
+    @staticmethod
+    def report_setting(system, key):
+        value = system.get(key)
+        return REPORT_DEFAULTS[key] if value is None else value
 
     def active_systems(self, *, include_inactive=False):
         """Control selections exclude hand-controlled units; observations retain all."""
@@ -249,6 +282,13 @@ class HouseCoordinator(DataUpdateCoordinator):
                     )
             self.restored = True
             self.reporting = Reporting(saved.get("reporting"))
+            self.command_settings = {
+                key: dict(value)
+                for key, value in saved.get("command_settings", {}).items()
+            }
+            self.report_marks = {
+                key: dict(value) for key, value in saved.get("report_marks", {}).items()
+            }
             for key in self.filters:
                 self.filters[key] = SensorFilter(
                     self.config.get("filter_minutes", 15),
@@ -345,7 +385,12 @@ class HouseCoordinator(DataUpdateCoordinator):
             dict.fromkeys(
                 s[key]
                 for s in self.active_systems(include_inactive=True)
-                for key in ("run_sensor", "supply_sensor", "return_sensor")
+                for key in (
+                    "run_sensor",
+                    "supply_sensor",
+                    "return_sensor",
+                    "report_timestamp_sensor",
+                )
                 if s.get(key)
             )
         )
@@ -459,6 +504,180 @@ class HouseCoordinator(DataUpdateCoordinator):
             result["problem"] = "invalid scale"
         return result
 
+    def report_time(self, system, entity):
+        """Seconds of the device's last real report, or None when unknown.
+
+        A configured `report_timestamp_sensor` (an entity whose state is the
+        device's last data fetch time) wins; a command echo can rewrite the
+        climate entity without a new fetch. Else the entity's `last_reported`.
+        """
+        sensor = self.report_setting(system, "report_timestamp_sensor")
+        if sensor:
+            state = self.hass.states.get(sensor)
+            if not state or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                return None
+            parsed = dt_util.parse_datetime(state.state)
+            return dt_util.as_utc(parsed).timestamp() if parsed else None
+        if not entity:
+            return None
+        reported = getattr(entity, "last_reported", None) or entity.last_updated
+        return reported.timestamp()
+
+    def house_mean(self):
+        """Weighted mean of the counted room sensors' current values."""
+        total = weight = 0.0
+        for member in members(self.config, self.priority_mode):
+            value = self.number(member["entity_id"])
+            share = member.get("weight", 1)
+            if value is None or not isfinite(share) or share <= 0:
+                continue
+            total += share * value
+            weight += share
+        return total / weight if weight else None
+
+    def report_status(self, system, now):
+        """Slow-reporter tag and report freshness for one system (v0.5.23)."""
+        key = system["entity_id"]
+        entity = self.hass.states.get(key)
+        reported = self.report_time(system, entity)
+        self.reporting.cadence.observe(key, reported)
+        slow, reason = self.reporting.cadence.status(
+            key,
+            self.report_setting(system, "report_trust"),
+            self.config.get("interval", 5),
+        )
+        age = now - reported if reported is not None else None
+        fresh = age is not None and age <= (
+            self.report_setting(system, "report_fresh_minutes") * 60
+        )
+        if reported is not None and (
+            self.report_marks.get(key, {}).get("reported") != reported
+        ):
+            self.report_marks[key] = {"reported": reported, "mean": self.house_mean()}
+        status = {
+            "slow": slow,
+            "slow_reason": reason,
+            "report_age_s": round(age) if age is not None else None,
+            "report_fresh": fresh,
+            "reported": reported,
+        }
+        self.reports[key] = status
+        return status
+
+    def report_usable(self, key):
+        """A slow system's report is fact only while fresh; others always."""
+        status = self.reports.get(key)
+        return not status or not status["slow"] or status["report_fresh"]
+
+    def command_action(self, system, mode, device_action, report, now):
+        """Effort label from the confirmed command, or None; plus diagnostics."""
+        key = system["entity_id"]
+        command = self.command_settings.get(key)
+        if not command:
+            self.command_labels.observe(key, "ambiguous", 0, now)
+            return None, {"class": "ambiguous", "reason": "no command"}
+        sent = command["sent_at"]
+        target = self.number(key, "temperature")
+        step = self.number(key, "target_temp_step") or 0.5
+        echoed = mode == command["mode"] and (
+            command["mode"] == "off"
+            or target is not None
+            and command["target"] is not None
+            and abs(target - command["target"]) <= step / 2
+        )
+        outside = self.outside_changes.get(key, float("-inf")) > sent
+        confirmed = not outside and (
+            echoed or now - sent <= self.command_setting("command_confirm_seconds")
+        )
+        # Only an explicit room sensor: a sensor matched on the same device as
+        # a slow reporter arrives through the same slow cloud fetch.
+        sensor = system.get("own_sensor")
+        own_value = None
+        if (
+            sensor
+            and sensor != key
+            and not self.local_problem(self.hass.states.get(sensor), now)
+        ):
+            own_value = self.number(sensor)
+        own, correction, own_source = own_estimate(
+            self.number(key, "current_temperature"),
+            self.report_marks.get(key, {}).get("mean"),
+            self.house_mean(),
+            own_value,
+        )
+        points = self.state.thermostat_points.get(key)
+        kind, direction, gap = command_effort(
+            command["mode"],
+            command["target"],
+            own,
+            correction,
+            active_mode=self.state.active_mode,
+            confirmed=confirmed,
+            clear_gap=self.command_setting("command_clear_gap"),
+            off_gap=self.command_setting("command_off_gap"),
+            hysteresis=sum(points) / len(points)
+            if points
+            else self.config.get("thermostat_hysteresis", 0.5),
+        )
+        current = self.command_labels.current(key)
+        cause = sent if current is None or sent > current["since"] else now
+        state = self.command_labels.observe(key, kind, direction, now, cause)
+        value = self.command_labels.value(key, now)
+        transition = None
+        if state["label"] == "on":
+            transition = "start_delay" if now < state["start"] else "on"
+        elif state["label"] == "off":
+            transition = (
+                "stop_tail" if now < state.get("tail_until", float("-inf")) else "off"
+            )
+        # A fresh report cross-checks a settled label once per report.
+        if (
+            report["report_fresh"]
+            and state["label"] is not None
+            and device_action in ("heating", "cooling", "idle", "off", "fan", "drying")
+        ):
+            settled_at = (
+                state["start"]
+                if state["label"] == "on"
+                else max(state["since"], state.get("tail_until", float("-inf")))
+            )
+            if now - settled_at >= 5 * 60:
+                self.reporting.checks.check(
+                    key,
+                    report["reported"],
+                    (device_action in ("heating", "cooling"))
+                    != (state["label"] == "on"),
+                    self.config,
+                )
+        info = {
+            "mode": command["mode"],
+            "target": command["target"],
+            "own_est": round(own, 2) if own is not None else None,
+            "own_source": own_source,
+            "correction": round(correction, 2) if correction is not None else None,
+            "gap": round(gap, 2) if gap is not None else None,
+            "class": kind,
+            "since": state["since"],
+        }
+        if not confirmed:
+            info["reason"] = (
+                "changed outside house control" if outside else "unconfirmed"
+            )
+        if transition:
+            info["transition"] = transition
+        if self.reporting.checks.suspended(key):
+            return None, info
+        return value, info
+
+    def latent_action(self, system, now):
+        """Latent effort from the rooms' response (v0.5.24 seam): not built yet.
+
+        Ranks after a clear command and a fresh report, before skipping. It
+        must return None (skip) unless the latent estimate is ready and
+        decisive, and its spans must add no learning counts.
+        """
+        return None
+
     def learning_action(self, system, device_action, mode, now, available=True):
         """Action for effort/learning.
 
@@ -466,13 +685,44 @@ class HouseCoordinator(DataUpdateCoordinator):
         device's direction; else, when no local sensor is set, the device's
         reported action. A configured local sensor never falls back to the
         device: no trusted local evidence is no evidence (`problem` is set).
+
+        v0.5.23: a slow reporter's action is fact only while its report is
+        fresh. Its effort comes first from the confirmed command (on/off with
+        a transition model), then a fresh report, else nothing. Untrusted local
+        sensors fall back to a clear command, never to the report.
         """
         key = system["entity_id"]
         if not available:
             device_action = mode = None
+        report = self.report_status(system, now)
+        use_command = self.report_setting(
+            system, "command_effort"
+        ) and not self.reporting.checks.suspended(key)
         if not system.get("run_sensor") and not system.get("supply_sensor"):
-            self.action_sources[key] = {"source": "device", "action": device_action}
-            return device_action
+            if not report["slow"]:
+                self.action_sources[key] = {"source": "device", "action": device_action}
+                return device_action
+            info = {
+                "device_action": device_action,
+                "mode": mode,
+                **{k: v for k, v in report.items() if k != "reported"},
+            }
+            value = None
+            if self.report_setting(system, "command_effort"):
+                value, info["command"] = self.command_action(
+                    system, mode, device_action, report, now
+                )
+            if value is not None and use_command:
+                info.update(source="command", action=value)
+            elif report["report_fresh"]:
+                info.update(source="report", action=device_action)
+            elif (latent := self.latent_action(system, now)) is not None:
+                info.update(source="latent", action=latent)
+            else:
+                info.update(source=None, action=None)
+            self.add_check_info(key, info)
+            self.action_sources[key] = info
+            return info["action"]
         info = {"device_action": device_action, "mode": mode}
         run = None
         if system.get("run_sensor"):
@@ -512,8 +762,162 @@ class HouseCoordinator(DataUpdateCoordinator):
                 )
         else:
             info.update(source="run_sensor", action=run, problem=info["run_problem"])
+        if info["problem"] and use_command and self.command_settings.get(key):
+            # Untrusted local sensors: a clear command, never the cloud action.
+            value, command = self.command_action(
+                system, mode, device_action, report, now
+            )
+            if value is not None:
+                info.update(
+                    source="command",
+                    action=value,
+                    command=command,
+                    local_problem=info["problem"],
+                    problem=None,
+                )
+                self.add_check_info(key, info)
+        if info["problem"] and (latent := self.latent_action(system, now)) is not None:
+            info.update(
+                source="latent",
+                action=latent,
+                local_problem=info["problem"],
+                problem=None,
+            )
         self.action_sources[key] = info
         return info["action"]
+
+    def windows_accepted(self):
+        """Whether any learning row has a full integrated window now."""
+        learning = self.learning
+        if not learning.window_minutes:
+            return True
+        width = learning.window_minutes * 60
+        if learning.average_minutes:
+            width += learning.average_minutes * 60
+            return any(
+                w["end"] - w.get("start", w["end"]) >= width
+                for w in learning.windows.values()
+            )
+        return any(
+            sum(s[2] for s in w.get("segments", [])) * learning.interval_minutes * 60
+            >= learning.window_minutes * 60
+            for w in learning.windows.values()
+        )
+
+    def record_coverage(self, efforts, now, duration):
+        """Last 24 h: share of time labelled by each source, skipped, windows."""
+        if duration <= 0:
+            return
+        accepted = self.windows_accepted()
+        for key, effort in efforts.items():
+            source = (
+                self.action_sources.get(key, {}).get("source") or "none"
+                if effort is not None
+                else "skipped"
+            )
+            spans = [
+                span for span in self.coverage.get(key, []) if span[1] > now - 86400
+            ]
+            spans.append((now - duration, now, source, accepted))
+            self.coverage[key] = spans
+            total = sum(b - a for a, b, _, _ in spans)
+            shares = {}
+            for a, b, name, _ in spans:
+                shares[name] = shares.get(name, 0) + (b - a) / total
+            info = self.action_sources.get(key)
+            if info is not None and (
+                info.get("slow") is not None or info.get("source") == "command"
+            ):
+                info["coverage_24h"] = {
+                    **{name: round(v, 3) for name, v in shares.items()},
+                    "windows": round(
+                        sum(b - a for a, b, _, ok in spans if ok) / total, 3
+                    ),
+                }
+
+    def command_labelled(self, key):
+        """Whether this system's effort comes (or can come) from its commands.
+
+        Such a system is re-labelled right after a command instead of being
+        marked unknown across a mode switch.
+        """
+        if self.action_sources.get(key, {}).get("source") == "command":
+            return True
+        system = next(
+            (
+                s
+                for s in self.active_systems(include_inactive=True)
+                if s["entity_id"] == key
+            ),
+            None,
+        )
+        return bool(
+            system
+            and self.reports.get(key, {}).get("slow")
+            and not system.get("run_sensor")
+            and not system.get("supply_sensor")
+            and self.report_setting(system, "command_effort")
+            and not self.reporting.checks.suspended(key)
+        )
+
+    def add_check_info(self, key, info):
+        checks = self.reporting.checks.status(key)
+        if checks["checks"]:
+            info["contradictions"] = checks
+            if checks["suspended"]:
+                info["problem"] = "command_contradicted"
+
+    def label_until(self, key, now):
+        """Fill the tracker up to `now` with known changes since its last sample.
+
+        A command label's modelled transitions (start delay, stop tail), and a
+        slow report's expiry: its action is no evidence once it is not fresh.
+        """
+        last = self.effort.times.get(key)
+        if last is None:
+            return
+        if key in self.command_fed:
+            for when in self.command_labels.breakpoints(key, last, now):
+                self.effort.change(
+                    key, self.command_labels.value(key, when), when, trusted=True
+                )
+        expiry = self.report_fed.get(key)
+        if expiry is not None and last < expiry < now:
+            self.effort.change(key, None, expiry)
+            self.report_fed.pop(key)
+
+    def feed_effort(self, key, action, now, mode):
+        """Pass a learning action to the effort tracker.
+
+        Command labels carry modelled transitions (start delay, stop tail)
+        between samples; they are trusted, so a known mode switch is kept.
+        """
+        self.label_until(key, now)
+        info = self.action_sources.get(key, {})
+        trusted = info.get("source") == "command"
+        if trusted:
+            self.command_fed.add(key)
+        else:
+            self.command_fed.discard(key)
+        self.report_fed.pop(key, None)
+        if info.get("source") == "report" and info.get("slow"):
+            status = self.reports.get(key, {})
+            if status.get("reported") is not None:
+                self.report_fed[key] = (
+                    status["reported"]
+                    + self.report_setting(
+                        self.system_config(key), "report_fresh_minutes"
+                    )
+                    * 60
+                )
+        self.effort.change(
+            key,
+            action,
+            now,
+            mode=mode,
+            commanded_mode=self.commanded_mode(key),
+            trusted=trusted,
+        )
 
     @callback
     def _local_changed(self, event):
@@ -525,6 +929,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 system.get("run_sensor"),
                 system.get("supply_sensor"),
                 system.get("return_sensor"),
+                system.get("report_timestamp_sensor"),
             ):
                 continue
             key = system["entity_id"]
@@ -532,7 +937,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             available = bool(
                 entity and entity.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
             )
-            self.effort.change(
+            self.feed_effort(
                 key,
                 self.learning_action(
                     system,
@@ -542,8 +947,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                     available,
                 ),
                 now,
-                mode=entity.state if entity else None,
-                commanded_mode=self.commanded_mode(key),
+                entity.state if entity else None,
             )
 
     def source_value(self, source):
@@ -637,7 +1041,12 @@ class HouseCoordinator(DataUpdateCoordinator):
         old, new = event.data.get("old_state"), event.data.get("new_state")
         # Runtime changes must be captured even during service calls under lock.
         entity_id = event.data["entity_id"]
-        if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+        system = self.system_config(entity_id)
+        self.report_status(system, dt_util.utcnow().timestamp())
+        # A slow reporter's stale action (e.g. a command echo of an old fetch)
+        # is neither a thermostat observation nor a start (v0.5.23).
+        usable = self.report_usable(entity_id)
+        if usable and new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             self.state.observe_report(
                 next(
                     s
@@ -654,13 +1063,14 @@ class HouseCoordinator(DataUpdateCoordinator):
                 ),
                 self.config,
             )
-        self.state.observe_action(
-            entity_id,
-            new.attributes.get("hvac_action")
-            if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
-            else None,
-            dt_util.utcnow().timestamp(),
-        )
+        if usable:
+            self.state.observe_action(
+                entity_id,
+                new.attributes.get("hvac_action")
+                if new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+                else None,
+                dt_util.utcnow().timestamp(),
+            )
         if (
             new
             and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
@@ -678,18 +1088,17 @@ class HouseCoordinator(DataUpdateCoordinator):
             },
             self.frozen_window,
         )
-        self.effort.change(
+        self.feed_effort(
             entity_id,
             self.learning_action(
-                self.system_config(entity_id),
+                system,
                 new.attributes.get("hvac_action") if new else None,
                 new.state if new else None,
                 dt_util.utcnow().timestamp(),
                 bool(new and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)),
             ),
             dt_util.utcnow().timestamp(),
-            mode=new.state if new else None,
-            commanded_mode=self.commanded_mode(entity_id),
+            new.state if new else None,
         )
         if not self.system_control.get(entity_id, True):
             self.state.reported_efforts[entity_id] = 0
@@ -768,6 +1177,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             ):
                 return
             note = f" {new.entity_id} changed outside house control; next interval will re-assert."
+            self.outside_changes[new.entity_id] = dt_util.utcnow().timestamp()
             _LOGGER.info("%s", note.strip())
             self.async_set_updated_data(
                 replace(self.data, explanation=self.data.explanation + note)
@@ -918,6 +1328,7 @@ class HouseCoordinator(DataUpdateCoordinator):
             devices = {}
             for system in self.active_systems(include_inactive=True):
                 entity_id = system["entity_id"]
+                self.report_status(system, now.timestamp())
                 entity = self.hass.states.get(entity_id)
                 if not entity or entity.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
                     devices[entity_id] = Device(available=False)
@@ -984,10 +1395,28 @@ class HouseCoordinator(DataUpdateCoordinator):
                         now.timestamp(),
                         device.available,
                     )
-                    if self.action_sources[key].get("problem"):
+                    if self.action_sources[key].get("problem") not in (
+                        None,
+                        "command_contradicted",
+                    ):
                         # Untrusted local sensors never fall back to the device:
                         # the interval since the last good sample is unknown.
                         self.effort.invalidate(key)
+                    self.label_until(key, now.timestamp())
+                trusted = {
+                    key
+                    for key in actions
+                    if self.action_sources[key].get("source") == "command"
+                }
+                self.command_fed = set(trusted)
+                self.report_fed = {
+                    key: self.reports[key]["reported"]
+                    + self.report_setting(system, "report_fresh_minutes") * 60
+                    for system in self.active_systems(include_inactive=True)
+                    if (key := system["entity_id"]) in actions
+                    and self.action_sources[key].get("source") == "report"
+                    and self.action_sources[key].get("slow")
+                }
                 efforts, duration = self.effort.finish(
                     actions,
                     now.timestamp(),
@@ -995,6 +1424,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                     commanded_modes={
                         key: command[0] for key, command in self.last_commands.items()
                     },
+                    trusted=trusted,
                 )
                 for key in efforts:
                     if not self.system_control.get(key, True):
@@ -1032,7 +1462,11 @@ class HouseCoordinator(DataUpdateCoordinator):
                     {
                         key: device.current_temperature
                         for key, device in devices.items()
-                        if device.available and device.current_temperature is not None
+                        if device.available
+                        and device.current_temperature is not None
+                        # A slow reporter's own row learns only from fresh
+                        # reports; the row itself is kept (v0.5.23).
+                        and self.report_usable(key)
                     }
                 )
                 if (
@@ -1068,6 +1502,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                 self.learning_baseline = (
                     (learning_values, outdoor, solar) if self.learning_enabled else None
                 )
+                self.record_coverage(efforts, now.timestamp(), duration)
                 for sensor_filter in self.filters.values():
                     sensor_filter.finish_interval()
             for sensor, state in self.learning.regimes.items():
@@ -1129,7 +1564,14 @@ class HouseCoordinator(DataUpdateCoordinator):
                 },
                 self.state,
                 readings,
-                self.active_devices(devices),
+                {
+                    # A slow reporter's stale action is unknown to control:
+                    # no thermostat points, starts or "finishing" from it.
+                    key: device
+                    if self.report_usable(key)
+                    else replace(device, hvac_action=None)
+                    for key, device in self.active_devices(devices).items()
+                },
                 now.timestamp(),
                 outdoor,
                 self.enabled,
@@ -1227,11 +1669,32 @@ class HouseCoordinator(DataUpdateCoordinator):
             for entity_id, service, data in decision.commands:
                 if entity_id in failures:
                     continue
+                previous_setting = self.command_settings.get(entity_id)
                 try:
                     self.pending_commands[entity_id] = data
-                    if service == "set_hvac_mode":
+                    if service in ("set_hvac_mode", "set_temperature"):
+                        # The command is the learning label from when it is
+                        # sent; a failed call restores the previous one.
+                        device = devices[entity_id]
+                        self.command_settings[entity_id] = {
+                            "mode": data.get(
+                                "hvac_mode",
+                                (previous_setting or {}).get("mode", device.mode),
+                            ),
+                            "target": data.get(
+                                "temperature",
+                                (previous_setting or {}).get(
+                                    "target", device.temperature
+                                ),
+                            ),
+                            "sent_at": dt_util.utcnow().timestamp(),
+                        }
+                    if service == "set_hvac_mode" and not self.command_labelled(
+                        entity_id
+                    ):
                         # Mark uncertainty before service callbacks can report
                         # either the old action or a delayed mode acknowledgement.
+                        # A command-labelled system knows the switch instead.
                         self.effort.change(
                             entity_id, None, dt_util.utcnow().timestamp()
                         )
@@ -1259,12 +1722,51 @@ class HouseCoordinator(DataUpdateCoordinator):
                         )
                 except HomeAssistantError as err:
                     failures.add(entity_id)
+                    if previous_setting is None:
+                        self.command_settings.pop(entity_id, None)
+                    else:
+                        self.command_settings[entity_id] = previous_setting
                     if service in ("set_fan_mode", "set_swing_mode"):
                         self.fans.invalidate()
                     decision.explanation += f" {entity_id}: command failed ({err})."
                     _LOGGER.warning("Command to %s failed: %s", entity_id, err)
                 finally:
                     self.pending_commands.pop(entity_id, None)
+            for entity_id in {
+                entity_id
+                for entity_id, service, _ in decision.commands
+                if service in ("set_hvac_mode", "set_temperature")
+            }:
+                # Re-label from the command just sent, at its send time.
+                if (
+                    system := next(
+                        (
+                            s
+                            for s in self.active_systems(include_inactive=True)
+                            if s["entity_id"] == entity_id
+                        ),
+                        None,
+                    )
+                ) is None or not self.command_labelled(entity_id):
+                    continue
+                entity = self.hass.states.get(entity_id)
+                available = bool(
+                    entity and entity.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+                )
+                stamp = dt_util.utcnow().timestamp()
+                self.feed_effort(
+                    entity_id,
+                    self.learning_action(
+                        system,
+                        entity.attributes.get("hvac_action") if available else None,
+                        entity.state if available else None,
+                        stamp,
+                        available,
+                    ),
+                    stamp,
+                    entity.state if entity else None,
+                )
+            self.sync_report_issues(now.timestamp())
             _LOGGER.debug("%s", decision.explanation)
             if record:
                 occupancy = self.hass.states.get(
@@ -1307,6 +1809,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                         for source in self.config.get("extra_heat_sources", [])
                     },
                     "reporting": self.reporting.to_dict(),
+                    "command_settings": self.command_settings,
+                    "report_marks": self.report_marks,
                     "filters": {key: f.to_dict() for key, f in self.filters.items()},
                 }
             )
@@ -1512,6 +2016,29 @@ class HouseCoordinator(DataUpdateCoordinator):
         unit = self.hass.states.get(entity_id).attributes.get("unit_of_measurement")
         factors = {"W": 0.001, "kW": 1, "MW": 1000}
         return value * factors[unit] if unit in factors else None
+
+    def sync_report_issues(self, now):
+        """Repair issue while a system's command labels are contradicted."""
+        for system in self.active_systems(include_inactive=True):
+            key = system["entity_id"]
+            issue_id = f"{self.config_entry.entry_id}_{key}_command_contradicted"
+            if self.reporting.checks.suspended(key):
+                status = self.reporting.checks.status(key)
+                entity = self.hass.states.get(key)
+                ir.async_create_issue(
+                    self.hass,
+                    DOMAIN,
+                    issue_id,
+                    is_fixable=False,
+                    severity=ir.IssueSeverity.WARNING,
+                    translation_key="command_contradicted",
+                    translation_placeholders={
+                        "system": entity.name if entity else key,
+                        "rate": f"{status['rate'] * 100:.0f}",
+                    },
+                )
+            else:
+                ir.async_delete_issue(self.hass, DOMAIN, issue_id)
 
     def sync_regime_issues(self, now):
         for sensor, state in self.learning.regimes.items():

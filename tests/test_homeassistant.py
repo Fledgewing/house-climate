@@ -38,12 +38,14 @@ def settings():
     data = deepcopy(DEFAULTS)
     data["learning_window_minutes"] = 0
     data["sensors"] = [{"entity_id": "sensor.room", "weight": 1, "zone": "Main"}]
+    # Locally reporting units (v0.5.23 would bootstrap auto as slow).
     data["systems"] = [
         {
             "entity_id": "climate.ducted",
             "preset": "manual",
+            "report_trust": "fresh",
         },
-        {"entity_id": "climate.split", "preset": ""},
+        {"entity_id": "climate.split", "preset": "", "report_trust": "fresh"},
     ]
     return data
 
@@ -573,6 +575,10 @@ async def test_config_flow_empty_defaults_and_selector_filters(hass):
         "delta_deadband",
         "delta_full_heat",
         "delta_full_cool",
+        "report_trust",
+        "report_timestamp_sensor",
+        "report_fresh_minutes",
+        "command_effort",
     }
     selectors = {
         field.schema: value for field, value in result["data_schema"].schema.items()

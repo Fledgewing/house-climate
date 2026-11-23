@@ -4,6 +4,40 @@ DOMAIN = "house_climate"
 DEFAULT_RUN_THRESHOLD = 50
 # Duct supply − return ΔT (°C) → signed learning effort (v0.5.22).
 DELTA_DEFAULTS = {"delta_deadband": 2, "delta_full_heat": 15, "delta_full_cool": 10}
+# Slow cloud reporters and command-derived learning effort (v0.5.23), per system.
+# `report_timestamp_sensor` is an entity whose state is the device's last real
+# data fetch time; empty uses the climate entity's own last report time.
+REPORT_DEFAULTS = {
+    "report_trust": "auto",
+    "report_timestamp_sensor": "",
+    "report_fresh_minutes": 5,
+    "command_effort": True,
+}
+REPORT_TRUST = ["auto", "fresh", "slow"]
+# Command-derived effort constants (v0.5.23), not in the UI: gaps in °C, times
+# in minutes. Read with `config.get(key, COMMAND_DEFAULTS[key])`. The start
+# delay, restart guard and stop tail are assumed thermostat/compressor timings.
+COMMAND_DEFAULTS = {
+    "command_clear_gap": 1.5,
+    "command_off_gap": 1.0,
+    "command_start_delay": 2,
+    "command_restart_guard": 5,
+    "command_stop_tail": 3,
+    # A sent command counts as confirmed during this grace (seconds) even
+    # before the slow device echoes it; the same span as outside-change notes.
+    "command_confirm_seconds": 120,
+    # Contradiction counter: last N cross-checks, suspend/clear rates, minimum
+    # checks before a suspension.
+    "command_checks": 20,
+    "command_suspend_rate": 0.3,
+    "command_clear_rate": 0.1,
+    "command_min_checks": 10,
+}
+# Auto report cadence: gaps kept, gaps needed before trusting the median, and
+# the median gap (in control intervals) above which a system is slow.
+CADENCE_GAPS = 48
+CADENCE_MIN_GAPS = 6
+CADENCE_SLOW_INTERVALS = 3
 PLATFORMS = ["climate", "button", "sensor", "switch", "select"]
 DEFAULTS = {
     "sensors": [],

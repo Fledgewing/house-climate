@@ -130,7 +130,8 @@ def settings():
             "supply_sensor": SUPPLY,
             "return_sensor": RETURN,
         },
-        {"entity_id": "climate.split", "preset": ""},
+        # A locally reporting unit (v0.5.23 would bootstrap auto as slow).
+        {"entity_id": "climate.split", "preset": "", "report_trust": "fresh"},
     ]
     return data
 
