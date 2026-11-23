@@ -24,6 +24,7 @@ from random import Random
 
 import pytest
 
+from custom_components.house_climate.latent import LatentEffort, room_terms
 from custom_components.house_climate.learning import (
     CommandTransitions,
     EffortTracker,
@@ -40,10 +41,19 @@ THERMOSTAT = "r1"
 HYSTERESIS = 0.5
 START_DELAY, RESTART_GUARD, STOP_TAIL = 2, 5, 3
 OFF_SPAN = (7 * 60, 12 * 60)  # local minutes of the daily commanded off span
+LATENT_DELAY = 45  # block + longest response delay, minutes
 
 
 def simulate(
-    source="command", *, days=3, part_load=None, drift=0.0, seed=1122, lockout=None
+    source="command",
+    *,
+    days=3,
+    part_load=None,
+    drift=0.0,
+    seed=1122,
+    lockout=None,
+    modulating=False,
+    latent=None,
 ):
     """Run the loop; return the model and the measured truth/coverage stats.
 
@@ -53,9 +63,19 @@ def simulate(
     capacity fraction; None is a single-speed unit. `lockout` is a (start, end)
     minute span in which the unit ignores its thermostat (a utility
     curtailment or lockout the house cannot see).
+
+    `modulating` sends a modulating unit's on commands (own + 0.6–1.0 °C at a
+    0.1 °C step, mostly ambiguous) after a 2-h clear warm-up following the daily
+    off span. `latent` runs `LatentEffort` on the rooms: "apply" backfills its
+    labels, "skip" estimates the same blocks but leaves them skipped.
     """
     rng = Random(seed)
-    model = Learning(list(RATES), [UNIT], window_minutes=60, drift_noise=drift)
+    model = Learning(
+        list(RATES),
+        [UNIT],
+        window_minutes=60,
+        drift_noise=drift,
+    )
     tracker = EffortTracker()
     labels = CommandTransitions(START_DELAY * 60, RESTART_GUARD * 60, STOP_TAIL * 60)
     checks = CommandChecks()
@@ -108,6 +128,9 @@ def simulate(
     command = {"mode": "heat", "target": device["target"], "sent_at": -1e9}
     on, since = False, -100
     stats = {"delivered": 0.0, "called": 0.0, "ticks": 0, "labelled": 0}
+    stats.update(filled=0.0, latent_checks=0, latent_wrong=0)
+    running = {}  # minute -> the compressor ran (truth for latent labels)
+    estimator = LatentEffort() if latent else None
     off_ticks = off_accepted = 0
 
     def label(minute):
@@ -222,6 +245,7 @@ def simulate(
             elif t < plant["tail_until"]:
                 delivered = 0.4
             stats["delivered"] += delivered
+            running[t] = plant["running"]
             stats["called"] += plant["call"]
             for room in temperatures:
                 temperatures[room] += (
@@ -254,12 +278,36 @@ def simulate(
             observed_history={f"system:{UNIT}": tracker.finished_segments[UNIT]},
             local_hour=(minute / 60) % 24,
         )
+        if estimator:
+            rooms = {}
+            for room in RATES:
+                value = model.temperature_filters[room].mean(
+                    minute * 60 - 600, minute * 60
+                )
+                terms = room_terms(model, room, value, outdoor)
+                if terms:
+                    rooms[room] = (value, *terms)
+            estimator.observe(minute * 60, rooms)
+            for system, start, end, value in estimator.process(
+                minute * 60,
+                model.systems,
+                {UNIT: {"direction": 1, "estimate": True}},
+                lambda key, a, b: model.effort_span("system", key, a, b),
+            ):
+                if latent == "apply":
+                    stats["filled"] += model.backfill_effort(system, start, end, value)
+                ran = [running.get(t, False) for t in range(start // 60, end // 60)]
+                stats["latent_checks"] += 1
+                stats["latent_wrong"] += (sum(ran) / len(ran) > 0.5) != (value > 0)
+            # Like the coordinator: windows wait for late labels once ready.
+            ready = estimator.diagnostics(UNIT)["ready"]
+            model.label_delay_minutes = LATENT_DELAY if ready else 0
         local = minute % 1440
         if OFF_SPAN[0] < local <= OFF_SPAN[1]:
             off_ticks += 1
             window = model.windows.get(THERMOSTAT)
-            # Averaged windows need 60 + 10 min of contiguous labelled updates.
-            off_accepted += bool(window and window["end"] - window["start"] >= 70 * 60)
+            # Averaged windows need 60 + 10 min of labelled updates.
+            off_accepted += bool(window and window.get("accepted"))
         # House controller on the reported (possibly stale) device temperature.
         house = mean(readings)
         if OFF_SPAN[0] <= local < OFF_SPAN[1]:
@@ -272,14 +320,25 @@ def simulate(
         elif on and minute - since >= 10 and (house > 22.2 or minute - since >= 60):
             on, since = False, minute
         reported = report["own"]
-        target = (
-            ceil((reported + 3) / 0.5) * 0.5
-            if on
-            else floor((reported - 3) / 0.5) * 0.5
-        )
+        if modulating and OFF_SPAN[1] <= local < OFF_SPAN[1] + 120:
+            on = True  # warm-up after the off span: a clear on
+            own, _, _ = own_estimate(reported, report["mean"], house)
+            target = ceil((own + 3) / 0.5) * 0.5
+        elif modulating and on:
+            if device["mode"] == "heat" and device["target"] - reported > 0.4:
+                target = device["target"]
+            else:
+                target = round((reported + rng.uniform(0.6, 1.0)) / 0.1) * 0.1
+        else:
+            target = (
+                ceil((reported + 3) / 0.5) * 0.5
+                if on
+                else floor((reported - 3) / 0.5) * 0.5
+            )
         if device["mode"] != "heat" or device["target"] != target:
             send(minute, "heat", target)
-    stats["coverage"] = stats["labelled"] / stats["ticks"]
+    stats["coverage"] = (stats["labelled"] + stats["filled"] / 300) / stats["ticks"]
+    stats["latent"] = estimator
     stats["off_windows"] = off_accepted / off_ticks
     stats["truth"] = {
         room: rate * stats["delivered"] / stats["called"]
@@ -339,3 +398,39 @@ def test_lockout_suspends_command_labels():
     _, stats = simulate("command", lockout=(12 * 60, 3 * 1440))
     assert stats["contradictions"]["suspended"]
     assert stats["contradictions"]["rate"] > 0.3
+
+
+@pytest.mark.parametrize("drift", [0.0, 1.0])
+def test_latent_raises_coverage_without_raising_confidence(drift):
+    """Modulating unit: most commands are ambiguous; latent labels fill them.
+
+    The same replay with the latent spans skipped is the reference: latent
+    labels add coverage and windows but no confidence (counts or the
+    independent covariance), and the effects stay near truth.
+    """
+    skipped, before = simulate(
+        "command", modulating=True, latent="skip", days=6, drift=drift
+    )
+    model, after = simulate(
+        "command", modulating=True, latent="apply", days=6, drift=drift
+    )
+    assert after["latent"].diagnostics(UNIT)["ready"]
+    assert after["coverage"] - before["coverage"] >= 0.30
+    assert model.confidence_percent == pytest.approx(
+        skipped.confidence_percent, abs=1.0
+    )
+    for room in RATES:
+        assert 100 * model.confidence(room, UNIT) == pytest.approx(
+            100 * skipped.confidence(room, UNIT), abs=1.0
+        ), room
+        assert model.rows[room].counts == pytest.approx(skipped.rows[room].counts)
+    learned = effects(model)
+    for room, truth in after["truth"].items():
+        assert learned[room] == pytest.approx(truth, rel=0.25), room
+
+
+def test_latent_labels_match_the_true_run_state():
+    """Every decisive latent label agrees with the plant in its block."""
+    _, stats = simulate("command", modulating=True, latent="apply", days=6)
+    assert stats["latent_checks"] >= 100
+    assert stats["latent_wrong"] / stats["latent_checks"] <= 0.05

@@ -383,6 +383,7 @@ async def test_command_state_persists_and_options_keep_learning(hass, settings):
     assert saved["command_settings"][CLOUD]["target"] == 16.0
     assert saved["report_marks"][CLOUD]["reported"] == start.timestamp()
     assert "cadence" in saved["reporting"] and "checks" in saved["reporting"]
+    assert saved["latent"]["anchors"] == {}
     c.learning.window_minutes = 0
     for step in range(3):
         c.learning.update(
@@ -410,10 +411,16 @@ async def test_command_state_persists_and_options_keep_learning(hass, settings):
         "report_timestamp_sensor",
         "report_fresh_minutes",
         "command_effort",
+        "latent_effort",
     } <= fields
     result = await flow.async_configure(
         result["flow_id"],
-        {"report_trust": "auto", "report_fresh_minutes": 10, "command_effort": False},
+        {
+            "report_trust": "auto",
+            "report_fresh_minutes": 10,
+            "command_effort": False,
+            "latent_effort": False,
+        },
     )
     result = await flow.async_configure(result["flow_id"], {})
     assert result["step_id"] == "tunables"
@@ -441,6 +448,8 @@ async def test_command_state_persists_and_options_keep_learning(hass, settings):
     assert system["report_trust"] == "auto"
     assert system["report_fresh_minutes"] == 10
     assert system["command_effort"] is False
+    assert system["latent_effort"] is False
+    assert "latent_effort" not in entry.options["systems"][1]  # default on
     # An empty timestamp sensor clears it; the split keeps its settings.
     assert "report_timestamp_sensor" not in system
     assert entry.options["systems"][1]["report_trust"] == "fresh"

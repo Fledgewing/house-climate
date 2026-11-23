@@ -259,7 +259,12 @@ class HouseSteps:
             if "quiet_max_fan" in user_input:
                 system["quiet_max_fan"] = user_input["quiet_max_fan"]
             # Slow reporters (v0.5.23): absent keys keep their defaults.
-            for key in ("report_trust", "report_fresh_minutes", "command_effort"):
+            for key in (
+                "report_trust",
+                "report_fresh_minutes",
+                "command_effort",
+                "latent_effort",
+            ):
                 if key in user_input:
                     system[key] = user_input[key]
             if user_input.get("report_timestamp_sensor"):
@@ -380,6 +385,14 @@ class HouseSteps:
                         description={
                             "suggested_value": system.get(
                                 "command_effort", REPORT_DEFAULTS["command_effort"]
+                            )
+                        },
+                    ): selector.BooleanSelector(),
+                    vol.Optional(
+                        "latent_effort",
+                        description={
+                            "suggested_value": system.get(
+                                "latent_effort", REPORT_DEFAULTS["latent_effort"]
                             )
                         },
                     ): selector.BooleanSelector(),

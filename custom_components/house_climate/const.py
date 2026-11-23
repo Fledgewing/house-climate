@@ -12,6 +12,9 @@ REPORT_DEFAULTS = {
     "report_timestamp_sensor": "",
     "report_fresh_minutes": 5,
     "command_effort": True,
+    # Latent effort from the rooms' response labels spans that neither a
+    # command nor a fresh report labels; it adds no learning confidence.
+    "latent_effort": True,
 }
 REPORT_TRUST = ["auto", "fresh", "slow"]
 # Command-derived effort constants (v0.5.23), not in the UI: gaps in °C, times
@@ -32,6 +35,8 @@ COMMAND_DEFAULTS = {
     "command_suspend_rate": 0.3,
     "command_clear_rate": 0.1,
     "command_min_checks": 10,
+    # Latent effort block length (minutes); response delays are latent.DELAYS.
+    "latent_block_minutes": 15,
 }
 # Auto report cadence: gaps kept, gaps needed before trusting the median, and
 # the median gap (in control intervals) above which a system is slow.

@@ -24,6 +24,9 @@ class Row:
     counts: list[float]
     samples: int = 0
     squared_error: float = 0
+    # v0.5.23: covariance from windows without latent labels, for confidence.
+    # None until a latent window is fitted (then it equals `covariance`).
+    independent: list[list[float]] | None = None
 
 
 class Learning:
@@ -54,6 +57,7 @@ class Learning:
         window_minutes=0,
         average_minutes=10,
         drift_noise=DRIFT_NOISE,
+        label_delay_minutes=0,
     ):
         if not 0 < forgetting <= 1 or n0 <= 0:
             raise ValueError("Invalid learning parameters")
@@ -68,6 +72,9 @@ class Learning:
         if not isfinite(drift_noise) or drift_noise < 0:
             raise ValueError("Invalid background drift")
         self.drift_noise = drift_noise
+        # v0.5.23: averaged windows are evaluated this much later, so late
+        # (latent) labels can complete them. Zero is the pre-v0.5.23 timing.
+        self.label_delay_minutes = label_delay_minutes
         self.lag_minutes = lag_minutes
         self.window_minutes = window_minutes
         self.average_minutes = average_minutes
@@ -124,6 +131,7 @@ class Learning:
             for _, _, values in self.effort_history:
                 for kind, key in removed:
                     values.pop(f"{kind}:{key}", None)
+                    values.pop(f"latent:{kind}:{key}", None)
         rows = {}
 
         def remap(old=None):
@@ -205,16 +213,48 @@ class Learning:
         ]
         self.record_efforts(efforts, sources, start_time, timestamp, observed_history)
         context = [outdoor, solar, duration, *activity]
-        if any(v is None or not isfinite(v) for v in context) or duration <= 0:
+        averaged = self.window_minutes and self.average_minutes
+        sensor_filters = sensor_filters or {}
+        known = [outdoor, solar, duration]
+        if any(v is None or not isfinite(v) for v in known) or duration <= 0:
             self.streaks.clear()
             self.windows.clear()
             return
-        averaged = self.window_minutes and self.average_minutes
-        sensor_filters = sensor_filters or {}
+        if any(v is None or not isfinite(v) for v in context) and not averaged:
+            self.streaks.clear()
+            self.windows.clear()
+            return
         if averaged:
             self.context_history.append((start_time, timestamp, outdoor, solar))
-            cutoff = timestamp - (self.window_minutes + self.average_minutes) * 60
+            cutoff = timestamp - (self.history_minutes - 5) * 60
             self.context_history = [v for v in self.context_history if v[1] > cutoff]
+        if any(v is None or not isfinite(v) for v in context):
+            # v0.5.23: a missing effort advances each averaged window instead of
+            # clearing it. The gap is in `effort_history`, which `averaged_window`
+            # rejects until `backfill_effort` fills it (a late latent label).
+            self.streaks.clear()
+            for sensor in self.rows:
+                start, end = before.get(sensor), after.get(sensor)
+                if (
+                    start is None
+                    or end is None
+                    or not isfinite(start)
+                    or not isfinite(end)
+                ):
+                    self.windows.pop(sensor, None)
+                    continue
+                if sensor_filters.get(sensor) is None:
+                    sensor_filter = self.internal_filter(sensor)
+                    if not sensor_filter.points:
+                        sensor_filter.observe(start, start_time)
+                    sensor_filter.observe(end, timestamp)
+                window = self.windows.get(sensor)
+                if window is None or abs(window["end"] - start_time) > 1e-6:
+                    window = {"start": start_time}
+                window["end"] = timestamp
+                window["accepted"] = False
+                self.windows[sensor] = window
+            return
         interval_duration = duration
         interval_activity = activity
         for sensor, row in self.rows.items():
@@ -236,6 +276,7 @@ class Learning:
                 continue
             if state["temporary"]:
                 continue
+            count_weights = None
             x = [
                 duration * v
                 for v in [
@@ -261,7 +302,11 @@ class Learning:
                 )
                 if integrated is None:
                     continue
-                x, target, activity, frozen = integrated
+                x, target, activity, frozen, latent = integrated
+                # A window holding any latent-labelled time adds no counts and
+                # ages none (no self-confirmation): confidence stays what the
+                # same replay gives with the latent spans skipped.
+                count_weights = [0.0 if share > 1e-9 else 1.0 for share in latent]
                 start, end, duration = 0.0, target, 1
             elif self.window_minutes:
                 window = self.windows.get(sensor)
@@ -317,6 +362,7 @@ class Learning:
                 frozen,
                 evidence_weight,
                 self.background_drift,
+                count_weights,
             )
             if self.choose_regime(sensor):
                 continue
@@ -371,7 +417,25 @@ class Learning:
                 frozen,
                 evidence_weight,
                 self.background_drift,
+                count_weights,
             )
+
+    @property
+    def history_minutes(self):
+        """Temperature history an averaged window needs, with its label delay."""
+        return self.window_minutes + self.average_minutes + self.label_delay_minutes + 5
+
+    def internal_filter(self, sensor):
+        sensor_filter = self.temperature_filters.get(sensor)
+        if sensor_filter is None:
+            sensor_filter = self.temperature_filters[sensor] = SensorFilter(
+                history_minutes=self.history_minutes
+            )
+        else:
+            sensor_filter.retention = max(
+                sensor_filter.retention, self.history_minutes * 60
+            )
+        return sensor_filter
 
     def averaged_window(self, sensor, sensor_filter, start, end, before, after):
         """Integrate clean spans on the trailing mean's half-span delayed clock."""
@@ -379,12 +443,7 @@ class Learning:
         lag = span / 2
         width = self.window_minutes * 60
         if sensor_filter is None:
-            sensor_filter = self.temperature_filters.setdefault(
-                sensor,
-                SensorFilter(
-                    history_minutes=self.window_minutes + self.average_minutes + 5
-                ),
-            )
+            sensor_filter = self.internal_filter(sensor)
             if not sensor_filter.points:
                 sensor_filter.observe(before, start)
             sensor_filter.observe(after, end)
@@ -392,10 +451,12 @@ class Learning:
         if window is None or abs(window["end"] - start) > 1e-6:
             window = {"start": start}
         window["end"] = end
+        window["accepted"] = False
         self.windows[sensor] = window
-        if end - window["start"] < width + span:
+        delay = self.label_delay_minutes * 60
+        if end - window["start"] < width + span + delay:
             return None
-        left, right = end - lag - width, end - lag
+        left, right = end - lag - delay - width, end - lag - delay
         excluded = [
             (max(a, left), min(b, right))
             for a, b in sensor_filter.exclusions(end)
@@ -413,6 +474,7 @@ class Learning:
             runs.append((cursor, right))
         count = len(self.systems) + len(self.sources)
         x = [0.0] * (3 * count + 3)
+        latent = [0.0] * count
         target = seconds = 0.0
         frozen = set()
         keys = [
@@ -458,15 +520,19 @@ class Learning:
                 ]
                 for k, v in enumerate(values):
                     x[k] += v * (hi - lo)
+                for k, (kind, key) in enumerate(keys):
+                    latent[k] += self.latent_share(kind, key, lo, hi) * (hi - lo)
                 seconds += hi - lo
         if not seconds:
             return None
+        window["accepted"] = True
         # Same per-control-interval units as the unsmoothed integrated model.
         return (
             [v / seconds for v in x],
             target * self.interval_minutes * 60 / seconds,
             [v / seconds for v in x[1 : count + 1]],
             frozen,
+            [v / seconds for v in latent],
         )
 
     @property
@@ -485,34 +551,57 @@ class Learning:
         frozen=(),
         evidence_weight=1,
         drift=0,
+        count_weights=None,
     ):
-        p = row.covariance
-        raw_px = [sum(a * b for a, b in zip(line, x)) for line in p]
-        px = [0 if i in frozen else v for i, v in enumerate(raw_px)]
-        denominator = forgetting + sum(a * b for a, b in zip(x, px))
-        gain = [v / denominator for v in px]
+        """RLS step; `count_weights` scale each input's count update (v0.5.23).
+
+        A weight of 0 (a window holding latent-labelled time) neither adds to
+        a count nor ages it, and leaves `independent` (the covariance used by
+        confidence) untouched, so confidence comes only from windows labelled
+        by independent sources. The coefficients and their covariance learn
+        from every window.
+        """
+
+        def updated(p, gain=None):
+            raw_px = [sum(a * b for a, b in zip(line, x)) for line in p]
+            px = [0 if i in frozen else v for i, v in enumerate(raw_px)]
+            denominator = forgetting + sum(a * b for a, b in zip(x, px))
+            if gain is not None:
+                gain.extend(v / denominator for v in px)
+
+            def covariance(i, j, value):
+                if i in frozen and j in frozen:
+                    return value
+                if i in frozen or j in frozen:
+                    # A zero-gain (Joseph) update keeps the missing coefficient's
+                    # mean/variance intact, while preserving a positive covariance.
+                    return (value - raw_px[i] * raw_px[j] / denominator) / sqrt(
+                        forgetting
+                    )
+                return (value - px[i] * px[j] / denominator) / forgetting
+
+            result = [
+                [covariance(i, j, v) for j, v in enumerate(line)]
+                for i, line in enumerate(p)
+            ]
+            # A random-walk background tracks slow unmodeled heat or loss. When
+            # the controller reacts to that drift, a constant background leaves
+            # it to the effort, interaction and lag columns (closed-loop bias).
+            result[-1][-1] += drift * evidence_weight
+            return result
+
+        latent = count_weights is not None and any(w < 1 for w in count_weights)
+        if latent and row.independent is None:
+            row.independent = deepcopy(row.covariance)
+        elif not latent and row.independent is not None:
+            row.independent = updated(row.independent)
+        gain = []
+        row.covariance = updated(row.covariance, gain)
         row.theta = [v + g * error for v, g in zip(row.theta, gain)]
-
-        def covariance(i, j, value):
-            if i in frozen and j in frozen:
-                return value
-            if i in frozen or j in frozen:
-                # A zero-gain (Joseph) update keeps the missing coefficient's
-                # mean/variance intact, while preserving a positive covariance.
-                return (value - raw_px[i] * raw_px[j] / denominator) / sqrt(forgetting)
-            return (value - px[i] * px[j] / denominator) / forgetting
-
-        row.covariance = [
-            [covariance(i, j, v) for j, v in enumerate(line)]
-            for i, line in enumerate(p)
-        ]
-        # A random-walk background tracks slow unmodeled heat or loss. When the
-        # controller reacts to that drift, a constant background leaves it to the
-        # effort, interaction and lag columns instead (closed-loop bias).
-        row.covariance[-1][-1] += drift * evidence_weight
+        weights = count_weights or [1] * len(row.counts)
         row.counts = [
-            forgetting * n + evidence_weight * (abs(value) > 1e-9)
-            for value, n in zip(activity, row.counts)
+            forgetting**weight * n + evidence_weight * weight * (abs(value) > 1e-9)
+            for value, n, weight in zip(activity, row.counts, weights)
         ]
         row.squared_error = forgetting * row.squared_error + (error / duration) ** 2
         row.samples += 1
@@ -690,10 +779,91 @@ class Learning:
             for item in self.effort_history
             if item[1]
             > end
-            - (self.lag_minutes + self.window_minutes + self.average_minutes) * 60
+            - (
+                self.lag_minutes
+                + self.window_minutes
+                + self.average_minutes
+                + self.label_delay_minutes
+            )
+            * 60
             - (end - start)
         ]
         self.effort_clock = max(self.effort_clock, end)
+
+    def latent_share(self, kind, key, start, end):
+        """Share of [start, end] whose effort is a backfilled latent label."""
+        if end <= start:
+            return 0.0
+        flag = f"latent:{kind}:{key}"
+        seconds = 0.0
+        for left, right, values in self.effort_history:
+            if values.get(flag):
+                seconds += max(0, min(right, end) - max(left, start))
+        return min(1.0, seconds / (end - start))
+
+    def effort_span(self, kind, key, start, end):
+        """Labels over [start, end]: (known mean, unknown share, constant, latent).
+
+        `known mean` is the time-weighted effort with unknown time counted as 0;
+        `constant` is the single value when the whole span is known and constant
+        (else None); `latent` is the share labelled by a latent backfill.
+        """
+        if end <= start:
+            return 0.0, 1.0, None, 0.0
+        total = known = 0.0
+        values_seen = set()
+        flag = f"latent:{kind}:{key}"
+        latent = 0.0
+        for left, right, values in self.effort_history:
+            seconds = min(right, end) - max(left, start)
+            if seconds <= 0:
+                continue
+            value = values.get(f"{kind}:{key}")
+            if value is None or not isfinite(value):
+                continue
+            known += seconds
+            total += seconds * value
+            values_seen.add(round(value, 6))
+            if values.get(flag):
+                latent += seconds
+        span = end - start
+        unknown = max(0.0, 1 - known / span)
+        if unknown < 1e-6:
+            unknown = 0.0
+        constant = (
+            next(iter(values_seen)) if not unknown and len(values_seen) == 1 else None
+        )
+        return total / span, unknown, constant, latent / span
+
+    def backfill_effort(self, system, start, end, value, latent=True):
+        """Fill missing effort for `system` within [start, end]; return seconds.
+
+        Only segments whose effort is missing change; known labels are never
+        overwritten. Windows ending after the backfill use the span. A latent
+        label is flagged (`latent:system:<key>`) so it adds no counts.
+        """
+        if value is None or not isfinite(value) or end <= start:
+            return 0.0
+        key = f"system:{system}"
+        flag = f"latent:{key}"
+        filled = 0.0
+        history = []
+        for left, right, values in self.effort_history:
+            a, b = max(left, start), min(right, end)
+            if b <= a or values.get(key) is not None:
+                history.append([left, right, values])
+                continue
+            if left < a:
+                history.append([left, a, dict(values)])
+            inside = {**values, key: value}
+            if latent:
+                inside[flag] = True
+            history.append([a, b, inside])
+            filled += b - a
+            if b < right:
+                history.append([b, right, dict(values)])
+        self.effort_history = history
+        return filled
 
     def past_effort(self, kind, key, end, start=None):
         start = end - self.lag_minutes * 60 if start is None else start
@@ -716,8 +886,13 @@ class Learning:
             else None
         )
 
-    def steady_std(self, sensor, system, outdoor=None, temperature=None):
-        """Posterior standard deviation of raw b + g*delta + h."""
+    def steady_std(
+        self, sensor, system, outdoor=None, temperature=None, independent=False
+    ):
+        """Posterior standard deviation of raw b + g*delta + h.
+
+        `independent` uses the covariance of windows without latent labels.
+        """
         k = self.systems.index(system)
         delta = (
             outdoor - temperature
@@ -725,7 +900,8 @@ class Learning:
             else 0
         )
         terms = [(1 + k, 1), (self.interaction_index(k), delta), (self.lag_index(k), 1)]
-        p = self.rows[sensor].covariance
+        row = self.rows[sensor]
+        p = row.independent if independent and row.independent else row.covariance
         return sqrt(max(0, sum(a * b * p[i][j] for i, a in terms for j, b in terms)))
 
     def source_effect(self, sensor, source, outdoor=None, temperature=None):
@@ -840,7 +1016,12 @@ class Learning:
             effect = row.theta[1 + k] + row.theta[self.lag_index(k)]
             confidence = min(
                 confidence,
-                effect**2 / (effect**2 + self.steady_std(sensor, system) ** 2 + 1e-12),
+                effect**2
+                / (
+                    effect**2
+                    + self.steady_std(sensor, system, independent=True) ** 2
+                    + 1e-12
+                ),
             )
         return confidence
 
@@ -1116,6 +1297,7 @@ class Learning:
                 # Short, correlated samples were not independent identification
                 # evidence. Retain physical means but reopen their uncertainty.
                 row.covariance = model.neutral_row().covariance
+                row.independent = None
                 row.theta[-1] = 0.0
                 row.counts = [0.0] * count
             return row

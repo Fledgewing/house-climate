@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.22 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.23 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 The setpoint is the center of the smallest predicted temperature band across the counted rooms.
 The default `objective: "band"` minimizes the largest priority-scaled room deviation from it,
@@ -43,6 +43,10 @@ unless `fan_reward_lambda` is explicitly set; this remains independent of object
 Legacy PI gains, house offset clamps and slew settings remain readable and unused.
 
 Automatic mode retains its 1 °C deadband and 60-minute heat/cool dwell. Cooling is vetoed below 10 °C outdoors; heating above 24 °C. Explicit heat/cool requests take effect immediately, subject to the outdoor veto. Starts and stops obey cycling protection on scheduled and immediate passes. Explicit House off and outdoor vetoes still stop operation.
+
+Version 0.5.23 learns slow cloud-read units' effort from House Climate's own clear commands
+and, where neither a command nor a fresh report is clear, from the rooms' response; see
+[Slow cloud reporters](#slow-cloud-reporters-learning-from-commands-0523).
 
 Version 0.5.22 adds optional per-system **duct temperature probes** and a **Run sensor** as
 the learning truth for units whose reported action is unreliable; see
@@ -197,6 +201,7 @@ Each system's step of **Configure** has:
 | **Report timestamp sensor** (`report_timestamp_sensor`) | empty | A sensor whose state is the unit's last real data fetch time. Freshness and the auto cadence then come from it; empty uses the climate entity's own last report time. |
 | **Fresh report window** (`report_fresh_minutes`) | 5 | A slow unit's reported action is fact for this many minutes after its report time. |
 | **Learn from clear commands** (`command_effort`) | on | Learn a slow unit's effort from the command House Climate sent when it is clearly on or off. |
+| **Learn from the rooms' response** (`latent_effort`) | on | Label time that neither a clear command nor a fresh report covers from how the rooms' temperatures moved (latent effort, below). |
 
 **Carrier / Bryant (ha_carrier):** set **Report timestamp sensor** to the integration's
 "all data last updated" timestamp sensor, for example
@@ -220,10 +225,11 @@ For a slow unit, each interval's learning effort comes from the first of:
    Transitions are modelled, not skipped: after an on, 0 for a 2-minute start delay and never
    within 5 minutes of the last stop; after an off, 0.5 for a 3-minute tail, then 0;
 3. a **fresh report** (within the fresh window), with the usual mode checks;
-4. otherwise nothing: that time is not learned from. A gap in between (a small target
-   difference while modulating, an unconfirmed or overridden command) costs about an hour of
-   learning windows, so only these unclear spans are skipped; a commanded off span (for
-   example a morning with the unit off) stays fully learned.
+4. the **latent effort** from the rooms' response (below), filled in about 45 minutes later;
+5. otherwise nothing: that time is not learned from. An unlabelled span no longer clears
+   the learning windows; it only keeps the windows that contain it from being used until it
+   is filled in or has passed. A commanded off span (for example a morning with the unit
+   off) stays fully learned.
 
 A unit with local sensors configured that are unavailable or stale uses step 2 too, but never
 its reported action. Units that report promptly (`fresh`, or measured fast) are unchanged.
@@ -238,16 +244,35 @@ least 10) disagree, for example a lockout, a hold or a utility curtailment, comm
 suspended for that unit, a repair issue is raised, and learning uses only its fresh reports
 until the rate falls below 10%.
 
-`climate.house` `action_sources` shows, for a slow unit: `source` (`command`, `report`, or
-none), `slow` and `slow_reason` (mode, measured gaps, median gap), `report_age_s`,
+**Latent effort:** a modulating unit's on targets sit only 0–1 °C above the room, so most of
+its commands are unclear. The rooms still show whether it ran. In 15-minute blocks House
+Climate compares each room's warming or cooling rate, after the modelled outdoor, sun,
+background and other units' effects, with how that room responded in blocks whose effort
+*was* known (a probe, run sensor, clear command or fresh report): those blocks calibrate
+each room's share, offset, noise and the response delay (0–30 minutes). An unlabelled block
+gets a label only when the rooms agree on a clear answer: off when the estimate is within
+±0.25 of 0, on when it is at least 0.75 in the mode's direction, with a small standard
+error and a consistent fit across rooms (a single sunny or draughty room fails it). It
+starts after 12 known-on and 12 known-off blocks in the last 7 days with at least 3 rooms
+that respond clearly, and never while another unit is also unlabelled. Labels arrive about
+45 minutes late, so while it is active the averaged learning windows are evaluated 45
+minutes late too. Latent labels fill learning windows but **never raise confidence**: a
+window holding any latent time adds no confidence count and does not tighten the
+uncertainty confidence is judged on, and room calibration never learns from latent blocks.
+
+`climate.house` `action_sources` shows, for a slow unit: `source` (`command`, `report`,
+`latent` while waiting for its late label, or none), `slow` and `slow_reason` (mode, measured gaps, median gap), `report_age_s`,
 `report_fresh`, `command` (`mode`, `target`, `own_est`, `own_source`, `correction`, `gap`,
 `class`, `since`, `transition`, and `reason` when unconfirmed), `contradictions` (`checks`,
-`rate`, `suspended`) and `coverage_24h`: the share of the last 24 h labelled by each source,
-`skipped`, and `windows` (share with a full learning window). Coverage is the number to watch.
+`rate`, `suspended`), `latent` (`u_hat`, `se`, `chi2`, `label`, `block`, `delay_min`,
+`anchors_on`, `anchors_off`, `rooms`, `ready`) and `coverage_24h`: the share of the last 24 h
+labelled by each source (`latent` once filled in), `skipped`, and `windows` (share with an
+accepted learning window). Coverage is the number to watch.
 
 The start delay, restart guard and stop tail (2, 5 and 3 minutes), the 1.5/1.0 °C margins
-and the check settings are configuration constants (`COMMAND_DEFAULTS` in `const.py`), not
-UI options. Existing learning is kept; nothing is reset.
+the check settings and the 15-minute latent block are configuration constants
+(`COMMAND_DEFAULTS` in `const.py`), not UI options. Existing learning is kept; nothing is
+reset, and stored data from 0.5.22 loads unchanged.
 
 ## Steady operation and cycling protection
 

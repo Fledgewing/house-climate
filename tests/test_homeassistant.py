@@ -579,6 +579,7 @@ async def test_config_flow_empty_defaults_and_selector_filters(hass):
         "report_timestamp_sensor",
         "report_fresh_minutes",
         "command_effort",
+        "latent_effort",
     }
     selectors = {
         field.schema: value for field, value in result["data_schema"].schema.items()

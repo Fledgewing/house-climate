@@ -1773,7 +1773,7 @@ days (observed 0.97–1.06 of truth), while on/off-only evidence for the variabl
 learns under 75% of truth.
 
 
-## v0.5.23: slow cloud reporters and command-derived effort
+## v0.5.23: slow cloud reporters, command-derived and latent effort
 
 Live evidence 2026-11-21/22: `climate.home_zone_1` (ha_carrier) fetched new data about every
 two hours (`sensor.living_room_home_all_data_last_updated`: 11:57, 14:43, 16:08, 16:16,
@@ -1781,12 +1781,15 @@ two hours (`sensor.living_room_home_all_data_last_updated`: 11:57, 14:43, 16:08,
 at an old temperature, moving the climate entity's `last_updated` without a fetch. Its
 indoor/outdoor status sensors are frozen. No local probe is fitted yet. Learning from the
 reported action is learning from a snapshot up to two hours old. The approved design is
-"effort inference for slow cloud reporters"; this release is its part A (tasks 1–9). Part B
-(latent effort from room response, window advance/backfill, count weights) is v0.5.24.
+"effort inference for slow cloud reporters"; this release builds both parts: part A (tasks
+1–9: slow tag, command labels, contradictions) and part B (tasks 10–14: window advance and
+backfill, count weights, latent effort from the rooms' response). The design planned part B
+as v0.5.24; both ship as v0.5.23.
 
 A single missing effort costs about 70 minutes of evidence: `Learning.update` clears all
 windows when any system's effort is None, and `averaged_window` needs `window + average`
 minutes of contiguous labelled updates. So unclear spans are skipped, transitions are not.
+(Part B changes the first half: a missing effort now advances the windows instead.)
 
 ### Slow-reporter tag (`reporting.ReportCadence`)
 
@@ -1828,7 +1831,7 @@ command-labelled system also skips the `set_hvac_mode` pre-mark and is re-labell
 after its commands.
 
 Chain (`learning_action`): local probe > run sensor > clear command > fresh report > latent
-(`latent_action`, a stub returning None: the v0.5.24 seam) > skip. Non-slow systems without
+(`latent_action`, part B) > skip. Non-slow systems without
 local sensors keep the exact `device` path. Untrusted local sensors fall back to a clear
 command, then latent, never to the report.
 
@@ -1857,6 +1860,106 @@ start or the stop tail): reported running vs label on. Over the last 20 checks, 
 - The tuning constants live in `const.COMMAND_DEFAULTS` (config keys, not UI), so the tunables
   form and its tests are unchanged.
 
+### Part B: late labels (`Learning.update`, `backfill_effort`, `effort_span`)
+
+In averaged mode a missing effort no longer clears every window: `update` still records the
+gap in `effort_history`, appends the interval's context, observes the internal filters and
+advances each window's end (`accepted` false). `averaged_window` rejects any window whose
+span holds the gap, as before, until `backfill_effort(system, start, end, value)` replaces
+the missing segments (only missing ones; known labels are never overwritten) and flags them
+`latent:system:<key>` in the segment's dict. Other paths (plain and unaveraged windows, a
+missing temperature, outdoor or solar) still clear. `windows[sensor]["accepted"]` now says
+whether the last evaluation produced a window; `windows_accepted` (coverage) and the
+off-span metric of the simulation use it, since a window's age alone no longer means its
+labels are complete.
+
+A latent label is complete only a block plus its response delay after the block, so while
+an estimate is ready for some system the coordinator sets `Learning.label_delay_minutes` to
+block + longest delay (45): averaged windows are then evaluated that much later (window
+`[end − lag − 45 min − 60 min, end − lag − 45 min]`, contiguity `≥ window + average + 45`).
+The room filters' history (and the internal filters, context and effort history) grows by
+that delay when averaged learning is on. Before a system is ready the delay is 0 and
+learning timing is unchanged.
+
+### Part B: no self-confirmation (count weights, independent covariance)
+
+`averaged_window` also returns each input's latent share. `fit_row(..., count_weights)`
+scales each input's count update by its weight, in both the increment and the ageing
+(`forgetting**w · n + evidence_weight · w · active`). A window holding *any* latent time for
+an input has weight 0 for it: the count neither grows nor ages, exactly as if the window had
+been skipped. Weight 1 (and no weights) is the old update bit for bit.
+
+The integrated confidence is `min(n/(n+n0), effect²/(effect² + steady_std²))`, and latent
+windows shrink the covariance like any other window, so counts alone did not stop
+inflation: the simulation gained +0.5 points (drift 0) and +4.7 points (drift 1) through the
+second term. Each row therefore keeps `independent`, a covariance updated only by windows
+without latent time (None until the first latent window, then a copy). `confidence` uses it;
+`steady_std` for control and diagnostics keeps the full covariance. Coefficients learn from
+every window. Rows stored by v0.5.22 load with `independent` None (= their covariance).
+
+### Part B: latent effort (`latent.LatentEffort`, `latent.room_terms`)
+
+Per tick the coordinator feeds each usable room (not disturbed, temporary, not reporting or
+filter-blocked): its 10-min filtered mean, its passive rate (`room_terms`: the learning row
+with all systems off: outdoor loss, solar, background, extra sources, °C/h) and every
+system's blended hourly effect. On 15-minute blocks (aligned to the clock) for each system
+with `latent_effort` on, once the block plus 30 min of response is in:
+
+- **Anchor**: the block's label is known for the whole block, constant and not latent
+  (`effort_span`). For every delay δ ∈ {0, 5, 10, 15, 20, 30} min, each room's response
+  `r = (T(b+B+δ) − T(b+δ))/B − mean passive − Σ_{k≠j} effect_k · label_k` (others' labels over
+  the shifted span; any other system unknown there drops the block) updates weighted sums
+  for `r = s·u + c` with forgetting 0.998 per anchor block. On (|u| > 0.5) and off (u = 0)
+  anchors are kept for 7 days.
+- **Estimate**: the block has missing time, and the system is a candidate (slow without
+  local sensors, or local sensors untrusted now). The fit takes the delay with the highest
+  mean R² over rooms, rooms with |s| > 2σ. Ready at ≥ 12 on and ≥ 12 off anchors and ≥ 3
+  such rooms. With k the known label mean and f the missing share,
+  `û = Σ w s f (r − c − s k) / Σ w (s f)²`, `se`, `χ²/(n − 1)`; label 0 when |û| ≤ 0.25, d
+  (the mode's direction; heat_cool uses the active mode) when d·û ≥ 0.75, both needing
+  se ≤ 0.2 and χ² ≤ 3; else nothing. A decisive label is backfilled over the block's missing
+  time and its coverage span is relabelled `latent`.
+
+Latent blocks are never anchors, so shares, offsets and noise come only from independent
+labels. Persisted in the Store under `latent` (sums, anchors, last processed block, last
+estimate per system); the tick buffer is not persisted (a restart loses under an hour of
+blocks). Stores without the key load empty.
+
+Coordinator: `latent_action` (the part A seam) returns the estimator's diagnostics when
+ready, and the chain then reports `source: latent` with action None (the present span is
+labelled later). `action_sources[...]["latent"]` carries `u_hat`, `se`, `chi2`, `label`,
+`block`, `delay_min`, `anchors_on`, `anchors_off`, `rooms`, `ready`; `coverage_24h` gains
+`latent`. Option `latent_effort` (per system, default on) in the system step, strings and
+`translations/en.json`; `latent_block_minutes` (15) is in `COMMAND_DEFAULTS`.
+
+### Decisions beyond the design, part B (all reversible)
+
+- One release: part B ships in v0.5.23 with part A, not as v0.5.24 (as instructed).
+- **Count weight is 0 for any window holding latent time**, not the design's
+  `1 − latent_fraction`. With the fraction, mixed windows (independent minutes beside latent
+  ones, rejected outright in the skipped replay) raised confidence +3.3 points in the
+  simulation; the strict rule keeps the no-inflation test exact for counts.
+- **Latent time also neither ages a count** (forgetting^0), so a latent-only window is a
+  no-op for counts, as in the skipped replay.
+- **Independent covariance for confidence** (above): needed because the covariance term of
+  `confidence` otherwise rose up to +4.7 points with `learning_drift` 1.
+- **Learning label delay** (45 min, only while some candidate is ready): without it, a
+  long ambiguous stretch never completes a window, since the newest blocks are always still
+  pending; the simulation filled 40% more time with labels but changed no fit.
+- `latent_action` cannot label the present (the response is not in yet): it marks the span
+  `source: latent` and the backfill labels it; it returns None while not ready (skip).
+- The estimate subtracts the block's known part (`s·k`) and scales by the missing share f,
+  so blocks that are partly labelled (a command turning ambiguous mid-block) are estimated
+  too; small f gives a large se and no label.
+- Anchors are gathered for every system with `latent_effort` on (not only slow ones), so a
+  unit that turns slow is calibrated already; estimates only for candidates.
+- The response delay is chosen per system from the anchor fit (one δ per system), not per
+  block.
+- Others' effects come from the learning rows' blended effects; their uncertainty is
+  absorbed by the anchor offsets and noise. The passive term uses the learning row too.
+- Anchor and readiness constants (12/12 blocks, 3 rooms, 7 days, 0.25/0.75, se 0.2, χ² 3,
+  forgetting 0.998) are `LatentEffort` arguments, not configuration.
+
 ### Tests
 
 `tests/test_slow_reporter.py` simulates three days: six rooms, a latched thermostat
@@ -1871,3 +1974,20 @@ mean delivered per commanded hour; a lockout suspends labels. `tests/test_comman
 covers the pure pieces and the coordinator: a clear off beating a stale `heating`,
 fresh report then skip, a mode switch kept with its start delay, the repair issue raised and
 cleared, hand control, persistence and the options round-trip.
+
+Part B: the same simulation with a modulating unit (on targets own + 0.6–1.0 °C at 0.1 °C,
+mostly ambiguous; a 2-h clear warm-up after the daily off span supplies on anchors), six
+days. With latent labels skipped, coverage is 30.0%; applied, 70.3% (drift 0) / 70.2%
+(drift 1): +40 points. Confidence: 8.64% skipped vs 8.66% applied (drift 0; per room
+within 0.13 points), 2.234% vs 2.233% (drift 1; per room within 0.10 points); counts are
+equal. Effects with latent labels are 1.00–1.02 (drift 0) and 0.98–1.01 (drift 1) of the
+per-commanded-hour truth. Of 252 decisive latent blocks, 3 disagree with the plant's
+majority run state in the block (1.2%; drift 1: 2 of 251). The estimator is ready from day 2.75. With window advance the binary command
+simulation is unchanged to ±0.001 (1.02–1.03 of truth, coverage 99.8%, off span 100%); the
+pinned HEAD path learns 0.28 (was 0.27) and keeps 78% of off-span windows (was 77%). `tests/test_latent_effort.py`: window advance
+and backfill, `effort_span`, count weights and the independent covariance, the label delay,
+v0.5.22 rows loading; on a synthetic six-room house, on/off recovery after anchors, refusal
+under 12 anchors, a one-room 1 °C/h spike rejected by χ², û 1 ± 0.15 on held-out known
+blocks, a second unlabelled system blocking; and the coordinator: a backfilled heating
+span (`source: latent`, coverage, delay 45, persistence), the option off, and a v0.5.22
+store loading.

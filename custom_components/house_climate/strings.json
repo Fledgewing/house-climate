@@ -39,7 +39,8 @@
           "report_trust": "Reported action trust",
           "report_timestamp_sensor": "Report timestamp sensor (optional)",
           "report_fresh_minutes": "Fresh report window (minutes)",
-          "command_effort": "Learn from clear commands"
+          "command_effort": "Learn from clear commands",
+          "latent_effort": "Learn from the rooms' response"
         },
         "data_description": {
           "run_sensor": "A local sensor at the equipment that shows whether this unit is really running: a binary sensor (on = running) or a power/current sensor. When set, it replaces the device's reported heating/cooling action for learning; the direction comes from the device's heat or cool mode (in heat/cool auto, from the House's selected direction). If it is unavailable or has not reported for longer than the sensor stale after setting, that unit's intervals are not learned from. Leave empty to use the device's reported action.",
@@ -52,7 +53,8 @@
           "report_trust": "How far to trust this unit's reported heating/cooling action for learning. auto (default) measures how often the device really reports: a median gap above three control intervals (or fewer than six measured gaps) makes it a slow reporter. A slow reporter's action is used only while its report is fresh; otherwise learning uses the command House Climate sent (clearly on or clearly off, with start and stop delays), and skips the time when neither is clear. fresh always trusts the report (today's behaviour); slow always treats it as slow.",
           "report_timestamp_sensor": "A sensor whose state is the time of this device's last real data fetch from its cloud (for example a 'last updated' timestamp sensor from the device's integration). When set, it decides report freshness and the auto cadence, because a command echo can rewrite the climate entity without a new fetch. Leave empty to use the climate entity's own last report time.",
           "report_fresh_minutes": "A slow reporter's action counts as fact for this many minutes after its report time. Default 5.",
-          "command_effort": "For a slow reporter (or while local run sensors/duct probes are unavailable), learn from the command House Climate sent when it is clearly on or off. A report that keeps contradicting the commands (over 30% of recent checks) suspends this and raises a repair issue. Default on."
+          "command_effort": "For a slow reporter (or while local run sensors/duct probes are unavailable), learn from the command House Climate sent when it is clearly on or off. A report that keeps contradicting the commands (over 30% of recent checks) suspends this and raises a repair issue. Default on.",
+          "latent_effort": "When neither a clear command nor a fresh report says whether this unit ran, infer it afterwards from how the rooms' temperatures moved, calibrated only on times whose effort was known. Only clear on/off answers are used, about 45 minutes late, and they never raise learning confidence. Starts once 12 known-on and 12 known-off 15-minute blocks have been seen. Default on."
         }
       },
       "tunables": {
@@ -193,7 +195,8 @@
           "report_trust": "Reported action trust",
           "report_timestamp_sensor": "Report timestamp sensor (optional)",
           "report_fresh_minutes": "Fresh report window (minutes)",
-          "command_effort": "Learn from clear commands"
+          "command_effort": "Learn from clear commands",
+          "latent_effort": "Learn from the rooms' response"
         },
         "data_description": {
           "run_sensor": "A local sensor at the equipment that shows whether this unit is really running: a binary sensor (on = running) or a power/current sensor. When set, it replaces the device's reported heating/cooling action for learning; the direction comes from the device's heat or cool mode (in heat/cool auto, from the House's selected direction). If it is unavailable or has not reported for longer than the sensor stale after setting, that unit's intervals are not learned from. Leave empty to use the device's reported action.",
@@ -206,7 +209,8 @@
           "report_trust": "How far to trust this unit's reported heating/cooling action for learning. auto (default) measures how often the device really reports: a median gap above three control intervals (or fewer than six measured gaps) makes it a slow reporter. A slow reporter's action is used only while its report is fresh; otherwise learning uses the command House Climate sent (clearly on or clearly off, with start and stop delays), and skips the time when neither is clear. fresh always trusts the report (today's behaviour); slow always treats it as slow.",
           "report_timestamp_sensor": "A sensor whose state is the time of this device's last real data fetch from its cloud (for example a 'last updated' timestamp sensor from the device's integration). When set, it decides report freshness and the auto cadence, because a command echo can rewrite the climate entity without a new fetch. Leave empty to use the climate entity's own last report time.",
           "report_fresh_minutes": "A slow reporter's action counts as fact for this many minutes after its report time. Default 5.",
-          "command_effort": "For a slow reporter (or while local run sensors/duct probes are unavailable), learn from the command House Climate sent when it is clearly on or off. A report that keeps contradicting the commands (over 30% of recent checks) suspends this and raises a repair issue. Default on."
+          "command_effort": "For a slow reporter (or while local run sensors/duct probes are unavailable), learn from the command House Climate sent when it is clearly on or off. A report that keeps contradicting the commands (over 30% of recent checks) suspends this and raises a repair issue. Default on.",
+          "latent_effort": "When neither a clear command nor a fresh report says whether this unit ran, infer it afterwards from how the rooms' temperatures moved, calibrated only on times whose effort was known. Only clear on/off answers are used, about 45 minutes late, and they never raise learning confidence. Starts once 12 known-on and 12 known-off 15-minute blocks have been seen. Default on."
         }
       },
       "tunables": {

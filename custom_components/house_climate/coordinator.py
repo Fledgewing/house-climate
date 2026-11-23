@@ -33,6 +33,7 @@ from .const import (
 from .controller import ControlState, Device, Reading, control
 from .fans import FanLearning, quiet_modes
 from .filtering import SensorFilter
+from .latent import DELAYS, LatentEffort, room_terms
 from .learning import (
     CommandTransitions,
     EffortTracker,
@@ -83,13 +84,14 @@ class HouseCoordinator(DataUpdateCoordinator):
         self.reporting = Reporting()
         self.not_reporting = {}
         self.history_seeded = False
+        self.latent = LatentEffort(
+            block_minutes=self.command_setting("latent_block_minutes")
+        )
         self.filters = {
             m["entity_id"]: SensorFilter(
                 self.config.get("filter_minutes", 15),
                 self.config.get("max_rate", 0.5),
-                history_minutes=self.config.get("learning_window_minutes", 60)
-                + self.config.get("learning_average_minutes", 10)
-                + 5,
+                history_minutes=self.filter_history_minutes,
             )
             for m in self.config["sensors"]
         }
@@ -114,6 +116,19 @@ class HouseCoordinator(DataUpdateCoordinator):
 
     def command_setting(self, key):
         return self.config.get(key, COMMAND_DEFAULTS[key])
+
+    @property
+    def latent_delay_minutes(self):
+        """How late a latent label arrives: one block plus the longest delay."""
+        return self.command_setting("latent_block_minutes") + max(DELAYS)
+
+    @property
+    def filter_history_minutes(self):
+        """Room history for averaged windows, including a latent label delay."""
+        window = self.config.get("learning_window_minutes", 60)
+        average = self.config.get("learning_average_minutes", 10)
+        delay = self.latent_delay_minutes if window and average else 0
+        return window + average + delay + 5
 
     @staticmethod
     def report_setting(system, key):
@@ -289,14 +304,16 @@ class HouseCoordinator(DataUpdateCoordinator):
             self.report_marks = {
                 key: dict(value) for key, value in saved.get("report_marks", {}).items()
             }
+            self.latent = LatentEffort(
+                saved.get("latent"),
+                block_minutes=self.command_setting("latent_block_minutes"),
+            )
             for key in self.filters:
                 self.filters[key] = SensorFilter(
                     self.config.get("filter_minutes", 15),
                     self.config.get("max_rate", 0.5),
                     saved.get("filters", {}).get(key),
-                    history_minutes=self.config.get("learning_window_minutes", 60)
-                    + self.config.get("learning_average_minutes", 10)
-                    + 5,
+                    history_minutes=self.filter_history_minutes,
                 )
             if saved.get("learning"):
                 self.learning = Learning.from_dict(
@@ -669,14 +686,33 @@ class HouseCoordinator(DataUpdateCoordinator):
             return None, info
         return value, info
 
-    def latent_action(self, system, now):
-        """Latent effort from the rooms' response (v0.5.24 seam): not built yet.
+    def latent_candidate(self, system):
+        """Whether latent effort may label this system's unlabelled spans.
 
-        Ranks after a clear command and a fresh report, before skipping. It
-        must return None (skip) unless the latent estimate is ready and
-        decisive, and its spans must add no learning counts.
+        A slow reporter without local sensors, or a system whose local run
+        sensor/duct probes are untrusted right now (never the cloud action).
         """
-        return None
+        if not self.report_setting(system, "latent_effort"):
+            return False
+        key = system["entity_id"]
+        if system.get("run_sensor") or system.get("supply_sensor"):
+            info = self.action_sources.get(key, {})
+            return bool(info.get("problem") or info.get("local_problem"))
+        return bool(self.reports.get(key, {}).get("slow"))
+
+    def latent_action(self, system, now):
+        """Latent effort (rank 5): the estimate covering an unlabelled span.
+
+        A block's room response is complete only a response delay after the
+        block, so the present span always stays unlabelled (action None) and
+        `LatentEffort` backfills it later with a decisive label (adds no
+        learning counts). Returns the estimator's diagnostics when it is ready
+        for this system, else None (skip).
+        """
+        if not self.report_setting(system, "latent_effort"):
+            return None
+        status = self.latent.diagnostics(system["entity_id"])
+        return status if status["ready"] else None
 
     def learning_action(self, system, device_action, mode, now, available=True):
         """Action for effort/learning.
@@ -717,9 +753,12 @@ class HouseCoordinator(DataUpdateCoordinator):
             elif report["report_fresh"]:
                 info.update(source="report", action=device_action)
             elif (latent := self.latent_action(system, now)) is not None:
-                info.update(source="latent", action=latent)
+                # Unlabelled now; LatentEffort backfills the span later.
+                info.update(source="latent", action=None, latent=latent)
             else:
                 info.update(source=None, action=None)
+                if self.report_setting(system, "latent_effort"):
+                    info["latent"] = self.latent.diagnostics(key)
             self.add_check_info(key, info)
             self.action_sources[key] = info
             return info["action"]
@@ -777,12 +816,8 @@ class HouseCoordinator(DataUpdateCoordinator):
                 )
                 self.add_check_info(key, info)
         if info["problem"] and (latent := self.latent_action(system, now)) is not None:
-            info.update(
-                source="latent",
-                action=latent,
-                local_problem=info["problem"],
-                problem=None,
-            )
+            # Unlabelled now; LatentEffort backfills the span later.
+            info.update(source="latent", action=None, latent=latent)
         self.action_sources[key] = info
         return info["action"]
 
@@ -791,13 +826,10 @@ class HouseCoordinator(DataUpdateCoordinator):
         learning = self.learning
         if not learning.window_minutes:
             return True
-        width = learning.window_minutes * 60
         if learning.average_minutes:
-            width += learning.average_minutes * 60
-            return any(
-                w["end"] - w.get("start", w["end"]) >= width
-                for w in learning.windows.values()
-            )
+            # A window advances over a missing effort (v0.5.23) but is accepted
+            # only when every span in it is labelled.
+            return any(w.get("accepted") for w in learning.windows.values())
         return any(
             sum(s[2] for s in w.get("segments", [])) * learning.interval_minutes * 60
             >= learning.window_minutes * 60
@@ -820,20 +852,93 @@ class HouseCoordinator(DataUpdateCoordinator):
             ]
             spans.append((now - duration, now, source, accepted))
             self.coverage[key] = spans
-            total = sum(b - a for a, b, _, _ in spans)
-            shares = {}
-            for a, b, name, _ in spans:
-                shares[name] = shares.get(name, 0) + (b - a) / total
-            info = self.action_sources.get(key)
-            if info is not None and (
-                info.get("slow") is not None or info.get("source") == "command"
+            self.coverage_info(key)
+
+    def coverage_info(self, key):
+        spans = self.coverage.get(key, [])
+        total = sum(b - a for a, b, _, _ in spans)
+        if total <= 0:
+            return
+        shares = {}
+        for a, b, name, _ in spans:
+            shares[name] = shares.get(name, 0) + (b - a) / total
+        info = self.action_sources.get(key)
+        if info is not None and (
+            info.get("slow") is not None
+            or info.get("source") == "command"
+            or "latent" in shares
+        ):
+            info["coverage_24h"] = {
+                **{name: round(v, 3) for name, v in shares.items()},
+                "windows": round(sum(b - a for a, b, _, ok in spans if ok) / total, 3),
+            }
+
+    def relabel_coverage(self, key, start, end):
+        """A latent backfill turns skipped time in [start, end] into latent."""
+        spans = []
+        for a, b, name, ok in self.coverage.get(key, []):
+            lo, hi = max(a, start), min(b, end)
+            if name != "skipped" or hi <= lo:
+                spans.append((a, b, name, ok))
+                continue
+            if a < lo:
+                spans.append((a, lo, name, ok))
+            spans.append((lo, hi, "latent", ok))
+            if hi < b:
+                spans.append((hi, b, name, ok))
+        self.coverage[key] = spans
+        self.coverage_info(key)
+
+    def latent_step(self, now, clean_values, outdoor, solar, sources, devices):
+        """Feed the rooms' response to LatentEffort and backfill its labels.
+
+        Rooms that are disturbed, temporary, not reporting or filter-blocked
+        are left out. While a latent estimate is ready, averaged learning
+        windows are evaluated `latent_delay_minutes` late so its labels can
+        complete them.
+        """
+        span = self.config.get("learning_average_minutes", 10) * 60
+        rooms = {}
+        for member in self.config["sensors"]:
+            key = member["entity_id"]
+            if (
+                key not in clean_values
+                or key in self.learning.disturbed
+                or self.learning.regimes.get(key, {}).get("temporary")
+                or self.filters[key].blocked
             ):
-                info["coverage_24h"] = {
-                    **{name: round(v, 3) for name, v in shares.items()},
-                    "windows": round(
-                        sum(b - a for a, b, _, ok in spans if ok) / total, 3
-                    ),
-                }
+                continue
+            value = self.filters[key].mean(now - span, now) if span else None
+            value = clean_values[key] if value is None else value
+            terms = room_terms(self.learning, key, value, outdoor, solar, sources)
+            if terms:
+                rooms[key] = (value, *terms)
+        self.latent.observe(now, rooms)
+        candidates = {}
+        for system in self.active_systems(include_inactive=True):
+            key = system["entity_id"]
+            if not self.report_setting(system, "latent_effort"):
+                continue
+            mode = devices[key].mode if key in devices else None
+            if mode in ("heat_cool", "auto"):
+                mode = self.state.active_mode
+            candidates[key] = {
+                "direction": {"heat": 1, "cool": -1}.get(mode),
+                "estimate": self.latent_candidate(system),
+            }
+        for key, start, end, value in self.latent.process(
+            now,
+            self.learning.systems,
+            candidates,
+            lambda key, a, b: self.learning.effort_span("system", key, a, b),
+        ):
+            if self.learning.backfill_effort(key, start, end, value):
+                self.relabel_coverage(key, start, end)
+        ready = any(
+            options["estimate"] and self.latent.diagnostics(key)["ready"]
+            for key, options in candidates.items()
+        )
+        self.learning.label_delay_minutes = self.latent_delay_minutes if ready else 0
 
     def command_labelled(self, key):
         """Whether this system's effort comes (or can come) from its commands.
@@ -1003,9 +1108,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                         "jitter": sensor_filter.jitter,
                         "changes": sensor_filter.changes,
                     },
-                    history_minutes=self.config.get("learning_window_minutes", 60)
-                    + self.config.get("learning_average_minutes", 10)
-                    + 5,
+                    history_minutes=self.filter_history_minutes,
                 )
         sensor_filter.observe(value, now)
         return sensor_filter
@@ -1281,9 +1384,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                     SensorFilter(
                         self.config.get("filter_minutes", 15),
                         self.config.get("max_rate", 0.5),
-                        history_minutes=self.config.get("learning_window_minutes", 60)
-                        + self.config.get("learning_average_minutes", 10)
-                        + 5,
+                        history_minutes=self.filter_history_minutes,
                     ),
                 )
                 if (
@@ -1503,6 +1604,15 @@ class HouseCoordinator(DataUpdateCoordinator):
                     (learning_values, outdoor, solar) if self.learning_enabled else None
                 )
                 self.record_coverage(efforts, now.timestamp(), duration)
+                if self.learning_enabled and outdoor is not None:
+                    self.latent_step(
+                        now.timestamp(),
+                        clean_values,
+                        outdoor,
+                        solar,
+                        source_fractions,
+                        devices,
+                    )
                 for sensor_filter in self.filters.values():
                     sensor_filter.finish_interval()
             for sensor, state in self.learning.regimes.items():
@@ -1811,6 +1921,7 @@ class HouseCoordinator(DataUpdateCoordinator):
                     "reporting": self.reporting.to_dict(),
                     "command_settings": self.command_settings,
                     "report_marks": self.report_marks,
+                    "latent": self.latent.to_dict(),
                     "filters": {key: f.to_dict() for key, f in self.filters.items()},
                 }
             )

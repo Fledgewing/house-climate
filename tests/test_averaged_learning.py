@@ -54,7 +54,7 @@ def test_regressors_shift_by_half_average_span():
                 sensor_filters={"room": f},
             )
     result = model.averaged_window("room", f, 80 * 60, 80 * 60, 20, 20)
-    x, _, activity, _ = result
+    x, _, activity, _, _ = result
     # Physical interval [15,75] rather than the unaligned [20,80].
     assert activity == pytest.approx([46, 138])
     assert x[0] == pytest.approx(26)
