@@ -487,6 +487,7 @@ class HouseSteps:
             ("stale_after", 1, 10080, 1),
             ("frozen_after", 1, 168, 0.5),
             ("deadband", 0.1, 10, 0.1),
+            ("coast_margin", 0, 10, 0.1),
             ("minimum_dwell", 0, 1440, 1),
             ("offset_clamp", 0, 10, 0.5),
             ("max_offset_change", 0.5, 5, 0.5),

@@ -1055,6 +1055,46 @@ def allocate(
     return dict(zip(systems, (direction * u for u in efforts))), predicted_mean
 
 
+def outdoor_vetoed(config, mode, outdoor):
+    """Whether the outdoor temperature rules out `mode` (cool too cold, heat too warm)."""
+    return outdoor is not None and (
+        (mode == "cool" and outdoor < config.get("cool_outdoor_min", 10))
+        or (mode == "heat" and outdoor > config.get("heat_outdoor_max", 24))
+    )
+
+
+def coast_reason(config, mode, wanted, house, setpoint, outdoor):
+    """Why heat_cool keeps `mode` rather than switching to the opposite `wanted`.
+
+    v0.5.25: an overshoot past the dead band used to switch heat to cool (or,
+    with cool vetoed, to off), and the house then drifted through the whole
+    band before heat came back. Instead the current mode stays (its allocation
+    idles the units above the setpoint) while:
+    - the outdoor temperature vetoes `wanted`, or
+    - the outdoor air pulls the house back towards the setpoint on its own and
+      the house is less than `deadband + coast_margin` past the setpoint.
+    Returns the note to explain it, or None to allow the switch. Unknown
+    outdoor temperature keeps the old behaviour.
+    """
+    if outdoor is None or wanted not in ("heat", "cool") or mode == wanted:
+        return None
+    if outdoor_vetoed(config, mode, outdoor):
+        return None
+    if outdoor_vetoed(config, wanted, outdoor):
+        return f"Coasting in {mode}: outdoor {outdoor:.1f} °C rules out {wanted}."
+    # +1 when heat is wanted (house below the band), -1 for cool.
+    direction = 1 if wanted == "heat" else -1
+    passive = direction * (outdoor - house) > 0
+    past = direction * (setpoint - house)
+    limit = config.get("deadband", 1) + config.get("coast_margin", 1)
+    if passive and past < limit:
+        return (
+            f"Coasting in {mode}: outdoor {outdoor:.1f} °C brings the house back; "
+            f"{wanted} only beyond {limit:g} °C past the setpoint."
+        )
+    return None
+
+
 def control(
     config,
     state,
@@ -1112,6 +1152,13 @@ def control(
                 if house > state.setpoint + deadband
                 else mode
             )
+            if wanted != mode and mode in ("heat", "cool"):
+                coast = coast_reason(
+                    config, mode, wanted, house, state.setpoint, outdoor
+                )
+                if coast:
+                    wanted = mode
+                    notes.append(coast)
             if wanted != mode:
                 if (
                     state.active_mode == "off"
@@ -1120,10 +1167,7 @@ def control(
                     mode = wanted
                 else:
                     notes.append("Minimum mode dwell retained the current mode.")
-    if outdoor is not None and (
-        (mode == "cool" and outdoor < config.get("cool_outdoor_min", 10))
-        or (mode == "heat" and outdoor > config.get("heat_outdoor_max", 24))
-    ):
+    if outdoor_vetoed(config, mode, outdoor):
         mode = "off"
         notes.append("Outdoor temperature vetoed operation.")
     for system in config["systems"]:

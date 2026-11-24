@@ -24,7 +24,12 @@ class Reporting:
         self.actions = {}
         self.observed_at = None
         self.cadence = ReportCadence(saved.get("cadence"))
-        self.checks = CommandChecks(saved.get("checks"))
+        # v0.5.25: checks recorded before rejected commands were recognised
+        # counted a command the unit never took as a contradiction; start over.
+        self.checks = CommandChecks(
+            saved.get("checks") if saved.get("checks_version") == 2 else None,
+            saved.get("rejected"),
+        )
 
     def activity(self, now, actions, window):
         if self.observed_at is not None and any(self.actions.values()):
@@ -70,6 +75,8 @@ class Reporting:
             "intervals": self.intervals,
             "cadence": self.cadence.to_dict(),
             "checks": self.checks.to_dict(),
+            "checks_version": 2,
+            "rejected": self.checks.rejected,
         }
 
 
@@ -122,10 +129,16 @@ class CommandChecks:
 
     Each distinct fresh report is one check. Above the suspend rate over the
     last checks (with a minimum count) command labels are suspended until the
-    rate falls below the clear rate.
+    rate falls below the clear rate, or (v0.5.25) the last `command_clear_run`
+    checks all agree; a clear by that run keeps only the run, so one later
+    contradiction does not suspend again at once.
+
+    `rejected` (v0.5.25) holds, per system and commanded mode, the report time
+    at which a fresh report showed a command in that mode was not taken (the
+    unit kept another setting). Cleared when a later report shows one taken.
     """
 
-    def __init__(self, saved=None):
+    def __init__(self, saved=None, rejected=None):
         self.systems = {
             key: {
                 "results": list(value.get("results", [])),
@@ -133,6 +146,11 @@ class CommandChecks:
                 "checked": value.get("checked"),
             }
             for key, value in (saved or {}).items()
+        }
+        # The state before each system's last check, for `retract` (not saved).
+        self.undo = {}
+        self.rejected = {
+            key: dict(modes) for key, modes in (rejected or {}).items() if modes
         }
 
     def check(self, key, reported, contradicted, settings=None):
@@ -143,18 +161,54 @@ class CommandChecks:
         )
         if state["checked"] is not None and reported <= state["checked"]:
             return
+        self.undo[key] = {
+            "reported": reported,
+            "checked": state["checked"],
+            "results": list(state["results"]),
+            "suspended": state["suspended"],
+        }
         state["checked"] = reported
         state["results"] = [*state["results"], bool(contradicted)][
             -settings["command_checks"] :
         ]
         rate = self.rate(key)
-        if (
+        run = settings["command_clear_run"]
+        clean_run = len(state["results"]) >= run and not any(state["results"][-run:])
+        if state["suspended"] and clean_run:
+            state["suspended"] = False
+            state["results"] = state["results"][-run:]
+        elif (
             len(state["results"]) >= settings["command_min_checks"]
             and rate > settings["command_suspend_rate"]
         ):
             state["suspended"] = True
         elif rate < settings["command_clear_rate"]:
             state["suspended"] = False
+
+    def retract(self, key, reported):
+        """Undo the check of the report at `reported` if it was the last one
+        (a later look at the same report showed the command was refused)."""
+        undo = self.undo.get(key)
+        if undo is None or undo["reported"] != reported:
+            return
+        state = self.systems[key]
+        state["checked"] = undo["checked"]
+        state["results"] = undo["results"]
+        state["suspended"] = undo["suspended"]
+        del self.undo[key]
+
+    def verdict(self, key, mode, reported, taken):
+        """A fresh report at `reported` showed a command in `mode` taken or not."""
+        modes = self.rejected.setdefault(key, {})
+        if taken:
+            modes.pop(mode, None)
+        else:
+            modes[mode] = reported
+        if not modes:
+            self.rejected.pop(key, None)
+
+    def is_rejected(self, key, mode):
+        return mode in self.rejected.get(key, {})
 
     def rate(self, key):
         results = self.systems.get(key, {}).get("results", [])
@@ -169,6 +223,11 @@ class CommandChecks:
             "checks": len(results),
             "rate": round(self.rate(key), 3),
             "suspended": self.suspended(key),
+            **(
+                {"rejected_modes": sorted(self.rejected[key])}
+                if self.rejected.get(key)
+                else {}
+            ),
         }
 
     def to_dict(self):

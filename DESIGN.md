@@ -2205,3 +2205,43 @@ after the entity-first fetch estimates 24.0 ± 0.1 (re-keyed mark). `tests/
 test_attribute_size.py`: the 8-room × 2-system × 4-source house with full-precision
 rows and 3 saved models per row stays under 12 KB for all three entities; exposed row
 fields and saved-model fields are exact; the model's diagnostics keep the rest.
+
+## v0.5.25: refused commands, faster label recovery, heat/cool coasting
+
+Live 2026-11-23/24: at 16:44 the house reached 23.1 °C (setpoint 22, dead band 1) with the
+Bryant's outdoor reading at 10.6 °C, so heat_cool switched it to cool at 19–20.5 °C. The
+entity echoed each command at once (optimistic write), but every fetch showed the unit idle
+with a 25 °C setting: it never took them. The on labels drawn from those commands were
+counted as contradictions (4 that evening), the rate passed 0.3 at 20:20 and command labels
+were suspended; with about one fresh report an hour and a clear rate under 0.1 over 20
+checks, recovery would have taken a day or more. The house drifted to 21.0 °C by midnight;
+at 06:07 (outdoor 9.4 °C, cool vetoed) the same overshoot switched the unit off for 5.5 h
+and the house again fell to 21.0 °C. The off/cool spells (4–12 h a day) predate v0.5.23.
+
+- **Refused commands** (`coordinator.command_action`, `CommandChecks.verdict/is_rejected`):
+  a fresh report made at least `command_confirm_seconds` after the command is the unit's
+  verdict on it: taken if the entity shows the command's mode and target (echo tolerance)
+  with no outside change since, else refused. A refused report is not cross-checked, and
+  undoes the check an earlier pass made of the same report (`retract`: the timestamp sensor
+  can update before the climate entity's setting). For a slow unit a refused mode stays
+  untrusted (commands in it are unconfirmed, so unlabelled) until a later report shows a
+  command in that mode taken. Persisted under `reporting.rejected`; shown as
+  `rejected_modes` in the contradictions diagnostics.
+- **Faster recovery** (`CommandChecks.check`): a suspension also clears after
+  `command_clear_run` (4) agreeing checks in a row, keeping only that run, so one later
+  contradiction cannot re-suspend before `command_min_checks`. `reporting.checks_version`
+  2: checks stored before v0.5.25 are dropped once (they counted refused commands).
+  In the modulating-unit simulation (genuine contradiction rate 0.4) command coverage
+  rises from 0.30 to 0.67 and the learned effects stay within 2 % of truth (7 % with
+  latent labels); latent labels still never raise confidence (windows mixing latent and
+  command time now lower it slightly, so those test assertions became one-sided).
+- **Coasting** (`controller.coast_reason`, `outdoor_vetoed`): in heat_cool a switch from
+  heat to cool (or back) waits while the outdoor temperature vetoes the wanted mode, or
+  the outdoor air pulls the house towards the setpoint (outdoor below the house for a
+  wanted cool, above it for a wanted heat) and the house is less than `deadband +
+  coast_margin` (1 + 1 °C) past the setpoint. The current mode's allocation idles the
+  units meanwhile. A vetoed current mode still goes off; unknown outdoor temperature and
+  `coast_margin` 0 keep the old switch. `tests/test_coasting.py` covers the 11-23 evening
+  and morning cases, real overheating (24.1 °C → cool), warm outdoors, the summer mirror
+  and the veto of the current mode.
+

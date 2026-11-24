@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.24 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.25 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 The setpoint is the center of the smallest predicted temperature band across the counted rooms.
 The default `objective: "band"` minimizes the largest priority-scaled room deviation from it,
@@ -42,7 +42,20 @@ with reachability anti-windup and a ±1 °C bias limit. The fan learner follows 
 unless `fan_reward_lambda` is explicitly set; this remains independent of objective selection.
 Legacy PI gains, house offset clamps and slew settings remain readable and unused.
 
-Automatic mode retains its 1 °C deadband and 60-minute heat/cool dwell. Cooling is vetoed below 10 °C outdoors; heating above 24 °C. Explicit heat/cool requests take effect immediately, subject to the outdoor veto. Starts and stops obey cycling protection on scheduled and immediate passes. Explicit House off and outdoor vetoes still stop operation.
+Automatic mode retains its 1 °C deadband and 60-minute heat/cool dwell. Cooling is vetoed below 10 °C outdoors; heating above 24 °C.
+Since 0.5.25 it **coasts**: past the dead band it keeps its current mode (the units idle above
+the setpoint) instead of switching heat to cool or off, while the outdoor temperature rules out
+the other mode, or the outdoor air brings the house back on its own and the house is less
+than dead band + **coast margin** (`coast_margin`, 1 °C) past the setpoint. Heat then resumes
+as soon as the house drops below the setpoint rather than a full dead band below it. Unknown
+outdoor temperature, or a current mode the outdoor temperature itself rules out, keeps the old
+switch; a coast margin of 0 restores it. Explicit heat/cool requests take effect immediately, subject to the outdoor veto. Starts and stops obey cycling protection on scheduled and immediate passes. Explicit House off and outdoor vetoes still stop operation.
+
+Version 0.5.25 does not trust a command a slow cloud-read unit refused: when a report made
+after a command shows the unit kept another setting, that report is not counted against the
+command labels, and commands in that mode stay unlabelled until a later report shows one taken.
+A suspension of command labels now also clears after **4 agreeing reports in a row**
+(`command_clear_run`), and the cross-check record kept before 0.5.25 is started over once.
 
 Version 0.5.24 keeps a slow cloud-read unit's clear commands labelled between its reports
 (learning windows completed again) and stops it learning an inflated thermostat hysteresis;

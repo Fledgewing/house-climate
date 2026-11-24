@@ -194,12 +194,67 @@ def test_command_checks_suspend_and_clear():
     checks.check(CLOUD, 9, False)  # the same report counts once
     assert checks.suspended(CLOUD)
     assert checks.status(CLOUD) == {"checks": 10, "rate": 1.0, "suspended": True}
-    for t in range(10, 28):
+    for t in range(10, 13):
         checks.check(CLOUD, t, False)
-    assert checks.suspended(CLOUD)  # 2 of 20 is not below 10%
-    checks.check(CLOUD, 28, False)
+    assert checks.suspended(CLOUD)
+    # v0.5.25: four agreeing checks in a row clear it (a slow unit gives
+    # about one an hour; 2 of 20 under 10% took a day) and keep only the run.
+    checks.check(CLOUD, 13, False)
+    assert not checks.suspended(CLOUD)
+    assert checks.status(CLOUD) == {"checks": 4, "rate": 0.0, "suspended": False}
+    checks.check(CLOUD, 14, True)  # one later contradiction does not re-suspend
     assert not checks.suspended(CLOUD)
     assert CommandChecks(checks.to_dict()).status(CLOUD) == checks.status(CLOUD)
+
+
+def test_command_checks_clear_run_is_a_setting():
+    checks = CommandChecks()
+    for t in range(10):
+        checks.check(CLOUD, t, True)
+    for t in range(10, 14):
+        checks.check(CLOUD, t, False, {"command_clear_run": 6})
+    assert checks.suspended(CLOUD)
+    for t in range(14, 16):
+        checks.check(CLOUD, t, False, {"command_clear_run": 6})
+    assert not checks.suspended(CLOUD)
+
+
+def test_refused_modes_persist_and_clear():
+    checks = CommandChecks()
+    checks.verdict(CLOUD, "cool", 100.0, False)
+    assert checks.is_rejected(CLOUD, "cool")
+    assert not checks.is_rejected(CLOUD, "heat")
+    assert checks.status(CLOUD)["rejected_modes"] == ["cool"]
+    restored = Reporting(Reporting({"checks": {}, "checks_version": 2}).to_dict())
+    assert restored.checks.rejected == {}
+    reporting = Reporting()
+    reporting.checks = checks
+    assert Reporting(reporting.to_dict()).checks.is_rejected(CLOUD, "cool")
+    checks.verdict(CLOUD, "cool", 200.0, True)
+    assert not checks.is_rejected(CLOUD, "cool")
+    assert "rejected_modes" not in checks.status(CLOUD)
+
+
+def test_retract_undoes_only_the_last_check():
+    checks = CommandChecks()
+    for t in range(10):
+        checks.check(CLOUD, t, t < 3)
+    checks.check(CLOUD, 10, True)
+    assert checks.status(CLOUD)["checks"] == 11
+    checks.retract(CLOUD, 9)  # not the last check: ignored
+    assert checks.status(CLOUD)["checks"] == 11
+    checks.retract(CLOUD, 10)
+    assert checks.status(CLOUD) == {"checks": 10, "rate": 0.3, "suspended": False}
+    checks.check(CLOUD, 10, False)  # the same report may be checked again
+    assert checks.status(CLOUD)["checks"] == 11
+
+
+def test_checks_from_before_v0525_start_over():
+    """Checks stored before refused commands were recognised are dropped once."""
+    old = {CLOUD: {"results": [True] * 9 + [False] * 11, "suspended": True}}
+    assert Reporting({"checks": old}).checks.systems == {}
+    kept = Reporting({"checks": old, "checks_version": 2}).checks
+    assert kept.suspended(CLOUD)
 
 
 @pytest.fixture
@@ -528,3 +583,52 @@ async def test_fahrenheit_rounded_echo_confirms_the_command(hass, settings):
     command = c.action_sources[CLOUD]["command"]
     assert "reason" not in command
     assert command["class"] == "on"
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_refused_cool_is_not_a_contradiction_and_not_trusted(hass, settings):
+    """Live 11-23: cool commands on a 10 °C evening were echoed at once by the
+    entity, but each fetch showed the unit idle at its own 25 °C setting. The
+    on labels were counted as contradictions and suspended command labels."""
+    start = dt_util.utcnow()
+    entry, c = await setup(hass, settings, start, action="idle")
+    sent = start - timedelta(minutes=30)
+    c.command_settings[CLOUD] = {
+        "mode": "cool",
+        "target": 20.0,
+        "sent_at": sent.timestamp(),
+    }
+    # The entity's immediate (optimistic) echo of the command.
+    hass.states.async_set(
+        CLOUD,
+        "cool",
+        {"hvac_action": "idle", "temperature": 20, "current_temperature": 23},
+    )
+    when = start
+    await tick_at(c, when, "23")
+    assert c.action_sources[CLOUD]["command"]["class"] == "on"
+    checks_before = c.reporting.checks.status(CLOUD)["checks"]
+    # The next fetch: the unit kept its own setting and stayed idle.
+    when += timedelta(minutes=30)
+    await tick_at(c, when, "23", fetched=when, temperature=25)
+    assert c.reporting.checks.status(CLOUD)["checks"] == checks_before
+    assert c.reporting.checks.is_rejected(CLOUD, "cool")
+    assert c.action_sources[CLOUD]["contradictions"]["rejected_modes"] == ["cool"]
+    # The house re-sends cool; the echo alone no longer confirms it.
+    resent = when + timedelta(minutes=5)
+    c.command_settings[CLOUD] = {
+        "mode": "cool",
+        "target": 20.0,
+        "sent_at": resent.timestamp(),
+    }
+    await tick_at(c, resent + timedelta(minutes=10), "23", temperature=20)
+    command = c.action_sources[CLOUD]["command"]
+    assert command["class"] == "ambiguous"
+    assert command["reason"] == "unit refused this mode"
+    assert c.action_sources[CLOUD]["source"] != "command"
+    # A later fetch showing the command taken trusts the mode again.
+    fetched = resent + timedelta(minutes=40)
+    await tick_at(c, fetched, "22.8", fetched=fetched, hvac_action="cooling")
+    assert not c.reporting.checks.is_rejected(CLOUD, "cool")
+    assert c.action_sources[CLOUD]["command"]["class"] == "on"
+    assert not c.reporting.checks.suspended(CLOUD)

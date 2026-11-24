@@ -415,15 +415,23 @@ def test_latent_raises_coverage_without_raising_confidence(drift):
         "command", modulating=True, latent="apply", days=6, drift=drift
     )
     assert after["latent"].diagnostics(UNIT)["ready"]
-    assert after["coverage"] - before["coverage"] >= 0.30
-    assert model.confidence_percent == pytest.approx(
-        skipped.confidence_percent, abs=1.0
-    )
+    # v0.5.25: suspensions clear after 4 agreeing checks, so the reference
+    # keeps more command coverage (0.67 vs 0.30) and the gain is smaller.
+    assert after["coverage"] - before["coverage"] >= 0.20
+    # Latent labels never raise confidence (v0.5.25: with more command time
+    # mixed in, windows holding latent time can lower it slightly).
+    assert model.confidence_percent <= skipped.confidence_percent + 1.0
     for room in RATES:
-        assert 100 * model.confidence(room, UNIT) == pytest.approx(
-            100 * skipped.confidence(room, UNIT), abs=1.0
+        assert (
+            100 * model.confidence(room, UNIT)
+            <= 100 * skipped.confidence(room, UNIT) + 1.0
         ), room
-        assert model.rows[room].counts == pytest.approx(skipped.rows[room].counts)
+        # Latent time never adds counts; a window mixing latent and command
+        # time (more of them since v0.5.25's faster clearing) adds none.
+        assert all(
+            got <= ref + 1e-9
+            for got, ref in zip(model.rows[room].counts, skipped.rows[room].counts)
+        ), room
     learned = effects(model)
     for room, truth in after["truth"].items():
         assert learned[room] == pytest.approx(truth, rel=0.25), room

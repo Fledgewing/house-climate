@@ -63,6 +63,9 @@ COMMAND_DEFAULTS = {
     "command_suspend_rate": 0.3,
     "command_clear_rate": 0.1,
     "command_min_checks": 10,
+    # v0.5.25: a suspension also clears after this many agreeing checks in a
+    # row (a slow unit gives about one check an hour).
+    "command_clear_run": 4,
     # Latent effort block length (minutes); response delays are latent.DELAYS.
     "latent_block_minutes": 15,
 }
@@ -103,6 +106,9 @@ DEFAULTS = {
     "max_rate": 0.5,
     "minor_weight_share": 0.05,
     "deadband": 1.0,
+    # v0.5.25: heat_cool keeps its mode this far past the dead band (°C)
+    # while the outdoor air brings the house back on its own.
+    "coast_margin": 1.0,
     "minimum_dwell": 60,
     "offset_clamp": 3.0,
     "max_offset_change": 0.5,

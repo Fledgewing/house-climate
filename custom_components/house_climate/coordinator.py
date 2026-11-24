@@ -693,6 +693,29 @@ class HouseCoordinator(DataUpdateCoordinator):
         confirmed = not outside and (
             echoed or now - sent <= self.command_setting("command_confirm_seconds")
         )
+        # v0.5.25: a fresh report made after the command had time to land
+        # shows whether the unit took it. The entity echoes a command at once
+        # (optimistically), so for a slow unit only such a report confirms it.
+        # A mode the unit refused (e.g. cool on a cold night) is then not
+        # trusted until a later report shows a command in it taken.
+        reported_at = report["reported"]
+        landed = (
+            report["report_fresh"]
+            and reported_at is not None
+            and reported_at >= sent + self.command_setting("command_confirm_seconds")
+        )
+        taken = echoed and not outside
+        if landed:
+            self.reporting.checks.verdict(key, command["mode"], reported_at, taken)
+            if not taken:
+                # The report time can arrive before the unit's own setting, so
+                # an earlier pass may already have checked this report.
+                self.reporting.checks.retract(key, reported_at)
+        refused = report["slow"] and self.reporting.checks.is_rejected(
+            key, command["mode"]
+        )
+        if refused:
+            confirmed = False
         # Only an explicit room sensor: a sensor matched on the same device as
         # a slow reporter arrives through the same slow cloud fetch.
         sensor = system.get("own_sensor")
@@ -726,7 +749,6 @@ class HouseCoordinator(DataUpdateCoordinator):
         # The label in effect when the report was made, for the cross-check
         # (v0.5.24): independent of which entity updated first, and never a
         # change observed at or after the report time (the report's own).
-        reported_at = report["reported"]
         at_report = (
             self.command_labels.state_before(key, reported_at)
             if reported_at is not None
@@ -811,8 +833,12 @@ class HouseCoordinator(DataUpdateCoordinator):
             )
             # A report within 5 min after this command reflects the change
             # itself (an echo fetch), not the settled label.
-            if reported_at - settled_at >= 5 * 60 and not (
-                sent <= reported_at < sent + 5 * 60
+            # A report showing the command was not taken (v0.5.25) says the
+            # unit refused it, not that the label's thermostat model is wrong.
+            if (
+                reported_at - settled_at >= 5 * 60
+                and not (sent <= reported_at < sent + 5 * 60)
+                and not (landed and not taken)
             ):
                 self.reporting.checks.check(
                     key,
@@ -835,7 +861,11 @@ class HouseCoordinator(DataUpdateCoordinator):
         }
         if not confirmed:
             info["reason"] = (
-                "changed outside house control" if outside else "unconfirmed"
+                "changed outside house control"
+                if outside
+                else "unit refused this mode"
+                if refused
+                else "unconfirmed"
             )
         if transition:
             info["transition"] = transition
@@ -1144,7 +1174,7 @@ class HouseCoordinator(DataUpdateCoordinator):
 
     def add_check_info(self, key, info):
         checks = self.reporting.checks.status(key)
-        if checks["checks"]:
+        if checks["checks"] or checks.get("rejected_modes"):
             info["contradictions"] = checks
             if checks["suspended"]:
                 info["problem"] = "command_contradicted"
