@@ -14,6 +14,7 @@ from custom_components.house_climate.controller import (
     Reading,
     coast_reason,
     control,
+    return_mode,
 )
 
 
@@ -90,12 +91,61 @@ def test_summer_undershoot_coasts_in_cool(config):
     assert state.active_mode == "heat"
 
 
-def test_current_mode_vetoed_still_goes_off(config):
-    # Cool already running when the night gets cold: the veto still turns it off.
+def test_cool_on_a_cold_night_coasts_in_heat_instead_of_off(config):
+    # Cool already running when the night gets cold: heat (idle) rather than off.
     state = auto("cool")
     result = step(config, state, 22.5, 8, mode="cool")
+    assert state.active_mode == "heat"
+    assert "rules out cool" in result.explanation
+    assert "vetoed operation" not in result.explanation
+
+
+def test_cool_returns_to_heat_inside_the_dead_band(config):
+    """Live 11-24 17:40: cool at 23.2 °C (13.9 °C outdoors) would have stayed
+    until 21.0 °C; it now returns to heat below setpoint + dead band."""
+    state = auto("cool")
+    step(config, state, 23.2, 13.9, mode="cool")
+    assert state.active_mode == "cool"
+    result = step(config, state, 22.9, 13.9, now=20000, mode="cool")
+    assert state.active_mode == "heat"
+    assert "Back to heat" in result.explanation
+    # And coasts in heat from there: no flip back to cool at 23.5.
+    step(config, state, 23.5, 13.9, now=30000)
+    assert state.active_mode == "heat"
+
+
+def test_return_waits_for_the_dwell(config):
+    state = auto("cool")
+    state.last_switch = 9000
+    step(config, state, 22.5, 13.9, mode="cool")
+    assert state.active_mode == "cool"
+    step(config, state, 22.5, 13.9, now=9000 + 3600, mode="cool")
+    assert state.active_mode == "heat"
+
+
+def test_summer_heat_returns_to_cool(config):
+    state = auto("heat", setpoint=24)
+    step(config, state, 22.8, 23.5)
+    assert state.active_mode == "heat"
+    step(config, state, 23.1, 23.5, now=20000)
+    assert state.active_mode == "cool"
+
+
+def test_off_returns_to_heat_past_the_setpoint(config):
+    """Live 11-24 06:07: off at 23.1 °C until 21.0 °C; now heat below 22."""
+    state = auto("off")
+    step(config, state, 22.4, 9.4, mode="off")
     assert state.active_mode == "off"
-    assert "vetoed operation" in result.explanation
+    result = step(config, state, 21.9, 9.4, now=20000, mode="off")
+    assert state.active_mode == "heat"
+    assert "Back to heat" in result.explanation
+
+
+def test_heat_in_winter_never_returns_to_cool(config):
+    state = auto("heat")
+    for house in (21.0, 22.0, 22.9, 23.9):
+        step(config, state, house, 5)
+        assert state.active_mode == "heat"
 
 
 def test_back_below_setpoint_heats_without_waiting_for_the_band(config):
@@ -127,3 +177,27 @@ def test_coast_margin_zero_restores_band_switch(config):
     state = auto("heat")
     step(config, state, 23.1, 10.6)
     assert state.active_mode == "cool"
+
+
+@pytest.mark.parametrize(
+    ("mode", "house", "outdoor", "expected"),
+    [
+        ("cool", 23.2, 13.9, None),
+        ("cool", 22.9, 13.9, "heat"),
+        ("cool", 23.5, 8, "heat"),  # cool ruled out
+        ("cool", 22.0, 25, None),  # warm outdoors: cool is the main mode
+        ("heat", 22.5, 5, None),
+        ("heat", 23.5, 30, "cool"),  # heat ruled out
+        ("heat", 20.5, 23.5, None),  # still a dead band below the setpoint
+        ("heat", 21.5, 23.5, "cool"),
+        ("off", 22.4, 9, None),
+        ("off", 21.9, 9, "heat"),
+        ("off", 22.1, 28, "cool"),
+        ("off", 23.0, 9, None),
+        ("cool", 22.0, None, None),
+    ],
+)
+def test_return_mode(mode, house, outdoor, expected):
+    config = {"deadband": 1}
+    back = return_mode(config, mode, house, 22, outdoor)
+    assert (back[0] if back else None) == expected

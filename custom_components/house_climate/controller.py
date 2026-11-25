@@ -1095,6 +1095,47 @@ def coast_reason(config, mode, wanted, house, setpoint, outdoor):
     return None
 
 
+def return_mode(config, mode, house, setpoint, outdoor):
+    """The mode heat_cool returns to inside the dead band, with its note, or None.
+
+    The counterpart of `coast_reason` (v0.5.25): the mode that works against
+    the outdoor drift (heat when the outdoor air cools the house) is the main
+    one. A spell in the other mode, or off, ends as soon as the house is back
+    inside the dead band on the main mode's side (cool: below setpoint +
+    dead band; off: past the setpoint), or at once when the outdoor temperature
+    rules out the current mode, instead of drifting through the whole band
+    (live 11-23: cool from 16:44 until the house reached 21.0 °C at 00:17).
+    Unknown outdoor temperature keeps the old behaviour.
+    """
+    if outdoor is None or mode not in ("heat", "cool", "off"):
+        return None
+    deadband = config.get("deadband", 1)
+    if mode == "off":
+        # Off (e.g. after an outdoor veto): back to the main mode once the
+        # house has drifted past the setpoint the way the outdoor air pulls it.
+        main = "heat" if outdoor < house else "cool" if outdoor > house else None
+        if main is None or outdoor_vetoed(config, main, outdoor):
+            return None
+        direction = 1 if main == "heat" else -1
+        if direction * (setpoint - house) > 0:
+            return main, f"Back to {main}: the house drifted past the setpoint."
+        return None
+    other = "cool" if mode == "heat" else "heat"
+    if outdoor_vetoed(config, other, outdoor):
+        return None
+    if outdoor_vetoed(config, mode, outdoor):
+        return other, f"Coasting in {other}: outdoor {outdoor:.1f} °C rules out {mode}."
+    # +1 for heat, -1 for cool: does the outdoor air already do this mode's work?
+    direction = 1 if mode == "heat" else -1
+    helps = direction * (outdoor - house) > 0
+    if helps and direction * (setpoint - house) < deadband:
+        return other, (
+            f"Back to {other}: outdoor {outdoor:.1f} °C does the {mode} work "
+            "inside the dead band."
+        )
+    return None
+
+
 def control(
     config,
     state,
@@ -1159,6 +1200,11 @@ def control(
                 if coast:
                     wanted = mode
                     notes.append(coast)
+            if wanted == mode:
+                back = return_mode(config, mode, house, state.setpoint, outdoor)
+                if back:
+                    wanted, note = back
+                    notes.append(note)
             if wanted != mode:
                 if (
                     state.active_mode == "off"

@@ -2245,3 +2245,17 @@ and the house again fell to 21.0 °C. The off/cool spells (4–12 h a day) preda
   and morning cases, real overheating (24.1 °C → cool), warm outdoors, the summer mirror
   and the veto of the current mode.
 
+## v0.5.26: return to the main mode inside the dead band
+
+v0.5.25 stopped new switches into cool on an overshoot, but at 17:40 on 11-24 (installed
+afterwards) the unit was already in cool at 23.2 °C with 13.9 °C outdoors, and cool would
+have stayed until the house reached 21.0 °C. `controller.return_mode` is the counterpart of
+`coast_reason`: the mode working against the outdoor drift is the main one. In the other
+mode, heat_cool returns to the main mode once the house is back inside the dead band on its
+side (cool with outdoor below the house: house < setpoint + dead band), and at once when
+the outdoor temperature rules out the current mode (cool on a cold night now coasts in heat
+instead of going off). Off returns to the main mode once the house has drifted past the
+setpoint. Hysteresis: heat → cool needs setpoint + dead band + coast margin (24 °C), cool →
+heat setpoint + dead band (23 °C); the minimum dwell still applies. Unknown outdoor
+temperature keeps the old behaviour.
+

@@ -1,6 +1,6 @@
 # House Climate
 
-A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.25 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
+A Home Assistant custom integration that makes several HVAC systems act as one house thermostat. Version 0.5.26 targets Home Assistant 2026.10 and Python 3.14.2+, with temperatures in °C.
 
 The setpoint is the center of the smallest predicted temperature band across the counted rooms.
 The default `objective: "band"` minimizes the largest priority-scaled room deviation from it,
@@ -48,8 +48,10 @@ the setpoint) instead of switching heat to cool or off, while the outdoor temper
 the other mode, or the outdoor air brings the house back on its own and the house is less
 than dead band + **coast margin** (`coast_margin`, 1 °C) past the setpoint. Heat then resumes
 as soon as the house drops below the setpoint rather than a full dead band below it. Unknown
-outdoor temperature, or a current mode the outdoor temperature itself rules out, keeps the old
-switch; a coast margin of 0 restores it. Explicit heat/cool requests take effect immediately, subject to the outdoor veto. Starts and stops obey cycling protection on scheduled and immediate passes. Explicit House off and outdoor vetoes still stop operation.
+outdoor temperature keeps the old switch; a coast margin of 0 restores it. The other way round
+(0.5.26), a spell in the other mode or off ends as soon as the house is back inside the dead band
+(cool while the outdoor air cools the house: below setpoint + dead band; off: past the setpoint),
+and at once when the outdoor temperature rules out the current mode (heat, idle, instead of off). Explicit heat/cool requests take effect immediately, subject to the outdoor veto. Starts and stops obey cycling protection on scheduled and immediate passes. Explicit House off and outdoor vetoes still stop operation.
 
 Version 0.5.25 does not trust a command a slow cloud-read unit refused: when a report made
 after a command shows the unit kept another setting, that report is not counted against the
